@@ -19,7 +19,17 @@ load_dotenv()
 api_id = int((os.environ.get("TELEGRAM_API_ID") or "0").strip() or "0")
 api_hash = (os.environ.get("TELEGRAM_API_HASH") or "").strip()
 if not api_id or not api_hash:
-    raise SystemExit("Set TELEGRAM_API_ID and TELEGRAM_API_HASH (and optional .env)")
+    raise SystemExit(
+        "Missing TELEGRAM_API_ID or TELEGRAM_API_HASH.\n\n"
+        "1) Open https://my.telegram.org/apps and copy api_id + api_hash.\n"
+        "2) Either create a file named .env next to this script with:\n"
+        "     TELEGRAM_API_ID=12345678\n"
+        "     TELEGRAM_API_HASH=your_hash_here\n"
+        "   Or in PowerShell for this session only:\n"
+        "     $env:TELEGRAM_API_ID=\"12345678\"\n"
+        "     $env:TELEGRAM_API_HASH=\"your_hash_here\"\n"
+        "3) Run again: py session_login.py\n"
+    )
 
 with TelegramClient(StringSession(), api_id, api_hash) as client:
     client.start()
