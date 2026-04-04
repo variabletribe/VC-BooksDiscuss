@@ -8,6 +8,8 @@
 #
 # After deploy: set BOT_TOKEN in the Render dashboard (Environment) if not using a secret file.
 # Optional: TELEGRAM_WEBHOOK_SECRET (Telegram sends X-Telegram-Bot-Api-Secret-Token).
+# Use exactly ONE service with this repo per BOT_TOKEN. Suspend any old Worker that still polls.
+# Dashboard → service → Settings: set Python to 3.12 if logs show 3.14 (match PYTHON_VERSION below).
 
 databases:
   - name: vc-bot-db
@@ -19,6 +21,7 @@ services:
     name: vc-bot
     runtime: python
     plan: free
+    numInstances: 1
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:

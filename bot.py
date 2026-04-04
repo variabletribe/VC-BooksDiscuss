@@ -89,6 +89,30 @@ def _use_webhook() -> bool:
     return False
 
 
+def _log_webhook_info(token: str) -> None:
+    """Log current Bot API webhook state (helps debug Conflict / wrong URL)."""
+    try:
+        r = httpx.get(
+            f"https://api.telegram.org/bot{token}/getWebhookInfo",
+            timeout=20.0,
+        )
+        r.raise_for_status()
+        body = r.json()
+        res = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(res, dict):
+            logger.warning("getWebhookInfo: unexpected response shape")
+            return
+        logger.info(
+            "getWebhookInfo: url=%r pending_updates=%s last_error_date=%s last_error=%r",
+            res.get("url"),
+            res.get("pending_update_count"),
+            res.get("last_error_date"),
+            res.get("last_error_message"),
+        )
+    except Exception:
+        logger.warning("getWebhookInfo failed (non-fatal)", exc_info=True)
+
+
 def _start_http_on_port_for_render() -> None:
     """Render Web Services require a bound PORT; polling bots otherwise fail the port scan."""
     raw = os.environ.get("PORT")
@@ -463,11 +487,20 @@ async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
     if isinstance(err, Conflict):
-        logger.error(
-            "Telegram Conflict: another getUpdates is using this bot token. "
-            "Run only ONE instance: stop python bot.py on your PC, delete duplicate "
-            "Render services, and keep a single Worker (or Web) with this BOT_TOKEN."
-        )
+        msg = str(err).strip()
+        logger.error("Telegram Conflict: %s", msg)
+        if "webhook is active" in msg.lower() or "deletewebhook" in msg.lower():
+            logger.error(
+                "This usually means something is still calling getUpdates with this BOT_TOKEN "
+                "(e.g. an old Render Worker, a second Web service, or python bot.py on your PC) "
+                "while this app uses a webhook. Suspend/delete every other service and stop local "
+                "bots; only one receiver may use this token."
+            )
+        else:
+            logger.error(
+                "If the message mentions another getUpdates request: only one long-poll client "
+                "may run per token. Stop duplicate Render services and any local bot process."
+            )
         return
     logger.error(
         "Unhandled exception: %s",
@@ -541,15 +574,21 @@ def main() -> None:
                 "process using this token to avoid stealing updates.",
                 path,
             )
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path=path,
-                webhook_url=webhook_url,
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                secret_token=secret,
-            )
+            _log_webhook_info(token)
+            webhook_kwargs: dict = {
+                "listen": "0.0.0.0",
+                "port": port,
+                "url_path": path,
+                "webhook_url": webhook_url,
+                "allowed_updates": Update.ALL_TYPES,
+                "drop_pending_updates": True,
+                "secret_token": secret,
+                "bootstrap_retries": 5,
+            }
+            # Render sends SIGTERM; avoid signal-handler edge cases on some runtimes.
+            if os.getenv("RENDER", "").strip().lower() == "true":
+                webhook_kwargs["stop_signals"] = None
+            app.run_webhook(**webhook_kwargs)
         else:
             app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except InvalidToken:
