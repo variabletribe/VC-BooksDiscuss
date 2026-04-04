@@ -24,7 +24,7 @@ from typing import Dict
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatMemberStatus
-from telegram.error import Conflict
+from telegram.error import Conflict, InvalidToken
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, MessageHandler, filters
 from telegram.ext.filters import MessageFilter
 
@@ -339,7 +339,7 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
-    token = os.environ.get("BOT_TOKEN")
+    token = (os.environ.get("BOT_TOKEN") or "").strip()
     if not token:
         raise SystemExit("Set BOT_TOKEN in environment or .env file")
 
@@ -364,7 +364,15 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info("Bot starting (group VC tracker)")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except InvalidToken:
+        logger.error(
+            "Telegram rejected BOT_TOKEN. In @BotFather use /token or /mybots → API Token, "
+            "copy the full value, paste into Render → Environment → BOT_TOKEN (no quotes or spaces), "
+            "save, then redeploy. If the token was ever leaked, use /revoke first."
+        )
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
