@@ -35,6 +35,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, Me
 from telegram.ext.filters import MessageFilter
 
 import db as dbmod
+import state as app_state
 
 load_dotenv()
 
@@ -143,9 +144,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "I track group voice/video chats and store stats in a database.\n\n"
-        "Limitation: Telegram does not tell bots who joined a VC or how long each "
-        "person stayed. I can only list people who show up in Telegram’s "
-        "“invited participants” updates, plus total call length — not every joiner.\n\n"
+        "Optional: with a Telethon user session (ASSISTANT_GROUP_IDS + "
+        "TELEGRAM_SESSION_STRING on the host), an assistant account can poll who is "
+        "in the VC and post join times (see repo session_login.py).\n\n"
+        "Without that, Telegram only gives bots invite-style hints — not every joiner.\n\n"
         "• After each VC ends, I reply with that call’s summary.\n"
         "• /vcreport — this month’s leaderboard (most time first).\n"
         "• /vcreport last — previous calendar month.\n"
@@ -233,6 +235,14 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = chat.id
     now = msg.date
+
+    if app_state.assistant_running and chat_id in app_state.assistant_chat_ids:
+        if msg.video_chat_started or msg.video_chat_participants_invited:
+            return
+        if msg.video_chat_ended:
+            _sessions.pop(chat_id, None)
+            return
+
     await asyncio.to_thread(dbmod.ensure_chat, chat_id, chat.title or None)
 
     if msg.video_chat_started:
@@ -406,6 +416,13 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     _start_http_on_port_for_render()
+
+    try:
+        from assistant import start_assistant_background
+
+        start_assistant_background()
+    except Exception:
+        logger.exception("Could not start VC assistant thread")
 
     logger.info("Bot starting (group VC tracker)")
     try:
