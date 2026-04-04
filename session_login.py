@@ -14,8 +14,8 @@ Add that same personal account to each group listed in ASSISTANT_GROUP_IDS.
 import os
 
 from dotenv import load_dotenv
-from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.sync import TelegramClient
 
 load_dotenv()
 
