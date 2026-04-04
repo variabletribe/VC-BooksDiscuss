@@ -22,6 +22,7 @@ import html
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -215,6 +216,42 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def _assistant_vc_fallback_report(
+    chat_id: int,
+    signal_mono: float,
+    duration_sec: int,
+    bot,
+) -> None:
+    """If assistant never saw the call (short VC between polls), still post Telegram duration."""
+    wait = float(os.getenv("ASSISTANT_FALLBACK_WAIT_SECONDS", "15"))
+    await asyncio.sleep(wait)
+    if app_state.assistant_vc_report_mono.get(chat_id, 0) > signal_mono:
+        return
+    ended = datetime.now(timezone.utc)
+    await asyncio.to_thread(
+        dbmod.record_vc_session,
+        chat_id,
+        ended,
+        duration_sec,
+        None,
+        [],
+    )
+    await asyncio.to_thread(dbmod.ensure_chat, chat_id, None)
+    text = (
+        "📞 <b>Voice/video chat ended</b>\n\n"
+        f"<b>Call length (Telegram):</b> {duration_sec // 60} min {duration_sec % 60} s "
+        f"({duration_sec} s total)\n\n"
+        "<i>No per-person breakdown: the assistant did not catch this call on its poll "
+        f"(often very short calls under ~{int(wait)}s between samples). "
+        "Lower ASSISTANT_POLL_SECONDS or run a longer test. Invite-based data is skipped "
+        "for assistant groups.</i>"
+    )
+    try:
+        await bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Assistant fallback send failed chat_id=%s", chat_id)
+
+
 class VideoChatServiceFilter(MessageFilter):
     def filter(self, message) -> bool:
         return bool(
@@ -241,6 +278,12 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
             return
         if msg.video_chat_ended:
             _sessions.pop(chat_id, None)
+            duration_sec = msg.video_chat_ended.duration
+            sig = time.monotonic()
+            asyncio.create_task(
+                _assistant_vc_fallback_report(chat_id, sig, duration_sec, context.bot),
+                name=f"vc-fallback-{chat_id}",
+            )
             return
 
     await asyncio.to_thread(dbmod.ensure_chat, chat_id, chat.title or None)

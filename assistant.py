@@ -16,6 +16,7 @@ import asyncio
 import html
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Set
@@ -170,11 +171,12 @@ async def _finalize_call(
     )
     text = "\n".join(lines)
     await _send_bot_message(chat_id, text)
+    app_state.assistant_vc_report_mono[chat_id] = time.monotonic()
     logger.info("Assistant finalized VC chat_id=%s participants=%s", chat_id, len(rows))
 
 
 async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
-    interval = float(os.getenv("ASSISTANT_POLL_SECONDS", "5"))
+    interval = float(os.getenv("ASSISTANT_POLL_SECONDS", "3"))
     states: Dict[int, _CallState] = {}
 
     while True:
