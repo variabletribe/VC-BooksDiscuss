@@ -241,10 +241,10 @@ async def _assistant_vc_fallback_report(
         "📞 <b>Voice/video chat ended</b>\n\n"
         f"<b>Call length (Telegram):</b> {duration_sec // 60} min {duration_sec % 60} s "
         f"({duration_sec} s total)\n\n"
-        "<i>No per-person breakdown: the assistant did not catch this call on its poll "
-        f"(often very short calls under ~{int(wait)}s between samples). "
-        "Lower ASSISTANT_POLL_SECONDS or run a longer test. Invite-based data is skipped "
-        "for assistant groups.</i>"
+        "<i>No per-person breakdown: the assistant never saw an active group call in "
+        "Telegram’s channel state, or participant lists stayed empty for this call. "
+        "Redeploy the latest code (uses getGroupCall). Add ASSISTANT_DEBUG=1 on the host "
+        "and check logs. The assistant user must be in this supergroup.</i>"
     )
     try:
         await bot.send_message(chat_id, text, parse_mode="HTML")

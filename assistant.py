@@ -24,7 +24,7 @@ from typing import Dict, Set
 import httpx
 from telethon import TelegramClient, functions, utils
 from telethon.sessions import StringSession
-from telethon.tl.types import GroupCall, PeerUser, User
+from telethon.tl.types import GroupCallDiscarded, PeerUser, User
 
 import db as dbmod
 import state as app_state
@@ -90,13 +90,51 @@ async def _send_bot_message(chat_id: int, text: str) -> None:
             logger.error("sendMessage failed: %s %s", r.status_code, r.text[:500])
 
 
-async def _fetch_participants(client: TelegramClient, call: GroupCall) -> tuple[Set[int], Dict[int, User]]:
+def _call_input(call) -> tuple[int, int] | None:
+    cid = getattr(call, "id", None)
+    ah = getattr(call, "access_hash", None)
+    if cid is None or ah is None:
+        return None
+    return int(cid), int(ah)
+
+
+def _is_live_group_call(call) -> bool:
+    if call is None:
+        return False
+    if isinstance(call, GroupCallDiscarded):
+        return False
+    return _call_input(call) is not None
+
+
+async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], Dict[int, User]]:
+    """Prefer phone.getGroupCall — often returns participants when getGroupParticipants is empty."""
     from telethon.tl.types import InputGroupCall
 
-    inp = InputGroupCall(id=call.id, access_hash=call.access_hash)
-    offset = ""
+    pair = _call_input(call)
+    if not pair:
+        return set(), {}
+    cid, ah = pair
+    inp = InputGroupCall(id=cid, access_hash=ah)
     ids: Set[int] = set()
     users: Dict[int, User] = {}
+
+    try:
+        res = await client(functions.phone.GetGroupCallRequest(call=inp, limit=500))
+        for p in res.participants:
+            peer = p.peer
+            if isinstance(peer, PeerUser):
+                ids.add(peer.user_id)
+        for u in res.users:
+            if isinstance(u, User):
+                users[u.id] = u
+        if os.getenv("ASSISTANT_DEBUG"):
+            logger.info("Assistant GetGroupCall: %s participant user id(s)", len(ids))
+        if ids:
+            return ids, users
+    except Exception:
+        logger.exception("Assistant GetGroupCall failed; falling back to GetGroupParticipants")
+
+    offset = ""
     while True:
         res = await client(
             functions.phone.GetGroupParticipantsRequest(
@@ -117,6 +155,8 @@ async def _fetch_participants(client: TelegramClient, call: GroupCall) -> tuple[
         offset = res.next_offset or ""
         if not offset:
             break
+    if os.getenv("ASSISTANT_DEBUG"):
+        logger.info("Assistant GetGroupParticipants total ids: %s", len(ids))
     return ids, users
 
 
@@ -198,15 +238,27 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 call = full.full_chat.call
                 st = states.get(chat_id)
 
-                active = isinstance(call, GroupCall)
+                if os.getenv("ASSISTANT_DEBUG"):
+                    logger.info(
+                        "Assistant poll chat=%s call=%s active=%s has_state=%s",
+                        chat_id,
+                        type(call).__name__ if call is not None else None,
+                        _is_live_group_call(call),
+                        st is not None,
+                    )
+
+                active = _is_live_group_call(call)
                 if not active:
                     if st is not None:
                         await _finalize_call(client, chat_id, st, now)
                         del states[chat_id]
                     continue
 
-                if st is None or st.call_id != call.id:
-                    states[chat_id] = _CallState(call_id=call.id, started_at=now)
+                call_id = getattr(call, "id", None)
+                if call_id is None:
+                    continue
+                if st is None or st.call_id != call_id:
+                    states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
 
                 current_ids, user_map = await _fetch_participants(client, call)
