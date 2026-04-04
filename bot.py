@@ -10,7 +10,11 @@ This bot uses:
 Data is stored in SQLite (local) or PostgreSQL (DATABASE_URL, e.g. Render).
 
 Env: BOT_TOKEN, optional DATABASE_URL, MONTHLY_REPORT_HOUR_UTC (default 9).
-If PORT is set (Render Web Service), a tiny HTTP listener is started so deploy health checks pass.
+On Render Web Services (RENDER_EXTERNAL_URL + PORT), the bot uses a webhook instead of getUpdates,
+which avoids Telegram Conflict when only one public URL receives updates. Locally, use polling
+(no public URL). Optional: WEBHOOK_URL + USE_WEBHOOK=1 + PORT for tunnels; FORCE_POLLING=1 to
+disable webhook on Render. TELEGRAM_WEBHOOK_PATH / TELEGRAM_WEBHOOK_SECRET optional.
+If PORT is set but webhook mode is off, a tiny HTTP stub is started for health checks.
 
 Privacy: @BotFather -> /setprivacy -> Disable if service messages are missing.
 """
@@ -18,6 +22,7 @@ Privacy: @BotFather -> /setprivacy -> Disable if service messages are missing.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import logging
 import os
@@ -50,6 +55,38 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _webhook_public_base() -> str | None:
+    base = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL") or "").strip().rstrip("/")
+    return base or None
+
+
+def _webhook_path_segment() -> str:
+    custom = (os.environ.get("TELEGRAM_WEBHOOK_PATH") or "").strip().strip("/")
+    if custom:
+        return custom
+    token = (os.environ.get("BOT_TOKEN") or "").encode()
+    return hashlib.sha256(token).hexdigest()[:20]
+
+
+def _use_webhook() -> bool:
+    if _env_truthy("FORCE_POLLING"):
+        return False
+    base = _webhook_public_base()
+    port = os.environ.get("PORT")
+    if not base or not port:
+        return False
+    if _env_truthy("USE_WEBHOOK"):
+        return True
+    # Render web/static sets RENDER_EXTERNAL_URL; workers leave it empty.
+    if (os.environ.get("RENDER_EXTERNAL_URL") or "").strip():
+        return True
+    return False
 
 
 def _start_http_on_port_for_render() -> None:
@@ -477,7 +514,9 @@ def main() -> None:
     )
     app.add_error_handler(error_handler)
 
-    _start_http_on_port_for_render()
+    use_webhook = _use_webhook()
+    if not use_webhook:
+        _start_http_on_port_for_render()
 
     try:
         from assistant import start_assistant_background
@@ -488,7 +527,31 @@ def main() -> None:
 
     logger.info("Bot starting (group VC tracker)")
     try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        if use_webhook:
+            raw_port = os.environ["PORT"]
+            port = int(raw_port)
+            base = _webhook_public_base()
+            if not base:
+                raise SystemExit("Webhook mode needs RENDER_EXTERNAL_URL or WEBHOOK_URL")
+            path = _webhook_path_segment()
+            webhook_url = f"{base}/{path}"
+            secret = (os.environ.get("TELEGRAM_WEBHOOK_SECRET") or "").strip() or None
+            logger.info(
+                "Webhook mode (no getUpdates): public URL ends with /%s — stop any other bot "
+                "process using this token to avoid stealing updates.",
+                path,
+            )
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=path,
+                webhook_url=webhook_url,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                secret_token=secret,
+            )
+        else:
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except InvalidToken:
         logger.error(
             "Telegram rejected BOT_TOKEN. In @BotFather use /token or /mybots → API Token, "
