@@ -8,6 +8,8 @@ Telegram does not expose per-user join/leave for group VCs. This bot uses:
 Data is stored in SQLite (local) or PostgreSQL (DATABASE_URL, e.g. Render).
 
 Env: BOT_TOKEN, optional DATABASE_URL, MONTHLY_REPORT_HOUR_UTC (default 9).
+If PORT is set (Render Web Service), a tiny HTTP listener is started so deploy health checks pass.
+
 Privacy: @BotFather -> /setprivacy -> Disable if service messages are missing.
 """
 
@@ -17,8 +19,10 @@ import asyncio
 import html
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict
 
 from dotenv import load_dotenv
@@ -41,6 +45,34 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def _start_http_on_port_for_render() -> None:
+    """Render Web Services require a bound PORT; polling bots otherwise fail the port scan."""
+    raw = os.environ.get("PORT")
+    if not raw:
+        return
+    try:
+        port = int(raw)
+    except ValueError:
+        logger.warning("PORT is not an integer (%r); skipping HTTP stub", raw)
+        return
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+    def _run():
+        HTTPServer(("0.0.0.0", port), _Handler).serve_forever()
+
+    threading.Thread(target=_run, name="http-port", daemon=True).start()
+    logger.info("HTTP stub listening on 0.0.0.0:%s (Render PORT check)", port)
 
 
 def _utc_ts(dt: datetime) -> float:
@@ -362,6 +394,8 @@ def main() -> None:
         )
     )
     app.add_error_handler(error_handler)
+
+    _start_http_on_port_for_render()
 
     logger.info("Bot starting (group VC tracker)")
     try:
