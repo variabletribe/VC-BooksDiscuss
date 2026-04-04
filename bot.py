@@ -1,9 +1,11 @@
 """
 Group voice/video chat tracker for Telegram.
 
-Telegram does not expose per-user join/leave for group VCs. This bot uses:
-- video_chat_participants_invited: users seen during the call (invite events)
-- video_chat_ended.duration: official call length in seconds
+Telegram’s Bot API does not expose “everyone who joined the VC” or real per-user
+durations. It only offers invite-style participant hints plus total call duration.
+This bot uses:
+- video_chat_participants_invited (subset of people, not all joiners)
+- video_chat_ended.duration (official call length in seconds)
 
 Data is stored in SQLite (local) or PostgreSQL (DATABASE_URL, e.g. Render).
 
@@ -130,7 +132,8 @@ def _format_leaderboard_html(year: int, month: int, rows: list[dbmod.LeaderRow],
         lines.append(f"{medal} {safe} — <b>{_format_duration(row.total_seconds)}</b>")
     lines.append("")
     lines.append(
-        "<i>Ranked by summed estimated time per call (Telegram limits accuracy).</i>"
+        "<i>Not everyone who joins a VC appears here — only people Telegram reports "
+        "via invite-style events. Times are estimates.</i>"
     )
     return "\n".join(lines)
 
@@ -140,10 +143,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "I track group voice/video chats and store stats in a database.\n\n"
+        "Limitation: Telegram does not tell bots who joined a VC or how long each "
+        "person stayed. I can only list people who show up in Telegram’s "
+        "“invited participants” updates, plus total call length — not every joiner.\n\n"
         "• After each VC ends, I reply with that call’s summary.\n"
         "• /vcreport — this month’s leaderboard (most time first).\n"
         "• /vcreport last — previous calendar month.\n"
-        "• /reports on|off — admins only; toggle automatic monthly report (1st of month, UTC hour from host).\n\n"
+        "• /reports on|off — admins only; automatic monthly report (1st, UTC).\n\n"
         "If I miss events: @BotFather → /setprivacy → Disable."
     )
 
@@ -280,14 +286,18 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
         if not session or not session.participants:
             lines.append("")
             lines.append(
-                "<i>No participant list was recorded. "
-                "People must appear in invite events during the call, "
-                "or the bot may need privacy mode disabled.</i>"
+                "<i>No names recorded. Bots cannot see a full “who joined” list — only "
+                "some people appear when Telegram sends invite-style updates. "
+                "Try inviting members to the call, and ensure privacy is disabled "
+                "(@BotFather → /setprivacy → Disable).</i>"
             )
         else:
             rows = sorted(parts, key=lambda x: -x[2])
             lines.append("")
-            lines.append(f"<b>Members seen (invite events):</b> {len(rows)}")
+            lines.append(
+                f"<b>People listed (Telegram invite updates only):</b> {len(rows)} "
+                f"<i>— not everyone who joined</i>"
+            )
             lines.append("")
             for _uid, label, est_sec in rows:
                 m_part = est_sec // 60
@@ -297,8 +307,8 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
         lines.append("")
         lines.append(
-            "<i>Per-user time is estimated from Telegram invite events, "
-            "capped by the call duration — not exact attendance.</i>"
+            "<i>Telegram does not expose real per-person VC time for bots. "
+            "These minutes are rough estimates from invite events, capped by call length.</i>"
         )
 
         text = "\n".join(lines)
