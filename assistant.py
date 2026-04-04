@@ -78,18 +78,35 @@ class _CallState:
     user_cache: Dict[int, User] = field(default_factory=dict)
 
 
-async def _send_bot_message(chat_id: int, text: str) -> None:
+async def _send_bot_message(chat_id: int, text: str) -> bool:
     token = (os.environ.get("BOT_TOKEN") or "").strip()
     if not token:
-        return
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(
+    async with httpx.AsyncClient(timeout=60.0) as http:
+        r = await http.post(
             url,
             data={"chat_id": str(chat_id), "text": text, "parse_mode": "HTML"},
         )
         if r.status_code != 200:
-            logger.error("sendMessage failed: %s %s", r.status_code, r.text[:500])
+            logger.error("Bot sendMessage HTTP failed: %s %s", r.status_code, r.text[:500])
+            return False
+    return True
+
+
+async def _post_vc_summary(telethon: TelegramClient, chat_id: int, text: str) -> bool:
+    """Try Bot API over HTTP, then post as the user so summaries still arrive if bot HTTP fails."""
+    if await _send_bot_message(chat_id, text):
+        return True
+    try:
+        await telethon.send_message(chat_id, text, parse_mode="html")
+        logger.warning(
+            "VC summary sent as the assistant user (bot HTTP failed; may not show as the bot)"
+        )
+        return True
+    except Exception:
+        logger.exception("VC summary: user send_message also failed")
+        return False
 
 
 def _call_input(call) -> tuple[int, int] | None:
@@ -212,8 +229,8 @@ async def _finalize_call(
         "Very short joins between polls may show as 0. Invite-only Bot API data is not used here.</i>"
     )
     text = "\n".join(lines)
-    await _send_bot_message(chat_id, text)
-    app_state.assistant_vc_report_mono[chat_id] = time.monotonic()
+    if await _post_vc_summary(client, chat_id, text):
+        app_state.assistant_vc_report_mono[chat_id] = time.monotonic()
     logger.info("Assistant finalized VC chat_id=%s participants=%s", chat_id, len(rows))
 
 

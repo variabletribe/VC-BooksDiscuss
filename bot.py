@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict
 
+import httpx
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatMemberStatus
@@ -216,11 +217,31 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def _http_bot_send_message(chat_id: int, text: str) -> bool:
+    """Direct Bot API HTTP (works even when python-telegram-bot polling hits Conflict)."""
+    token = (os.environ.get("BOT_TOKEN") or "").strip()
+    if not token:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                url,
+                data={"chat_id": str(chat_id), "text": text, "parse_mode": "HTML"},
+            )
+        if r.status_code != 200:
+            logger.error("HTTP sendMessage failed: %s %s", r.status_code, r.text[:400])
+            return False
+        return True
+    except Exception:
+        logger.exception("HTTP sendMessage exception chat_id=%s", chat_id)
+        return False
+
+
 async def _assistant_vc_fallback_report(
     chat_id: int,
     signal_mono: float,
     duration_sec: int,
-    bot,
 ) -> None:
     """If assistant never saw the call (short VC between polls), still post Telegram duration."""
     wait = float(os.getenv("ASSISTANT_FALLBACK_WAIT_SECONDS", "15"))
@@ -246,10 +267,8 @@ async def _assistant_vc_fallback_report(
         "Redeploy the latest code (uses getGroupCall). Add ASSISTANT_DEBUG=1 on the host "
         "and check logs. The assistant user must be in this supergroup.</i>"
     )
-    try:
-        await bot.send_message(chat_id, text, parse_mode="HTML")
-    except Exception:
-        logger.exception("Assistant fallback send failed chat_id=%s", chat_id)
+    if not await _http_bot_send_message(chat_id, text):
+        logger.error("Assistant fallback could not send chat_id=%s", chat_id)
 
 
 class VideoChatServiceFilter(MessageFilter):
@@ -281,7 +300,7 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
             duration_sec = msg.video_chat_ended.duration
             sig = time.monotonic()
             asyncio.create_task(
-                _assistant_vc_fallback_report(chat_id, sig, duration_sec, context.bot),
+                _assistant_vc_fallback_report(chat_id, sig, duration_sec),
                 name=f"vc-fallback-{chat_id}",
             )
             return
