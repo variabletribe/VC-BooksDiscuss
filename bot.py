@@ -24,6 +24,7 @@ from typing import Dict
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatMemberStatus
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, MessageHandler, filters
 from telegram.ext.filters import MessageFilter
 
@@ -308,6 +309,22 @@ async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Failed monthly report chat_id=%s", chat_id)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.error(
+            "Telegram Conflict: another getUpdates is using this bot token. "
+            "Run only ONE instance: stop python bot.py on your PC, delete duplicate "
+            "Render services, and keep a single Worker (or Web) with this BOT_TOKEN."
+        )
+        return
+    logger.error(
+        "Unhandled exception: %s",
+        err,
+        exc_info=(type(err), err, err.__traceback__) if err and getattr(err, "__traceback__", None) else None,
+    )
+
+
 async def post_init(application: Application) -> None:
     jq = application.job_queue
     if jq is None:
@@ -344,9 +361,10 @@ def main() -> None:
             on_video_chat_service,
         )
     )
+    app.add_error_handler(error_handler)
 
     logger.info("Bot starting (group VC tracker)")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
