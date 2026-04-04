@@ -1,11 +1,14 @@
 """
-One-time: create TELEGRAM_SESSION_STRING for the assistant user account.
+One-time: create TELEGRAM_SESSION_STRING for the assistant USER account.
 
 1. Get api_id / api_hash from https://my.telegram.org/apps
 2. Run:  py session_login.py
-3. Paste printed session string into Render env TELEGRAM_SESSION_STRING
+3. When prompted, log in with a normal PHONE (personal Telegram account).
+   Do NOT use your BotFather bot token here — bot sessions cannot call group-call APIs.
 
-The assistant account must be a normal user in each group you track (ASSISTANT_GROUP_IDS).
+4. Paste the printed StringSession into Render env TELEGRAM_SESSION_STRING
+
+Add that same personal account to each group listed in ASSISTANT_GROUP_IDS.
 """
 
 import os
@@ -33,5 +36,11 @@ if not api_id or not api_hash:
 
 with TelegramClient(StringSession(), api_id, api_hash) as client:
     client.start()
+    me = client.get_me()
+    if getattr(me, "bot", False):
+        raise SystemExit(
+            "This session is a BOT. Use session_login with a normal user phone login only."
+        )
     print("Add this to your environment as TELEGRAM_SESSION_STRING:\n")
     print(client.session.save())
+    print(f"\n(Logged in as user: {me.first_name!r} id={me.id} — not a bot.)\n")

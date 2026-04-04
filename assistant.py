@@ -7,7 +7,9 @@ Requires:
   ASSISTANT_GROUP_IDS=-100111,-100222  (supergroup chat ids)
   BOT_TOKEN (to post the summary as the bot)
 
-The assistant user must be a member of each tracked group (add that account like a normal user).
+The assistant must be a normal USER account (phone login via session_login.py).
+Do NOT use a bot token / BotFather session — Telegram returns BotMethodInvalidError for
+GetGroupCall and GetGroupParticipants on bot accounts.
 """
 
 from __future__ import annotations
@@ -298,22 +300,42 @@ async def run_assistant() -> None:
         logger.warning("ASSISTANT_GROUP_IDS has no valid ids")
         return
 
-    app_state.assistant_chat_ids = chat_ids
     client = TelegramClient(StringSession(session_s), api_id, api_hash)
-
-    await client.connect()
-    if not await client.is_user_authorized():
-        logger.error("Assistant: session not authorized. Run session_login.py locally and set TELEGRAM_SESSION_STRING.")
-        return
-
-    app_state.assistant_running = True
-    logger.info("Assistant connected; tracking %s group(s): %s", len(chat_ids), sorted(chat_ids))
-
     try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.error(
+                "Assistant: session not authorized. Run session_login.py locally and set TELEGRAM_SESSION_STRING."
+            )
+            return
+
+        me = await client.get_me()
+        if getattr(me, "bot", False):
+            logger.error(
+                "Assistant: TELEGRAM_SESSION_STRING is for a BOT. Telegram forbids "
+                "GetGroupCall / GetGroupParticipants for bot accounts (BotMethodInvalidError). "
+                "Run session_login.py on your PC, sign in with a normal USER phone number "
+                "(the personal account you add to the group — not @BotFather, not BOT_TOKEN). "
+                "Put the printed StringSession in TELEGRAM_SESSION_STRING. "
+                "Until then, remove ASSISTANT_GROUP_IDS or fix the session so the bot can use invite-based VC again."
+            )
+            return
+
+        app_state.assistant_chat_ids = set(chat_ids)
+        app_state.assistant_running = True
+        label = f"@{me.username}" if me.username else str(me.id)
+        logger.info(
+            "Assistant connected as user %s; tracking %s group(s): %s",
+            label,
+            len(chat_ids),
+            sorted(chat_ids),
+        )
         await _poll_loop(client, chat_ids)
     finally:
         app_state.assistant_running = False
-        await client.disconnect()
+        app_state.assistant_chat_ids.clear()
+        if client.is_connected():
+            await client.disconnect()
 
 
 def start_assistant_background() -> None:
