@@ -21,9 +21,9 @@ from datetime import datetime, timezone
 from typing import Dict, Set
 
 import httpx
-from telethon import TelegramClient, functions
+from telethon import TelegramClient, functions, utils
 from telethon.sessions import StringSession
-from telethon.tl.types import GroupCall, InputChannel, PeerUser, User
+from telethon.tl.types import GroupCall, PeerUser, User
 
 import db as dbmod
 import state as app_state
@@ -182,10 +182,17 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
         for chat_id in chat_ids:
             try:
                 inp = await client.get_input_entity(chat_id)
-                if not isinstance(inp, InputChannel):
-                    logger.warning("Assistant: %s is not a supergroup (channel); skipping", chat_id)
+                try:
+                    channel_inp = utils.get_input_channel(inp)
+                except TypeError:
+                    logger.warning(
+                        "Assistant: %s is not a channel/megagroup (upgrade group to supergroup or fix id); skipping",
+                        chat_id,
+                    )
                     continue
-                full = await client(functions.channels.GetFullChannelRequest(channel=inp))
+                full = await client(
+                    functions.channels.GetFullChannelRequest(channel=channel_inp)
+                )
                 call = full.full_chat.call
                 st = states.get(chat_id)
 
