@@ -1,0 +1,29 @@
+# Render Blueprint: Background Worker + PostgreSQL
+# https://render.com/docs/blueprint-spec
+#
+# After deploy: set BOT_TOKEN in the Render dashboard (Environment) if not using a secret file.
+# Link the worker to the database so DATABASE_URL is injected.
+
+databases:
+  - name: vc-bot-db
+    databaseName: vc_bot
+    plan: free
+
+services:
+  - type: worker
+    name: vc-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: vc-bot-db
+          property: connectionString
+      - key: MONTHLY_REPORT_HOUR_UTC
+        value: "9"
