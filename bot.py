@@ -134,6 +134,13 @@ def _log_webhook_info(token: str) -> None:
                 "Typical on free Render when idle.",
                 (last_err[:240] + "…") if len(str(last_err)) > 240 else last_err,
             )
+        if "403" in err_l or "forbidden" in err_l or "secret" in err_l:
+            logger.warning(
+                "Webhook may be rejecting requests (403/forbidden/secret). If you set "
+                "TELEGRAM_WEBHOOK_SECRET in Render, it must match what Telegram has; easiest fix "
+                "is to remove TELEGRAM_WEBHOOK_SECRET from the dashboard and redeploy so PTB sets "
+                "a clean webhook without a secret, unless you need that header for security."
+            )
     except Exception:
         logger.warning("getWebhookInfo failed (non-fatal)", exc_info=True)
 
@@ -571,6 +578,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def _webhook_post_register_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-log getWebhookInfo after run_webhook has called setWebhook (first log is often stale)."""
+    if not _use_webhook():
+        return
+    logger.info("Webhook health check ~20s after boot (state should reflect this deploy’s setWebhook)")
+    _log_webhook_info(context.application.bot.token.strip())
+
+
 async def post_init(application: Application) -> None:
     if (
         os.getenv("RENDER", "").strip().lower() == "true"
@@ -582,6 +597,8 @@ async def post_init(application: Application) -> None:
     jq = application.job_queue
     if jq is None:
         return
+    if _use_webhook():
+        jq.run_once(_webhook_post_register_check, when=20, name="webhook_post_register_check")
     jq.run_repeating(
         hourly_monthly_gate,
         interval=3600,
@@ -642,6 +659,11 @@ def main() -> None:
                 "Webhook mode (no getUpdates): public URL ends with /%s — stop any other bot "
                 "process using this token to avoid stealing updates.",
                 path,
+            )
+            logger.info(
+                "Telegram webhook status below may still show 521/pending from the *previous* "
+                "deploy; setWebhook runs when the app finishes starting. Check the ~20s "
+                "follow-up log line webhook_post_register_check."
             )
             _log_webhook_info(token)
             webhook_kwargs: dict = {
