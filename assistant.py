@@ -219,14 +219,13 @@ async def _finalize_call(
         f"<b>People in VC (assistant):</b> {len(rows)}",
         "",
     ]
-    for _uid, label, sec in rows:
+    for rank, (_uid, label, sec) in enumerate(rows, start=1):
         mp, sp = sec // 60, sec % 60
         safe = html.escape(label, quote=False)
-        lines.append(f"• {safe}: <b>{mp} min {sp} s</b>")
+        lines.append(f"{rank}. {safe}: <b>{mp} min {sp} s</b>")
     lines.append("")
     lines.append(
-        "<i>Tracked by polling the live participant list every few seconds. "
-        "Very short joins between polls may show as 0. Invite-only Bot API data is not used here.</i>"
+        "<i>Tracked by the live participant list every few seconds. The time they spent in the call is listed here.</i>"
     )
     text = "\n".join(lines)
     if await _post_vc_summary(client, chat_id, text):

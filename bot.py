@@ -304,8 +304,7 @@ def _format_leaderboard_html(year: int, month: int, rows: list[dbmod.LeaderRow],
         lines.append(f"{medal} {safe} — <b>{_format_duration(row.total_seconds)}</b>")
     lines.append("")
     lines.append(
-        "<i>Not everyone who joins a VC appears here — only people Telegram reports "
-        "via invite-style events. Times are estimates.</i>"
+        "<i>Participants who joined the call are listed here along with their time they spent in the call.</i>"
     )
     return "\n".join(lines)
 
@@ -540,11 +539,11 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
                 f"<i>— not everyone who joined</i>"
             )
             lines.append("")
-            for _uid, label, est_sec in rows:
+            for rank, (_uid, label, est_sec) in enumerate(rows, start=1):
                 m_part = est_sec // 60
                 s_part = est_sec % 60
                 safe = html.escape(label, quote=False)
-                lines.append(f"• {safe}: ~{m_part} min {s_part} s")
+                lines.append(f"{rank}. {safe}: ~{m_part} min {s_part} s")
 
         lines.append("")
         lines.append(
