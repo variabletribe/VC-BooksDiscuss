@@ -8,6 +8,7 @@
 #
 # After deploy: set BOT_TOKEN in the Render dashboard (Environment) if not using a secret file.
 # Optional: TELEGRAM_WEBHOOK_SECRET (Telegram sends X-Telegram-Bot-Api-Secret-Token).
+# Optional: KEEP_ALIVE_INTERVAL_SECONDS (default 300), KEEP_ALIVE_DISABLE=1 to turn off self-ping.
 # Use exactly ONE service with this repo per BOT_TOKEN. Suspend any old Worker that still polls.
 # Dashboard → service → Settings: set Python to 3.12 if logs show 3.14 (match PYTHON_VERSION below).
 

@@ -16,6 +16,11 @@ which avoids Telegram Conflict when only one public URL receives updates. Locall
 disable webhook on Render. TELEGRAM_WEBHOOK_PATH / TELEGRAM_WEBHOOK_SECRET optional.
 If PORT is set but webhook mode is off, a tiny HTTP stub is started for health checks.
 
+On Render free Web services, idle spin-down yields HTTP 521 and Telegram webhook backlog.
+While the process runs, a background keep-alive GETs RENDER_EXTERNAL_URL every
+KEEP_ALIVE_INTERVAL_SECONDS (default 300). Disable with KEEP_ALIVE_DISABLE=1.
+For long cold starts, use an external uptime monitor or a paid instance.
+
 Privacy: @BotFather -> /setprivacy -> Disable if service messages are missing.
 """
 
@@ -102,15 +107,72 @@ def _log_webhook_info(token: str) -> None:
         if not isinstance(res, dict):
             logger.warning("getWebhookInfo: unexpected response shape")
             return
+        pending_raw = res.get("pending_update_count")
+        last_err = res.get("last_error_message") or ""
+        try:
+            pending_n = int(pending_raw or 0)
+        except (TypeError, ValueError):
+            pending_n = 0
         logger.info(
             "getWebhookInfo: url=%r pending_updates=%s last_error_date=%s last_error=%r",
             res.get("url"),
-            res.get("pending_update_count"),
+            pending_raw,
             res.get("last_error_date"),
-            res.get("last_error_message"),
+            last_err,
         )
+        if pending_n > 0:
+            logger.warning(
+                "Telegram has %s webhook update(s) still queued—earlier deliveries failed "
+                "(often 521 when Render was asleep). After this deploy they should drain; "
+                "keep-alive reduces sleep. External ping or paid tier is most reliable.",
+                pending_n,
+            )
+        err_l = str(last_err).lower()
+        if "521" in err_l or "503" in err_l or "wrong response" in err_l or "timeout" in err_l:
+            logger.warning(
+                "Recent webhook error from Telegram: %r — origin unreachable or bad response. "
+                "Typical on free Render when idle.",
+                (last_err[:240] + "…") if len(str(last_err)) > 240 else last_err,
+            )
     except Exception:
         logger.warning("getWebhookInfo failed (non-fatal)", exc_info=True)
+
+
+def _start_render_keepalive_thread() -> None:
+    """GET the public service URL on an interval so Render's idle timer resets (free Web tier)."""
+    base = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    if not base:
+        return
+    try:
+        interval = max(60, int(os.getenv("KEEP_ALIVE_INTERVAL_SECONDS", "300")))
+    except ValueError:
+        interval = 300
+    try:
+        start_delay = max(20, int(os.getenv("KEEP_ALIVE_START_DELAY_SECONDS", "90")))
+    except ValueError:
+        start_delay = 90
+    path = (os.getenv("KEEP_ALIVE_PATH") or "/").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{base}{path}"
+
+    def _run() -> None:
+        time.sleep(start_delay)
+        logger.info(
+            "Keep-alive: GET %s every %ss (KEEP_ALIVE_INTERVAL_SECONDS; disable KEEP_ALIVE_DISABLE=1)",
+            url,
+            interval,
+        )
+        while True:
+            try:
+                r = httpx.get(url, timeout=45.0, follow_redirects=True)
+                if r.status_code >= 500:
+                    logger.warning("Keep-alive GET %s returned HTTP %s", url, r.status_code)
+            except Exception as exc:
+                logger.warning("Keep-alive request failed: %s", exc)
+            time.sleep(interval)
+
+    threading.Thread(target=_run, name="render-keepalive", daemon=True).start()
 
 
 def _start_http_on_port_for_render() -> None:
@@ -510,6 +572,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def post_init(application: Application) -> None:
+    if (
+        os.getenv("RENDER", "").strip().lower() == "true"
+        and _use_webhook()
+        and not _env_truthy("KEEP_ALIVE_DISABLE")
+    ):
+        _start_render_keepalive_thread()
+
     jq = application.job_queue
     if jq is None:
         return
