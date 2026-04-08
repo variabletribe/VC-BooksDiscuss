@@ -16,6 +16,10 @@ which avoids Telegram Conflict when only one public URL receives updates. Locall
 disable webhook on Render. TELEGRAM_WEBHOOK_PATH / TELEGRAM_WEBHOOK_SECRET optional.
 If PORT is set but webhook mode is off, a tiny HTTP stub is started for health checks.
 
+If /start never works on free Render (521 / webhook errors), set FORCE_POLLING=1 with exactly
+one running service so Telegram uses getUpdates instead of pushing to your URL. WEBHOOK_DEBUG=1
+enables verbose telegram.ext logs (incoming webhook POSTs).
+
 On Render free Web services, idle spin-down yields HTTP 521 and Telegram webhook backlog.
 While the process runs, a background keep-alive GETs RENDER_EXTERNAL_URL every
 KEEP_ALIVE_INTERVAL_SECONDS (default 300). Disable with KEEP_ALIVE_DISABLE=1.
@@ -60,6 +64,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def _configure_debug_loggers() -> None:
+    if _env_truthy("WEBHOOK_DEBUG"):
+        logging.getLogger("telegram.ext").setLevel(logging.DEBUG)
+        logging.getLogger("telegram").setLevel(logging.DEBUG)
+        logger.info("WEBHOOK_DEBUG=1: telegram.ext logging at DEBUG")
 
 
 def _env_truthy(name: str) -> bool:
@@ -143,6 +154,34 @@ def _log_webhook_info(token: str) -> None:
             )
     except Exception:
         logger.warning("getWebhookInfo failed (non-fatal)", exc_info=True)
+
+
+def _log_bot_identity(token: str) -> None:
+    """Confirm BOT_TOKEN is valid; does not prove webhooks are delivered."""
+    try:
+        r = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=20.0)
+        r.raise_for_status()
+        body = r.json()
+        res = body.get("result") if isinstance(body, dict) else None
+        if not isinstance(res, dict):
+            logger.warning("getMe: unexpected response shape")
+            return
+        uname = res.get("username")
+        bid = res.get("id")
+        logger.info(
+            "getMe OK: bot id=%s @%s — token is valid; silent /start means updates are not "
+            "reaching the app (webhook 521/403, wrong URL, or a second process using this token).",
+            bid,
+            uname,
+        )
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "getMe HTTP %s: %s",
+            exc.response.status_code,
+            (exc.response.text or "")[:400],
+        )
+    except Exception:
+        logger.exception("getMe request failed")
 
 
 def _start_render_keepalive_thread() -> None:
@@ -609,9 +648,12 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
+    _configure_debug_loggers()
     token = (os.environ.get("BOT_TOKEN") or "").strip()
     if not token:
         raise SystemExit("Set BOT_TOKEN in environment or .env file")
+
+    _log_bot_identity(token)
 
     dbmod.init_db()
 
@@ -679,8 +721,13 @@ def main() -> None:
             # Render sends SIGTERM; avoid signal-handler edge cases on some runtimes.
             if os.getenv("RENDER", "").strip().lower() == "true":
                 webhook_kwargs["stop_signals"] = None
+                logger.info(
+                    "Render: free tier often breaks inbound webhooks (521). If /start does nothing, "
+                    "set FORCE_POLLING=1 (one instance only) or use uptime ping + paid tier."
+                )
             app.run_webhook(**webhook_kwargs)
         else:
+            logger.info("Polling mode: bot will use getUpdates (needs exactly one poller for this token).")
             app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except InvalidToken:
         logger.error(
