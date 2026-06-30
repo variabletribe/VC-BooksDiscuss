@@ -318,7 +318,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "TELEGRAM_SESSION_STRING on the host), an assistant account can poll who is "
         "in the VC and post join times (see repo session_login.py).\n\n"
         "Without that, Telegram only gives bots invite-style hints — not every joiner.\n\n"
-        "• After each VC ends, I reply with that call’s summary.\n"
+        "• After each VC ends, I reply with that call’s summary and a present-attendance message "
+        "(20+ minutes in one call = +1 present day, saved forever).\n"
         "• /vcreport — this month’s leaderboard (most time first).\n"
         "• /vcreport last — previous calendar month.\n"
         "• /reports on|off — admins only; automatic monthly report (1st, UTC).\n\n"
@@ -437,6 +438,12 @@ async def _assistant_vc_fallback_report(
     )
     if not await _http_bot_send_message(chat_id, text):
         logger.error("Assistant fallback could not send chat_id=%s", chat_id)
+        return
+
+    earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, [])
+    all_attendance = await asyncio.to_thread(dbmod.fetch_all_attendance, chat_id)
+    attendance_text = dbmod.format_attendance_message(earned, all_attendance)
+    await _http_bot_send_message(chat_id, attendance_text)
 
 
 class VideoChatServiceFilter(MessageFilter):
@@ -553,6 +560,12 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
         text = "\n".join(lines)
         await msg.reply_text(text, parse_mode="HTML")
+
+        earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, parts)
+        all_attendance = await asyncio.to_thread(dbmod.fetch_all_attendance, chat_id)
+        attendance_text = dbmod.format_attendance_message(earned, all_attendance)
+        await msg.reply_text(attendance_text, parse_mode="HTML")
+
         logger.info(
             "VC ended chat_id=%s duration=%s participants=%s",
             chat_id,

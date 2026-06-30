@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 from datetime import datetime, timezone
 from typing import Iterable, NamedTuple
@@ -63,6 +64,23 @@ class LeaderRow(NamedTuple):
     user_id: int
     display_name: str
     total_seconds: int
+
+
+class UserAttendance(Base):
+    """Cumulative present days: +1 per VC when user stays more than PRESENT_MIN_SECONDS."""
+
+    __tablename__ = "user_attendance"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    present_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class AttendanceRow(NamedTuple):
+    user_id: int
+    display_name: str
+    present_days: int
 
 
 _engine = None
@@ -232,3 +250,89 @@ def mark_monthly_report_sent(chat_id: int, year: int, month: int) -> None:
 def fetch_month_leaderboard(chat_id: int, year: int, month: int) -> list[LeaderRow]:
     start, end = month_bounds_utc(year, month)
     return fetch_leaderboard(chat_id, start, end)
+
+
+def present_threshold_sec() -> int:
+    try:
+        return max(1, int(os.getenv("PRESENT_MIN_SECONDS", "1200")))
+    except ValueError:
+        return 1200
+
+
+def record_present_attendance(
+    chat_id: int,
+    participants: Iterable[tuple[int, str, int]],
+) -> list[AttendanceRow]:
+    """+1 present day per user who stayed longer than the threshold in this call."""
+    assert SessionLocal is not None
+    threshold = present_threshold_sec()
+    earned: list[AttendanceRow] = []
+    with SessionLocal() as s:
+        for uid, name, sec in participants:
+            if sec <= threshold:
+                continue
+            row = s.get(UserAttendance, (chat_id, uid))
+            if row is None:
+                row = UserAttendance(
+                    chat_id=chat_id,
+                    user_id=uid,
+                    display_name=name[:512],
+                    present_days=1,
+                )
+                s.add(row)
+            else:
+                row.present_days += 1
+                row.display_name = name[:512]
+            earned.append(AttendanceRow(uid, name, row.present_days))
+        s.commit()
+    return earned
+
+
+def fetch_all_attendance(chat_id: int) -> list[AttendanceRow]:
+    assert SessionLocal is not None
+    with SessionLocal() as s:
+        q = (
+            select(UserAttendance)
+            .where(UserAttendance.chat_id == chat_id)
+            .order_by(UserAttendance.present_days.desc(), UserAttendance.display_name)
+        )
+        rows = s.scalars(q).all()
+        return [AttendanceRow(r.user_id, r.display_name, r.present_days) for r in rows]
+
+
+def format_attendance_message(
+    earned: list[AttendanceRow],
+    all_rows: list[AttendanceRow],
+) -> str:
+    threshold_min = present_threshold_sec() // 60
+    lines = [
+        "📋 <b>Present attendance</b>",
+        "",
+        f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
+        "",
+    ]
+    earned_ids = {r.user_id for r in earned}
+    if earned:
+        lines.append("<b>This call (+1):</b>")
+        for row in sorted(earned, key=lambda r: (-r.present_days, r.display_name)):
+            safe = html.escape(row.display_name, quote=False)
+            day_word = "day" if row.present_days == 1 else "days"
+            lines.append(f"✅ {safe} — Present <b>{row.present_days}</b> {day_word}")
+        lines.append("")
+    else:
+        lines.append("<i>No one reached the present threshold in this call.</i>")
+        lines.append("")
+
+    if all_rows:
+        lines.append("<b>All-time in this group:</b>")
+        for i, row in enumerate(all_rows, start=1):
+            safe = html.escape(row.display_name, quote=False)
+            day_word = "day" if row.present_days == 1 else "days"
+            marker = " ✅" if row.user_id in earned_ids else ""
+            lines.append(
+                f"{i}. {safe} — Present <b>{row.present_days}</b> {day_word}{marker}"
+            )
+    else:
+        lines.append("<i>No present days recorded yet in this group.</i>")
+
+    return "\n".join(lines)

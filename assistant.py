@@ -230,6 +230,12 @@ async def _finalize_call(
     text = "\n".join(lines)
     if await _post_vc_summary(client, chat_id, text):
         app_state.assistant_vc_report_mono[chat_id] = time.monotonic()
+
+    earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, rows)
+    all_attendance = await asyncio.to_thread(dbmod.fetch_all_attendance, chat_id)
+    attendance_text = dbmod.format_attendance_message(earned, all_attendance)
+    await _post_vc_summary(client, chat_id, attendance_text)
+
     logger.info("Assistant finalized VC chat_id=%s participants=%s", chat_id, len(rows))
 
 
