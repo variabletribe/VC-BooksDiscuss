@@ -57,15 +57,7 @@ def _user_label(u: User | None, uid: int) -> str:
 
 
 def _parse_group_ids(raw: str) -> set[int]:
-    out: set[int] = set()
-    for part in raw.replace(" ", "").split(","):
-        if not part:
-            continue
-        try:
-            out.add(int(part))
-        except ValueError:
-            logger.warning("Skip invalid ASSISTANT_GROUP_IDS entry: %r", part)
-    return out
+    return app_state.parse_assistant_group_ids(raw)
 
 
 @dataclass
@@ -378,7 +370,7 @@ async def run_assistant() -> None:
 
     chat_ids = _parse_group_ids(raw_ids)
     if not chat_ids:
-        logger.warning("ASSISTANT_GROUP_IDS has no valid ids")
+        logger.warning("ASSISTANT_GROUP_IDS has no valid ids: %r", raw_ids)
         return
 
     client = TelegramClient(StringSession(session_s), api_id, api_hash)

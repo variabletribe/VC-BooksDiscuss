@@ -347,6 +347,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day).\n"
         "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
         "• /monthreport — previous calendar month’s participant stats.\n"
+        "• /vcstatus — show this group’s chat id and whether VC tracking is active.\n"
         "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n\n"
         "If I miss events: @BotFather → /setprivacy → Disable."
     )
@@ -401,6 +402,58 @@ async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         subtitle = f"{_month_name(m)} {y} (UTC)"
     text = _format_vc_stats_html(f"Monthly VC report — {_month_name(m)} {y}", subtitle, rows)
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_vcstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+
+    configured = app_state.configured_assistant_groups()
+    in_config = chat.id in configured
+    in_runtime = chat.id in app_state.assistant_chat_ids
+    has_session = bool((os.environ.get("TELEGRAM_SESSION_STRING") or "").strip())
+    has_api = bool(
+        (os.environ.get("TELEGRAM_API_ID") or "").strip()
+        and (os.environ.get("TELEGRAM_API_HASH") or "").strip()
+    )
+
+    if app_state.assistant_running and in_runtime:
+        tracking = "✅ Assistant is running and tracking this group."
+    elif in_config and not app_state.assistant_running:
+        tracking = (
+            "⚠️ This group is in ASSISTANT_GROUP_IDS but the assistant is NOT running. "
+            "Re-run session_login.py and update TELEGRAM_SESSION_STRING on Render."
+        )
+    elif not in_config and configured:
+        tracking = (
+            f"⚠️ This group is NOT in ASSISTANT_GROUP_IDS.\n"
+            f"Configured ids: {sorted(configured)}\n"
+            f"Add this group: <code>{chat.id}</code>"
+        )
+    elif not configured:
+        tracking = (
+            "⚠️ ASSISTANT_GROUP_IDS is not set — only limited Bot API tracking (often no names)."
+        )
+    else:
+        tracking = "⚠️ Assistant not active for this group."
+
+    lines = [
+        "🔧 <b>VC tracking status</b>",
+        "",
+        f"<b>This group chat id:</b> <code>{chat.id}</code>",
+        f"<b>Title:</b> {html.escape(chat.title or '—', quote=False)}",
+        "",
+        tracking,
+        "",
+        f"TELEGRAM_SESSION_STRING set: {'yes' if has_session else 'no'}",
+        f"TELEGRAM_API_ID/HASH set: {'yes' if has_api else 'no'}",
+        f"ASSISTANT_GROUP_IDS: <code>{html.escape(os.environ.get('ASSISTANT_GROUP_IDS', '') or '(not set)', quote=False)}</code>",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -545,14 +598,20 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = chat.id
     now = msg.date
-    assistant_group = chat_id in app_state.assistant_chat_ids
-    use_assistant = app_state.assistant_running and assistant_group
+    configured = app_state.configured_assistant_groups()
+    assistant_group = chat_id in configured
+    use_assistant = app_state.assistant_running and chat_id in app_state.assistant_chat_ids
 
     if assistant_group:
         if msg.video_chat_started:
             starter_id, starter_label = _vc_starter_from_message(msg)
             app_state.note_bot_vc_started(chat_id, now, starter_id, starter_label)
-            logger.info("VC started (assistant group) chat_id=%s starter=%s", chat_id, starter_id)
+            logger.info(
+                "VC started chat_id=%s starter=%s assistant_running=%s",
+                chat_id,
+                starter_id,
+                app_state.assistant_running,
+            )
             if use_assistant:
                 return
         if msg.video_chat_participants_invited and msg.video_chat_participants_invited.users:
@@ -560,28 +619,30 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
                 (u.id, _user_label(u)) for u in msg.video_chat_participants_invited.users
             ]
             app_state.note_bot_vc_invited(chat_id, now, invited)
-            logger.info("VC invited (assistant group) chat_id=%s count=%s", chat_id, len(invited))
+            logger.info("VC invited chat_id=%s count=%s", chat_id, len(invited))
             if use_assistant:
                 return
-        if msg.video_chat_ended and use_assistant:
+        if msg.video_chat_ended:
             _sessions.pop(chat_id, None)
             duration_sec = msg.video_chat_ended.duration
             sig = time.monotonic()
+            if not app_state.assistant_running:
+                logger.warning(
+                    "VC ended chat_id=%s — assistant configured but not running; using hint fallback",
+                    chat_id,
+                )
             asyncio.create_task(
                 _assistant_vc_fallback_report(chat_id, sig, duration_sec),
                 name=f"vc-fallback-{chat_id}",
             )
             return
 
-    if assistant_group and not app_state.assistant_running and msg.video_chat_ended:
+    if msg.video_chat_ended:
         logger.warning(
-            "VC ended chat_id=%s but assistant is not running — check TELEGRAM_SESSION_STRING on Render",
+            "VC ended chat_id=%s — not in ASSISTANT_GROUP_IDS (%s); limited Bot API tracking. "
+            "Run /vcstatus in the group to get the correct chat id.",
             chat_id,
-        )
-    elif not assistant_group and msg.video_chat_ended:
-        logger.warning(
-            "VC ended chat_id=%s but group is not in ASSISTANT_GROUP_IDS — limited Bot API tracking only",
-            chat_id,
+            sorted(configured) if configured else "none configured",
         )
 
     await asyncio.to_thread(dbmod.ensure_chat, chat_id, chat.title or None)
@@ -652,25 +713,13 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
             f"({duration_sec} s total)",
         ]
 
-        if not session or not session.participants:
+        if not parts:
             lines.append("")
-            if not app_state.assistant_running:
-                lines.append(
-                    "<i>No names recorded. Assistant is not running — set TELEGRAM_SESSION_STRING, "
-                    "TELEGRAM_API_ID, TELEGRAM_API_HASH, and ASSISTANT_GROUP_IDS on Render, then redeploy.</i>"
-                )
-            elif chat_id not in app_state.assistant_chat_ids:
-                lines.append(
-                    "<i>No names recorded. This group is not in ASSISTANT_GROUP_IDS — add its chat id "
-                    "to enable full VC tracking.</i>"
-                )
-            else:
-                lines.append(
-                    "<i>No names recorded. Bots cannot see a full “who joined” list — only "
-                    "some people appear when Telegram sends invite-style updates. "
-                    "Try inviting members to the call, and ensure privacy is disabled "
-                    "(@BotFather → /setprivacy → Disable).</i>"
-                )
+            lines.append(
+                "<i>No names recorded. Add this group to ASSISTANT_GROUP_IDS and set up the "
+                "Telethon assistant (TELEGRAM_SESSION_STRING). Run /vcstatus here for your "
+                "exact chat id and setup checklist.</i>"
+            )
         else:
             rows = sorted(parts, key=lambda x: -x[2])
             lines.append("")
@@ -814,6 +863,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("vcreport", cmd_vcreport))
     app.add_handler(CommandHandler("monthreport", cmd_monthreport))
+    app.add_handler(CommandHandler("vcstatus", cmd_vcstatus))
     app.add_handler(CommandHandler("reports", cmd_reports))
     app.add_handler(
         MessageHandler(

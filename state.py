@@ -2,15 +2,35 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
 assistant_running: bool = False
-# Supergroup IDs (negative) where the assistant tracks VC; bot skips Bot-API VC summaries for these.
+# Populated when assistant thread connects; may be empty if session failed.
 assistant_chat_ids: set[int] = set()
 # Set when assistant successfully posts a VC end summary (time.monotonic()); used for fallback dedupe.
 assistant_vc_report_mono: dict[int, float] = {}
+
+
+def parse_assistant_group_ids(raw: str | None = None) -> set[int]:
+    """Parse ASSISTANT_GROUP_IDS env (comma-separated supergroup ids)."""
+    text = (raw if raw is not None else os.environ.get("ASSISTANT_GROUP_IDS") or "").strip()
+    out: set[int] = set()
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            pass
+    return out
+
+
+def configured_assistant_groups() -> set[int]:
+    """Groups that should use assistant + hint tracking (from env, even if thread is down)."""
+    return parse_assistant_group_ids()
 
 
 @dataclass
