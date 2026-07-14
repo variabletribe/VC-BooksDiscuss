@@ -335,6 +335,21 @@ def _format_vc_stats_html(
     return "\n".join(lines)
 
 
+def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
+    threshold_min = dbmod.present_threshold_sec() // 60
+    lines = [
+        "📋 <b>Present attendance</b>",
+        f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
+        "",
+    ]
+    for i, row in enumerate(rows, start=1):
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+        safe = html.escape(row.display_name, quote=False)
+        day_word = "day" if row.present_days == 1 else "days"
+        lines.append(f"{medal} {safe} — <b>{row.present_days}</b> {day_word}")
+    return "\n".join(lines)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -346,6 +361,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Without that, Telegram only gives bots invite-style hints — not every joiner.\n\n"
         "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day).\n"
         "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
+        "• /attendance — present-day leaderboard for this group.\n"
         "• /monthreport — previous calendar month’s participant stats.\n"
         "• /vcstatus — show this group’s chat id and whether VC tracking is active.\n"
         "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n"
@@ -380,6 +396,26 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     subtitle = f"{_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
     text = _format_vc_stats_html("All-time VC report", subtitle, rows)
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+
+    rows = await asyncio.to_thread(dbmod.fetch_all_attendance, chat.id)
+    if not rows:
+        threshold_min = dbmod.present_threshold_sec() // 60
+        await update.message.reply_text(
+            f"No present attendance recorded in this group yet.\n\n"
+            f"Stay more than {threshold_min} minutes in a voice/video call to earn +1 present day."
+        )
+        return
+
+    await update.message.reply_text(_format_attendance_html(rows), parse_mode="HTML")
 
 
 async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -954,6 +990,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("vcreport", cmd_vcreport))
+    app.add_handler(CommandHandler("attendance", cmd_attendance))
     app.add_handler(CommandHandler("monthreport", cmd_monthreport))
     app.add_handler(CommandHandler("vcstatus", cmd_vcstatus))
     app.add_handler(CommandHandler("reports", cmd_reports))
