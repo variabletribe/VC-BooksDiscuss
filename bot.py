@@ -354,11 +354,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     await update.message.reply_text(
-        "I track group voice/video chats and store stats in a database.\n\n"
-        "Optional: with a Telethon user session (ASSISTANT_GROUP_IDS + "
-        "TELEGRAM_SESSION_STRING on the host), an assistant account can poll who is "
-        "in the VC and post join times (see repo session_login.py).\n\n"
-        "Without that, Telegram only gives bots invite-style hints — not every joiner.\n\n"
+         
+        " This is a customised private and personal bot for BOOKSDISCUSS telegram group.\n"
+        "This bot tracks the number of VC calls joined and the total hours spent in calls along with present attendance (20+ min = +1 day).\n\n"
         "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day).\n"
         "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
         "• /attendance — present-day leaderboard for this group.\n"
