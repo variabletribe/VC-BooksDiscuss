@@ -66,6 +66,13 @@ class LeaderRow(NamedTuple):
     total_seconds: int
 
 
+class VCStatsRow(NamedTuple):
+    user_id: int
+    display_name: str
+    vc_count: int
+    total_seconds: int
+
+
 class UserAttendance(Base):
     """Cumulative present days: +1 per VC when user stays more than PRESENT_MIN_SECONDS."""
 
@@ -252,6 +259,76 @@ def fetch_month_leaderboard(chat_id: int, year: int, month: int) -> list[LeaderR
     return fetch_leaderboard(chat_id, start, end)
 
 
+def fetch_vc_date_range(
+    chat_id: int,
+    period_start: datetime | None = None,
+    period_end_exclusive: datetime | None = None,
+) -> tuple[datetime | None, datetime | None]:
+    assert SessionLocal is not None
+    with SessionLocal() as s:
+        q = select(
+            func.min(VCSessionRow.ended_at),
+            func.max(VCSessionRow.ended_at),
+        ).where(VCSessionRow.chat_id == chat_id)
+        if period_start is not None:
+            if period_start.tzinfo is None:
+                period_start = period_start.replace(tzinfo=timezone.utc)
+            q = q.where(VCSessionRow.ended_at >= period_start)
+        if period_end_exclusive is not None:
+            if period_end_exclusive.tzinfo is None:
+                period_end_exclusive = period_end_exclusive.replace(tzinfo=timezone.utc)
+            q = q.where(VCSessionRow.ended_at < period_end_exclusive)
+        row = s.execute(q).one()
+        return row[0], row[1]
+
+
+def fetch_vc_stats(
+    chat_id: int,
+    period_start: datetime | None = None,
+    period_end_exclusive: datetime | None = None,
+) -> list[VCStatsRow]:
+    assert SessionLocal is not None
+    if period_start is not None and period_start.tzinfo is None:
+        period_start = period_start.replace(tzinfo=timezone.utc)
+    if period_end_exclusive is not None and period_end_exclusive.tzinfo is None:
+        period_end_exclusive = period_end_exclusive.replace(tzinfo=timezone.utc)
+
+    uid = VCParticipantRow.user_id
+    name = func.max(VCParticipantRow.display_name).label("dname")
+    vc_count = func.count(func.distinct(VCSessionRow.id)).label("vcs")
+    total = func.sum(VCParticipantRow.estimated_seconds).label("total")
+
+    with SessionLocal() as s:
+        q = (
+            select(uid, name, vc_count, total)
+            .join(VCSessionRow, VCParticipantRow.session_id == VCSessionRow.id)
+            .where(VCSessionRow.chat_id == chat_id)
+        )
+        if period_start is not None:
+            q = q.where(VCSessionRow.ended_at >= period_start)
+        if period_end_exclusive is not None:
+            q = q.where(VCSessionRow.ended_at < period_end_exclusive)
+        q = q.group_by(uid).order_by(total.desc(), vc_count.desc())
+        rows = s.execute(q).all()
+        return [
+            VCStatsRow(int(r[0]), str(r[1]), int(r[2] or 0), int(r[3] or 0))
+            for r in rows
+        ]
+
+
+def fetch_alltime_vc_stats(chat_id: int) -> tuple[list[VCStatsRow], datetime | None, datetime | None]:
+    rows = fetch_vc_stats(chat_id)
+    start, end = fetch_vc_date_range(chat_id)
+    return rows, start, end
+
+
+def fetch_month_vc_stats(chat_id: int, year: int, month: int) -> tuple[list[VCStatsRow], datetime | None, datetime | None]:
+    start, end = month_bounds_utc(year, month)
+    rows = fetch_vc_stats(chat_id, start, end)
+    range_start, range_end = fetch_vc_date_range(chat_id, start, end)
+    return rows, range_start, range_end
+
+
 def present_threshold_sec() -> int:
     try:
         return max(1, int(os.getenv("PRESENT_MIN_SECONDS", "1200")))
@@ -300,10 +377,7 @@ def fetch_all_attendance(chat_id: int) -> list[AttendanceRow]:
         return [AttendanceRow(r.user_id, r.display_name, r.present_days) for r in rows]
 
 
-def format_attendance_message(
-    earned: list[AttendanceRow],
-    all_rows: list[AttendanceRow],
-) -> str:
+def format_attendance_message(earned: list[AttendanceRow]) -> str:
     threshold_min = present_threshold_sec() // 60
     lines = [
         "📋 <b>Present attendance</b>",
@@ -311,28 +385,12 @@ def format_attendance_message(
         f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
         "",
     ]
-    earned_ids = {r.user_id for r in earned}
     if earned:
-        lines.append("<b>This call (+1):</b>")
         for row in sorted(earned, key=lambda r: (-r.present_days, r.display_name)):
             safe = html.escape(row.display_name, quote=False)
             day_word = "day" if row.present_days == 1 else "days"
             lines.append(f"✅ {safe} — Present <b>{row.present_days}</b> {day_word}")
-        lines.append("")
     else:
         lines.append("<i>No one reached the present threshold in this call.</i>")
-        lines.append("")
-
-    if all_rows:
-        lines.append("<b>All-time in this group:</b>")
-        for i, row in enumerate(all_rows, start=1):
-            safe = html.escape(row.display_name, quote=False)
-            day_word = "day" if row.present_days == 1 else "days"
-            marker = " ✅" if row.user_id in earned_ids else ""
-            lines.append(
-                f"{i}. {safe} — Present <b>{row.present_days}</b> {day_word}{marker}"
-            )
-    else:
-        lines.append("<i>No present days recorded yet in this group.</i>")
 
     return "\n".join(lines)

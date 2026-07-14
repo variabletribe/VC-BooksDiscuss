@@ -292,20 +292,46 @@ def _month_name(month: int) -> str:
     return datetime(2000, month, 1, tzinfo=timezone.utc).strftime("%B")
 
 
-def _format_leaderboard_html(year: int, month: int, rows: list[dbmod.LeaderRow], title: str) -> str:
+def _format_duration_hours(seconds: int) -> str:
+    if seconds <= 0:
+        return "0h"
+    h, r = divmod(seconds, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{h}h {m}m" if m else f"{h}h"
+    if m:
+        return f"{m}m {s}s" if s else f"{m}m"
+    return f"{s}s"
+
+
+def _format_date_utc(dt: datetime | None) -> str:
+    if dt is None:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%d %b %Y")
+
+
+def _format_vc_stats_html(
+    title: str,
+    subtitle: str,
+    rows: list[dbmod.VCStatsRow],
+) -> str:
     lines = [
         f"📊 <b>{html.escape(title)}</b>",
-        f"<b>{_month_name(month)} {year}</b> (estimated VC time, invite-based)",
+        f"<i>{html.escape(subtitle)}</i>",
         "",
     ]
     for i, row in enumerate(rows, start=1):
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
         safe = html.escape(row.display_name, quote=False)
-        lines.append(f"{medal} {safe} — <b>{_format_duration(row.total_seconds)}</b>")
+        vc_word = "VC" if row.vc_count == 1 else "VCs"
+        lines.append(
+            f"{medal} {safe} — <b>{row.vc_count}</b> {vc_word}, "
+            f"<b>{_format_duration_hours(row.total_seconds)}</b>"
+        )
     lines.append("")
-    lines.append(
-        "<i>Participants who joined the call are listed here along with their time they spent in the call.</i>"
-    )
+    lines.append("<i>VC count = calls joined · time = total minutes/hours in calls.</i>")
     return "\n".join(lines)
 
 
@@ -318,11 +344,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "TELEGRAM_SESSION_STRING on the host), an assistant account can poll who is "
         "in the VC and post join times (see repo session_login.py).\n\n"
         "Without that, Telegram only gives bots invite-style hints — not every joiner.\n\n"
-        "• After each VC ends, I reply with that call’s summary and a present-attendance message "
-        "(20+ minutes in one call = +1 present day, saved forever).\n"
-        "• /vcreport — this month’s leaderboard (most time first).\n"
-        "• /vcreport last — previous calendar month.\n"
-        "• /reports on|off — admins only; automatic monthly report (1st, UTC).\n\n"
+        "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day).\n"
+        "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
+        "• /monthreport — previous calendar month’s participant stats.\n"
+        "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n\n"
         "If I miss events: @BotFather → /setprivacy → Disable."
     )
 
@@ -345,22 +370,36 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Use this command in a group.")
         return
 
-    args = context.args or []
-    now = datetime.now(timezone.utc)
-    if args and args[0].lower() == "last":
-        y, m = dbmod.previous_calendar_month(now.year, now.month)
-        title = "Monthly VC leaderboard"
-    else:
-        y, m = now.year, now.month
-        title = "VC leaderboard (month to date)"
+    rows, start, end = await asyncio.to_thread(dbmod.fetch_alltime_vc_stats, chat.id)
+    if not rows:
+        await update.message.reply_text("No recorded VC data in this group yet.")
+        return
+    subtitle = f"{_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
+    text = _format_vc_stats_html("All-time VC report", subtitle, rows)
+    await update.message.reply_text(text, parse_mode="HTML")
 
-    rows = await asyncio.to_thread(dbmod.fetch_month_leaderboard, chat.id, y, m)
+
+async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+
+    now = datetime.now(timezone.utc)
+    y, m = dbmod.previous_calendar_month(now.year, now.month)
+    rows, start, end = await asyncio.to_thread(dbmod.fetch_month_vc_stats, chat.id, y, m)
     if not rows:
         await update.message.reply_text(
-            f"No recorded VC time for {_month_name(m)} {y} in this group."
+            f"No recorded VC data for {_month_name(m)} {y} in this group."
         )
         return
-    text = _format_leaderboard_html(y, m, rows, title)
+    if start and end:
+        subtitle = f"{_month_name(m)} {y}: {_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
+    else:
+        subtitle = f"{_month_name(m)} {y} (UTC)"
+    text = _format_vc_stats_html(f"Monthly VC report — {_month_name(m)} {y}", subtitle, rows)
     await update.message.reply_text(text, parse_mode="HTML")
 
 
@@ -441,8 +480,7 @@ async def _assistant_vc_fallback_report(
         return
 
     earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, [])
-    all_attendance = await asyncio.to_thread(dbmod.fetch_all_attendance, chat_id)
-    attendance_text = dbmod.format_attendance_message(earned, all_attendance)
+    attendance_text = dbmod.format_attendance_message(earned)
     await _http_bot_send_message(chat_id, attendance_text)
 
 
@@ -562,8 +600,7 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
         await msg.reply_text(text, parse_mode="HTML")
 
         earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, parts)
-        all_attendance = await asyncio.to_thread(dbmod.fetch_all_attendance, chat_id)
-        attendance_text = dbmod.format_attendance_message(earned, all_attendance)
+        attendance_text = dbmod.format_attendance_message(earned)
         await msg.reply_text(attendance_text, parse_mode="HTML")
 
         logger.info(
@@ -588,14 +625,17 @@ async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in chat_ids:
         if await asyncio.to_thread(dbmod.monthly_report_already_sent, chat_id, report_y, report_m):
             continue
-        rows = await asyncio.to_thread(dbmod.fetch_month_leaderboard, chat_id, report_y, report_m)
+        rows, start, end = await asyncio.to_thread(dbmod.fetch_month_vc_stats, chat_id, report_y, report_m)
         if not rows:
             continue
-        text = _format_leaderboard_html(
-            report_y,
-            report_m,
+        if start and end:
+            subtitle = f"{_month_name(report_m)} {report_y}: {_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
+        else:
+            subtitle = f"{_month_name(report_m)} {report_y} (UTC)"
+        text = _format_vc_stats_html(
+            f"Monthly VC report — {_month_name(report_m)} {report_y}",
+            subtitle,
             rows,
-            "Monthly VC leaderboard",
         )
         try:
             await bot.send_message(chat_id, text, parse_mode="HTML")
@@ -678,6 +718,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("vcreport", cmd_vcreport))
+    app.add_handler(CommandHandler("monthreport", cmd_monthreport))
     app.add_handler(CommandHandler("reports", cmd_reports))
     app.add_handler(
         MessageHandler(

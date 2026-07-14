@@ -73,6 +73,7 @@ class _CallState:
     call_id: int
     started_at: datetime
     last_ids: Set[int] = field(default_factory=set)
+    seen_ids: Set[int] = field(default_factory=set)
     join_at: Dict[int, datetime] = field(default_factory=dict)
     accumulated: Dict[int, float] = field(default_factory=dict)
     user_cache: Dict[int, User] = field(default_factory=dict)
@@ -126,7 +127,7 @@ def _is_live_group_call(call) -> bool:
 
 
 async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], Dict[int, User]]:
-    """Prefer phone.getGroupCall — often returns participants when getGroupParticipants is empty."""
+    """Merge GetGroupCall + GetGroupParticipants for the fullest participant list."""
     from telethon.tl.types import InputGroupCall
 
     pair = _call_input(call)
@@ -148,22 +149,24 @@ async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], D
                 users[u.id] = u
         if os.getenv("ASSISTANT_DEBUG"):
             logger.info("Assistant GetGroupCall: %s participant user id(s)", len(ids))
-        if ids:
-            return ids, users
     except Exception:
         logger.exception("Assistant GetGroupCall failed; falling back to GetGroupParticipants")
 
     offset = ""
     while True:
-        res = await client(
-            functions.phone.GetGroupParticipantsRequest(
-                call=inp,
-                ids=[],
-                sources=[],
-                offset=offset,
-                limit=256,
+        try:
+            res = await client(
+                functions.phone.GetGroupParticipantsRequest(
+                    call=inp,
+                    ids=[],
+                    sources=[],
+                    offset=offset,
+                    limit=256,
+                )
             )
-        )
+        except Exception:
+            logger.exception("Assistant GetGroupParticipants failed")
+            break
         for p in res.participants:
             peer = p.peer
             if isinstance(peer, PeerUser):
@@ -175,8 +178,31 @@ async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], D
         if not offset:
             break
     if os.getenv("ASSISTANT_DEBUG"):
-        logger.info("Assistant GetGroupParticipants total ids: %s", len(ids))
+        logger.info("Assistant merged participant ids: %s", len(ids))
     return ids, users
+
+
+async def _resolve_users(client: TelegramClient, st: _CallState, uids: Set[int]) -> None:
+    missing = [uid for uid in uids if uid not in st.user_cache]
+    if not missing:
+        return
+    try:
+        entities = await client.get_entities(missing)
+        if not isinstance(entities, list):
+            entities = [entities]
+        for ent in entities:
+            if isinstance(ent, User):
+                st.user_cache[ent.id] = ent
+    except Exception:
+        logger.exception("Assistant could not resolve %s user name(s)", len(missing))
+
+
+def _participant_seconds(st: _CallState, uid: int, ended_at: datetime) -> int:
+    sec = float(st.accumulated.get(uid, 0))
+    ja = st.join_at.get(uid)
+    if ja is not None:
+        sec += (ended_at - ja).total_seconds()
+    return max(0, int(round(sec)))
 
 
 async def _finalize_call(
@@ -189,16 +215,17 @@ async def _finalize_call(
         st.accumulated[uid] = st.accumulated.get(uid, 0) + (ended_at - ja).total_seconds()
     st.join_at.clear()
 
+    all_uids = st.seen_ids | set(st.accumulated.keys())
+    await _resolve_users(client, st, all_uids)
+
     duration_sec = max(0, int((ended_at - st.started_at).total_seconds()))
     rows: list[tuple[int, str, int]] = []
-    for uid, sec in st.accumulated.items():
-        sec_i = int(round(sec))
-        if sec_i < 1:
-            continue
+    for uid in all_uids:
+        sec_i = min(_participant_seconds(st, uid, ended_at), duration_sec)
         label = _user_label(st.user_cache.get(uid), uid)
-        rows.append((uid, label, min(sec_i, duration_sec)))
+        rows.append((uid, label, sec_i))
 
-    rows.sort(key=lambda x: -x[2])
+    rows.sort(key=lambda x: (-x[2], x[1].lower()))
 
     await asyncio.to_thread(
         dbmod.record_vc_session,
@@ -232,15 +259,14 @@ async def _finalize_call(
         app_state.assistant_vc_report_mono[chat_id] = time.monotonic()
 
     earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, rows)
-    all_attendance = await asyncio.to_thread(dbmod.fetch_all_attendance, chat_id)
-    attendance_text = dbmod.format_attendance_message(earned, all_attendance)
+    attendance_text = dbmod.format_attendance_message(earned)
     await _post_vc_summary(client, chat_id, attendance_text)
 
     logger.info("Assistant finalized VC chat_id=%s participants=%s", chat_id, len(rows))
 
 
 async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
-    interval = float(os.getenv("ASSISTANT_POLL_SECONDS", "3"))
+    interval = float(os.getenv("ASSISTANT_POLL_SECONDS", "2"))
     states: Dict[int, _CallState] = {}
 
     while True:
@@ -281,16 +307,21 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 call_id = getattr(call, "id", None)
                 if call_id is None:
                     continue
-                if st is None or st.call_id != call_id:
+                if st is not None and st.call_id != call_id:
+                    await _finalize_call(client, chat_id, st, now)
+                    st = None
+                if st is None:
                     states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
 
                 current_ids, user_map = await _fetch_participants(client, call)
                 st.user_cache.update(user_map)
+                st.seen_ids.update(current_ids)
 
                 joined = current_ids - st.last_ids
                 left = st.last_ids - current_ids
                 for uid in joined:
+                    st.seen_ids.add(uid)
                     st.join_at[uid] = now
                 for uid in left:
                     ja = st.join_at.pop(uid, None)
