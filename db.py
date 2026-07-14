@@ -97,6 +97,14 @@ class RemoveUserResult(NamedTuple):
     attendance_rows_deleted: int
 
 
+class FindUserRow(NamedTuple):
+    user_id: int
+    display_name: str
+    vc_count: int
+    total_seconds: int
+    present_days: int
+
+
 _engine = None
 SessionLocal = None
 
@@ -411,6 +419,76 @@ def remove_user_from_chat(chat_id: int, user_id: int) -> RemoveUserResult:
             vc_rows_deleted=int(vc_deleted or 0),
             attendance_rows_deleted=int(att_deleted or 0),
         )
+
+
+def find_users_in_chat(chat_id: int, query: str, limit: int = 15) -> list[FindUserRow]:
+    """Search stored display names (includes old @usernames) for this group."""
+    assert SessionLocal is not None
+    term = query.strip().lstrip("@")
+    if not term:
+        return []
+    pattern = f"%{term}%"
+
+    uid = VCParticipantRow.user_id
+    name = func.max(VCParticipantRow.display_name).label("dname")
+    vc_count = func.count(func.distinct(VCSessionRow.id)).label("vcs")
+    total = func.coalesce(func.sum(VCParticipantRow.estimated_seconds), 0).label("total")
+
+    with SessionLocal() as s:
+        by_id: dict[int, FindUserRow] = {}
+
+        vc_q = (
+            select(uid, name, vc_count, total)
+            .join(VCSessionRow, VCParticipantRow.session_id == VCSessionRow.id)
+            .where(
+                VCSessionRow.chat_id == chat_id,
+                VCParticipantRow.display_name.ilike(pattern),
+            )
+            .group_by(uid)
+            .order_by(total.desc())
+            .limit(limit)
+        )
+        for r in s.execute(vc_q).all():
+            by_id[int(r[0])] = FindUserRow(
+                int(r[0]), str(r[1]), int(r[2] or 0), int(r[3] or 0), 0
+            )
+
+        att_rows = s.scalars(
+            select(UserAttendance).where(
+                UserAttendance.chat_id == chat_id,
+                UserAttendance.display_name.ilike(pattern),
+            )
+        ).all()
+        for att in att_rows:
+            if att.user_id in by_id:
+                row = by_id[att.user_id]
+                by_id[att.user_id] = FindUserRow(
+                    row.user_id,
+                    row.display_name,
+                    row.vc_count,
+                    row.total_seconds,
+                    att.present_days,
+                )
+            else:
+                by_id[att.user_id] = FindUserRow(
+                    att.user_id, att.display_name, 0, 0, att.present_days
+                )
+
+        for user_id, row in list(by_id.items()):
+            if row.present_days:
+                continue
+            att = s.get(UserAttendance, (chat_id, user_id))
+            if att:
+                by_id[user_id] = FindUserRow(
+                    row.user_id,
+                    row.display_name,
+                    row.vc_count,
+                    row.total_seconds,
+                    att.present_days,
+                )
+
+        rows = sorted(by_id.values(), key=lambda x: (-x.total_seconds, x.display_name.lower()))
+        return rows[:limit]
 
 
 def fetch_all_attendance(chat_id: int) -> list[AttendanceRow]:

@@ -349,7 +349,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /monthreport — previous calendar month’s participant stats.\n"
         "• /vcstatus — show this group’s chat id and whether VC tracking is active.\n"
         "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n"
-        "• /removeuser USER_ID — admins only; remove a user from VC stats and attendance.\n\n"
+        "• /removeuser USER_ID — admins only; remove a user from VC stats and attendance.\n"
+        "• /finduser NAME — admins only; find a user's id by name or old @username.\n\n"
         "If I miss events: @BotFather → /setprivacy → Disable."
     )
 
@@ -457,6 +458,49 @@ async def cmd_vcstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await update.message.reply_text("Only group admins can search the database.")
+        return
+
+    query = " ".join(context.args).strip().lstrip("@")
+    if not query:
+        await update.message.reply_text(
+            "Usage: /finduser NAME_OR_USERNAME\n\n"
+            "Examples:\n"
+            "/finduser udvega\n"
+            "/finduser Palxp1\n"
+            "/finduser Kumar",
+        )
+        return
+
+    rows = await asyncio.to_thread(dbmod.find_users_in_chat, chat.id, query)
+    if not rows:
+        await update.message.reply_text(
+            f"No database records match <code>{html.escape(query, quote=False)}</code> in this group.",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = [f"Found <b>{len(rows)}</b> match(es) for <code>{html.escape(query, quote=False)}</code>:", ""]
+    for i, row in enumerate(rows, start=1):
+        safe_name = html.escape(row.display_name, quote=False)
+        lines.append(f"{i}. <code>{row.user_id}</code> — {safe_name}")
+        lines.append(
+            f"   {row.vc_count} VC(s), {_format_duration(row.total_seconds)}"
+            + (f" | {row.present_days} present day(s)" if row.present_days else "")
+        )
+    lines.append("")
+    lines.append("Remove with: /removeuser USER_ID")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -472,7 +516,7 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             "Usage: /removeuser &lt;telegram_user_id&gt;\n\n"
             "Example: /removeuser 1087968824\n\n"
-            "Run /vcreport or list users in the database to find the numeric user id.",
+            "Run /finduser NAME to look up a user's numeric id.",
             parse_mode="HTML",
         )
         return
@@ -914,6 +958,7 @@ def main() -> None:
     app.add_handler(CommandHandler("vcstatus", cmd_vcstatus))
     app.add_handler(CommandHandler("reports", cmd_reports))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
+    app.add_handler(CommandHandler("finduser", cmd_finduser))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
