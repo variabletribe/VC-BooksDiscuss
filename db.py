@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timezone
 from typing import Iterable, NamedTuple
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, func, select
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -88,6 +88,13 @@ class AttendanceRow(NamedTuple):
     user_id: int
     display_name: str
     present_days: int
+
+
+class RemoveUserResult(NamedTuple):
+    user_id: int
+    display_name: str | None
+    vc_rows_deleted: int
+    attendance_rows_deleted: int
 
 
 _engine = None
@@ -363,6 +370,47 @@ def record_present_attendance(
             earned.append(AttendanceRow(uid, name, row.present_days))
         s.commit()
     return earned
+
+
+def remove_user_from_chat(chat_id: int, user_id: int) -> RemoveUserResult:
+    """Delete all VC participant rows and attendance for one user in this group."""
+    assert SessionLocal is not None
+    with SessionLocal() as s:
+        name = s.scalar(
+            select(VCParticipantRow.display_name)
+            .join(VCSessionRow, VCParticipantRow.session_id == VCSessionRow.id)
+            .where(
+                VCSessionRow.chat_id == chat_id,
+                VCParticipantRow.user_id == user_id,
+            )
+            .order_by(VCSessionRow.ended_at.desc())
+            .limit(1)
+        )
+        if name is None:
+            att = s.get(UserAttendance, (chat_id, user_id))
+            if att is not None:
+                name = att.display_name
+
+        session_ids = select(VCSessionRow.id).where(VCSessionRow.chat_id == chat_id)
+        vc_deleted = s.execute(
+            delete(VCParticipantRow).where(
+                VCParticipantRow.user_id == user_id,
+                VCParticipantRow.session_id.in_(session_ids),
+            )
+        ).rowcount
+        att_deleted = s.execute(
+            delete(UserAttendance).where(
+                UserAttendance.chat_id == chat_id,
+                UserAttendance.user_id == user_id,
+            )
+        ).rowcount
+        s.commit()
+        return RemoveUserResult(
+            user_id=user_id,
+            display_name=str(name) if name else None,
+            vc_rows_deleted=int(vc_deleted or 0),
+            attendance_rows_deleted=int(att_deleted or 0),
+        )
 
 
 def fetch_all_attendance(chat_id: int) -> list[AttendanceRow]:

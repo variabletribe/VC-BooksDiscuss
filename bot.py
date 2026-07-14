@@ -348,7 +348,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
         "• /monthreport — previous calendar month’s participant stats.\n"
         "• /vcstatus — show this group’s chat id and whether VC tracking is active.\n"
-        "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n\n"
+        "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n"
+        "• /removeuser USER_ID — admins only; remove a user from VC stats and attendance.\n\n"
         "If I miss events: @BotFather → /setprivacy → Disable."
     )
 
@@ -452,6 +453,53 @@ async def cmd_vcstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"TELEGRAM_SESSION_STRING set: {'yes' if has_session else 'no'}",
         f"TELEGRAM_API_ID/HASH set: {'yes' if has_api else 'no'}",
         f"ASSISTANT_GROUP_IDS: <code>{html.escape(os.environ.get('ASSISTANT_GROUP_IDS', '') or '(not set)', quote=False)}</code>",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await update.message.reply_text("Only group admins can remove users from the database.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /removeuser &lt;telegram_user_id&gt;\n\n"
+            "Example: /removeuser 1087968824\n\n"
+            "Run /vcreport or list users in the database to find the numeric user id.",
+            parse_mode="HTML",
+        )
+        return
+
+    raw = context.args[0].strip()
+    try:
+        user_id = int(raw)
+    except ValueError:
+        await update.message.reply_text("User id must be a number, e.g. /removeuser 1087968824")
+        return
+    if user_id <= 0:
+        await update.message.reply_text("User id must be a positive Telegram user id.")
+        return
+
+    result = await asyncio.to_thread(dbmod.remove_user_from_chat, chat.id, user_id)
+    if result.vc_rows_deleted == 0 and result.attendance_rows_deleted == 0:
+        await update.message.reply_text(
+            f"No database records found for user id <code>{user_id}</code> in this group.",
+            parse_mode="HTML",
+        )
+        return
+
+    label = html.escape(result.display_name or str(user_id), quote=False)
+    lines = [
+        f"Removed <b>{label}</b> (<code>{user_id}</code>) from this group's stats:",
+        f"• VC call records deleted: <b>{result.vc_rows_deleted}</b>",
+        f"• Attendance records deleted: <b>{result.attendance_rows_deleted}</b>",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -865,6 +913,7 @@ def main() -> None:
     app.add_handler(CommandHandler("monthreport", cmd_monthreport))
     app.add_handler(CommandHandler("vcstatus", cmd_vcstatus))
     app.add_handler(CommandHandler("reports", cmd_reports))
+    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
