@@ -650,12 +650,12 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
     if msg.video_chat_started:
         session = VCSession(started_at=now, participants={})
         starter_id, starter_label = _vc_starter_from_message(msg)
-        if starter_id is not None and starter_label:
+        if starter_id is not None and starter_label and app_state.is_vc_participant(starter_id):
             session.participants[starter_id] = (starter_label, now)
         hint = app_state.peek_bot_vc_hint(chat_id)
         if hint:
             for uid, (label, first_seen) in hint.participants.items():
-                if uid not in session.participants:
+                if app_state.is_vc_participant(uid) and uid not in session.participants:
                     session.participants[uid] = (label, first_seen)
         _sessions[chat_id] = session
         logger.info("VC started chat_id=%s starter=%s", chat_id, starter_id)
@@ -667,7 +667,7 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
             session = VCSession(started_at=now, participants={})
             _sessions[chat_id] = session
         for user in msg.video_chat_participants_invited.users:
-            if user.id not in session.participants:
+            if app_state.is_vc_participant(user.id, user.username) and user.id not in session.participants:
                 session.participants[user.id] = (_user_label(user), now)
         logger.info(
             "VC participants invited chat_id=%s count=%s",

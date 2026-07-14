@@ -7,6 +7,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
+# Telegram placeholder for anonymous group-call users — not a real participant.
+GROUP_ANONYMOUS_BOT_ID = 1087968824
+
 assistant_running: bool = False
 # Populated when assistant thread connects; may be empty if session failed.
 assistant_chat_ids: set[int] = set()
@@ -47,6 +50,15 @@ bot_vc_hints: dict[int, BotVCHint] = {}
 vc_wake_mono: dict[int, float] = {}
 
 
+def is_vc_participant(user_id: int, username: str | None = None) -> bool:
+    """False for Telegram system accounts that appear in VC lists but are not real people."""
+    if user_id == GROUP_ANONYMOUS_BOT_ID:
+        return False
+    if username and username.lower() == "groupanonymousbot":
+        return False
+    return True
+
+
 def signal_vc_wake(chat_id: int) -> None:
     vc_wake_mono[chat_id] = time.monotonic()
 
@@ -55,7 +67,12 @@ def note_bot_vc_started(chat_id: int, when: datetime, user_id: int | None, label
     hint = bot_vc_hints.setdefault(chat_id, BotVCHint())
     if hint.started_at is None:
         hint.started_at = when
-    if user_id is not None and label and user_id not in hint.participants:
+    if (
+        user_id is not None
+        and label
+        and is_vc_participant(user_id)
+        and user_id not in hint.participants
+    ):
         hint.participants[user_id] = (label, when)
     signal_vc_wake(chat_id)
 
@@ -65,7 +82,7 @@ def note_bot_vc_invited(chat_id: int, when: datetime, users: list[tuple[int, str
     if hint.started_at is None:
         hint.started_at = when
     for uid, label in users:
-        if uid not in hint.participants:
+        if is_vc_participant(uid) and uid not in hint.participants:
             hint.participants[uid] = (label, when)
     signal_vc_wake(chat_id)
 

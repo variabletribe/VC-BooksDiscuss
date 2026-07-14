@@ -119,6 +119,11 @@ def _is_live_group_call(call) -> bool:
     return _call_input(call) is not None
 
 
+def _is_trackable_user(uid: int, user: User | None = None) -> bool:
+    username = user.username if user else None
+    return app_state.is_vc_participant(uid, username)
+
+
 async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], Dict[int, User]]:
     """Merge GetGroupCall + GetGroupParticipants for the fullest participant list."""
     from telethon.tl.types import InputGroupCall
@@ -135,10 +140,10 @@ async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], D
         res = await client(functions.phone.GetGroupCallRequest(call=inp, limit=500))
         for p in res.participants:
             peer = p.peer
-            if isinstance(peer, PeerUser):
+            if isinstance(peer, PeerUser) and _is_trackable_user(peer.user_id):
                 ids.add(peer.user_id)
         for u in res.users:
-            if isinstance(u, User):
+            if isinstance(u, User) and _is_trackable_user(u.id, u):
                 users[u.id] = u
         if os.getenv("ASSISTANT_DEBUG"):
             logger.info("Assistant GetGroupCall: %s participant user id(s)", len(ids))
@@ -162,10 +167,10 @@ async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], D
             break
         for p in res.participants:
             peer = p.peer
-            if isinstance(peer, PeerUser):
+            if isinstance(peer, PeerUser) and _is_trackable_user(peer.user_id):
                 ids.add(peer.user_id)
         for u in res.users:
-            if isinstance(u, User):
+            if isinstance(u, User) and _is_trackable_user(u.id, u):
                 users[u.id] = u
         offset = res.next_offset or ""
         if not offset:
@@ -176,16 +181,25 @@ async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], D
 
 
 async def _resolve_users(client: TelegramClient, st: _CallState, uids: Set[int]) -> None:
-    missing = [uid for uid in uids if uid not in st.user_cache]
+    missing = [
+        uid for uid in uids if uid not in st.user_cache and _is_trackable_user(uid)
+    ]
     if not missing:
         return
     try:
-        entities = await client.get_entities(missing)
-        if not isinstance(entities, list):
-            entities = [entities]
-        for ent in entities:
-            if isinstance(ent, User):
+        results = await asyncio.gather(
+            *[client.get_entity(uid) for uid in missing],
+            return_exceptions=True,
+        )
+        failed = 0
+        for ent in results:
+            if isinstance(ent, BaseException):
+                failed += 1
+                continue
+            if isinstance(ent, User) and _is_trackable_user(ent.id, ent):
                 st.user_cache[ent.id] = ent
+        if failed:
+            logger.warning("Assistant could not resolve %s user name(s)", failed)
     except Exception:
         logger.exception("Assistant could not resolve %s user name(s)", len(missing))
 
@@ -205,6 +219,8 @@ def _apply_bot_hints(st: _CallState, chat_id: int, now: datetime) -> None:
     if hint.started_at and hint.started_at < st.started_at:
         st.started_at = hint.started_at
     for uid, (label, first_seen) in hint.participants.items():
+        if not _is_trackable_user(uid):
+            continue
         st.seen_ids.add(uid)
         st.hint_labels[uid] = label
         if uid not in st.join_at and uid not in st.accumulated:
@@ -227,7 +243,11 @@ async def _finalize_call(
         st.accumulated[uid] = st.accumulated.get(uid, 0) + (ended_at - ja).total_seconds()
     st.join_at.clear()
 
-    all_uids = st.seen_ids | set(st.accumulated.keys()) | set(st.hint_labels.keys())
+    all_uids = {
+        uid
+        for uid in (st.seen_ids | set(st.accumulated.keys()) | set(st.hint_labels.keys()))
+        if _is_trackable_user(uid)
+    }
     await _resolve_users(client, st, all_uids)
 
     duration_sec = max(0, int((ended_at - st.started_at).total_seconds()))
