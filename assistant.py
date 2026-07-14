@@ -77,6 +77,7 @@ class _CallState:
     join_at: Dict[int, datetime] = field(default_factory=dict)
     accumulated: Dict[int, float] = field(default_factory=dict)
     user_cache: Dict[int, User] = field(default_factory=dict)
+    hint_labels: Dict[int, str] = field(default_factory=dict)
 
 
 async def _send_bot_message(chat_id: int, text: str) -> bool:
@@ -205,6 +206,25 @@ def _participant_seconds(st: _CallState, uid: int, ended_at: datetime) -> int:
     return max(0, int(round(sec)))
 
 
+def _apply_bot_hints(st: _CallState, chat_id: int, now: datetime) -> None:
+    hint = app_state.peek_bot_vc_hint(chat_id)
+    if hint is None:
+        return
+    if hint.started_at and hint.started_at < st.started_at:
+        st.started_at = hint.started_at
+    for uid, (label, first_seen) in hint.participants.items():
+        st.seen_ids.add(uid)
+        st.hint_labels[uid] = label
+        if uid not in st.join_at and uid not in st.accumulated:
+            st.join_at[uid] = first_seen
+
+
+def _label_from_state(st: _CallState, uid: int) -> str:
+    if uid in st.hint_labels:
+        return st.hint_labels[uid]
+    return _user_label(st.user_cache.get(uid), uid)
+
+
 async def _finalize_call(
     client: TelegramClient,
     chat_id: int,
@@ -215,17 +235,18 @@ async def _finalize_call(
         st.accumulated[uid] = st.accumulated.get(uid, 0) + (ended_at - ja).total_seconds()
     st.join_at.clear()
 
-    all_uids = st.seen_ids | set(st.accumulated.keys())
+    all_uids = st.seen_ids | set(st.accumulated.keys()) | set(st.hint_labels.keys())
     await _resolve_users(client, st, all_uids)
 
     duration_sec = max(0, int((ended_at - st.started_at).total_seconds()))
     rows: list[tuple[int, str, int]] = []
     for uid in all_uids:
         sec_i = min(_participant_seconds(st, uid, ended_at), duration_sec)
-        label = _user_label(st.user_cache.get(uid), uid)
+        label = _label_from_state(st, uid)
         rows.append((uid, label, sec_i))
 
     rows.sort(key=lambda x: (-x[2], x[1].lower()))
+    app_state.take_bot_vc_hint(chat_id)
 
     await asyncio.to_thread(
         dbmod.record_vc_session,
@@ -314,6 +335,8 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                     states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
 
+                _apply_bot_hints(st, chat_id, now)
+
                 current_ids, user_map = await _fetch_participants(client, call)
                 st.user_cache.update(user_map)
                 st.seen_ids.update(current_ids)
@@ -332,7 +355,12 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
             except Exception:
                 logger.exception("Assistant poll error chat_id=%s", chat_id)
 
-        await asyncio.sleep(interval)
+        sleep_for = interval
+        if any(app_state.vc_wake_mono.get(cid, 0) > time.monotonic() - 5 for cid in chat_ids):
+            sleep_for = min(0.5, interval)
+        for cid in chat_ids:
+            app_state.vc_wake_mono.pop(cid, None)
+        await asyncio.sleep(sleep_for)
 
 
 async def run_assistant() -> None:

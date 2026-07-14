@@ -452,34 +452,64 @@ async def _assistant_vc_fallback_report(
     duration_sec: int,
 ) -> None:
     """If assistant never saw the call (short VC between polls), still post Telegram duration."""
-    wait = float(os.getenv("ASSISTANT_FALLBACK_WAIT_SECONDS", "15"))
+    wait = float(os.getenv("ASSISTANT_FALLBACK_WAIT_SECONDS", "8"))
     await asyncio.sleep(wait)
     if app_state.assistant_vc_report_mono.get(chat_id, 0) > signal_mono:
         return
     ended = datetime.now(timezone.utc)
+    hint = app_state.take_bot_vc_hint(chat_id)
+    end_ts = _utc_ts(ended)
+
+    parts: list[tuple[int, str, int]] = []
+    started_at = hint.started_at if hint else None
+    if hint and hint.participants:
+        for uid, (label, first_seen) in hint.participants.items():
+            span = max(0.0, end_ts - _utc_ts(first_seen))
+            est_sec = int(min(span, float(duration_sec)))
+            parts.append((uid, label, est_sec))
+
     await asyncio.to_thread(
         dbmod.record_vc_session,
         chat_id,
         ended,
         duration_sec,
-        None,
-        [],
+        started_at,
+        parts,
     )
     await asyncio.to_thread(dbmod.ensure_chat, chat_id, None)
-    text = (
-        "📞 <b>Voice/video chat ended</b>\n\n"
-        f"<b>Call length (Telegram):</b> {duration_sec // 60} min {duration_sec % 60} s "
-        f"({duration_sec} s total)\n\n"
-        "<i>No per-person breakdown: the assistant never saw an active group call in "
-        "Telegram’s channel state, or participant lists stayed empty for this call. "
-        "Redeploy the latest code (uses getGroupCall). Add ASSISTANT_DEBUG=1 on the host "
-        "and check logs. The assistant user must be in this supergroup.</i>"
-    )
+
+    lines = [
+        "📞 <b>Voice/video chat ended</b>",
+        "",
+        f"<b>Call length (tracked):</b> {duration_sec // 60} min {duration_sec % 60} s",
+        "",
+    ]
+    if parts:
+        rows = sorted(parts, key=lambda x: -x[2])
+        lines.append(f"<b>People in VC:</b> {len(rows)}")
+        lines.append("")
+        for rank, (_uid, label, est_sec) in enumerate(rows, start=1):
+            mp, sp = est_sec // 60, est_sec % 60
+            safe = html.escape(label, quote=False)
+            lines.append(f"{rank}. {safe}: <b>{mp} min {sp} s</b>")
+        lines.append("")
+        lines.append(
+            "<i>Names from Bot API hints (assistant poll missed this short call). "
+            "For full tracking, keep the assistant session active.</i>"
+        )
+    else:
+        lines.append(
+            "<i>No per-person breakdown: the assistant never saw an active group call in "
+            "Telegram’s channel state, and the Bot API did not report who joined. "
+            "Check TELEGRAM_SESSION_STRING, ASSISTANT_GROUP_IDS, and that the assistant "
+            "user is in this supergroup. Add ASSISTANT_DEBUG=1 and check Render logs.</i>"
+        )
+    text = "\n".join(lines)
     if not await _http_bot_send_message(chat_id, text):
         logger.error("Assistant fallback could not send chat_id=%s", chat_id)
         return
 
-    earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, [])
+    earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, parts)
     attendance_text = dbmod.format_attendance_message(earned)
     await _http_bot_send_message(chat_id, attendance_text)
 
@@ -493,6 +523,17 @@ class VideoChatServiceFilter(MessageFilter):
         )
 
 
+def _vc_starter_from_message(msg) -> tuple[int | None, str | None]:
+    """Best-effort who started the VC from a Bot API service message."""
+    if msg.from_user:
+        return msg.from_user.id, _user_label(msg.from_user)
+    sender = getattr(msg, "sender_chat", None)
+    if sender is not None and getattr(sender, "type", None) == "channel":
+        title = getattr(sender, "title", None) or str(sender.id)
+        return None, title
+    return None, None
+
+
 async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg or not msg.chat:
@@ -504,11 +545,25 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = chat.id
     now = msg.date
+    assistant_group = chat_id in app_state.assistant_chat_ids
+    use_assistant = app_state.assistant_running and assistant_group
 
-    if app_state.assistant_running and chat_id in app_state.assistant_chat_ids:
-        if msg.video_chat_started or msg.video_chat_participants_invited:
-            return
-        if msg.video_chat_ended:
+    if assistant_group:
+        if msg.video_chat_started:
+            starter_id, starter_label = _vc_starter_from_message(msg)
+            app_state.note_bot_vc_started(chat_id, now, starter_id, starter_label)
+            logger.info("VC started (assistant group) chat_id=%s starter=%s", chat_id, starter_id)
+            if use_assistant:
+                return
+        if msg.video_chat_participants_invited and msg.video_chat_participants_invited.users:
+            invited = [
+                (u.id, _user_label(u)) for u in msg.video_chat_participants_invited.users
+            ]
+            app_state.note_bot_vc_invited(chat_id, now, invited)
+            logger.info("VC invited (assistant group) chat_id=%s count=%s", chat_id, len(invited))
+            if use_assistant:
+                return
+        if msg.video_chat_ended and use_assistant:
             _sessions.pop(chat_id, None)
             duration_sec = msg.video_chat_ended.duration
             sig = time.monotonic()
@@ -518,11 +573,31 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
+    if assistant_group and not app_state.assistant_running and msg.video_chat_ended:
+        logger.warning(
+            "VC ended chat_id=%s but assistant is not running — check TELEGRAM_SESSION_STRING on Render",
+            chat_id,
+        )
+    elif not assistant_group and msg.video_chat_ended:
+        logger.warning(
+            "VC ended chat_id=%s but group is not in ASSISTANT_GROUP_IDS — limited Bot API tracking only",
+            chat_id,
+        )
+
     await asyncio.to_thread(dbmod.ensure_chat, chat_id, chat.title or None)
 
     if msg.video_chat_started:
-        _sessions[chat_id] = VCSession(started_at=now, participants={})
-        logger.info("VC started chat_id=%s", chat_id)
+        session = VCSession(started_at=now, participants={})
+        starter_id, starter_label = _vc_starter_from_message(msg)
+        if starter_id is not None and starter_label:
+            session.participants[starter_id] = (starter_label, now)
+        hint = app_state.peek_bot_vc_hint(chat_id)
+        if hint:
+            for uid, (label, first_seen) in hint.participants.items():
+                if uid not in session.participants:
+                    session.participants[uid] = (label, first_seen)
+        _sessions[chat_id] = session
+        logger.info("VC started chat_id=%s starter=%s", chat_id, starter_id)
         return
 
     if msg.video_chat_participants_invited and msg.video_chat_participants_invited.users:
@@ -551,6 +626,15 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
                 span = max(0.0, end_ts - _utc_ts(first_seen))
                 est_sec = int(min(span, float(duration_sec)))
                 parts.append((uid, label, est_sec))
+        if not parts:
+            hint = app_state.take_bot_vc_hint(chat_id)
+            if hint and hint.participants:
+                for uid, (label, first_seen) in hint.participants.items():
+                    span = max(0.0, end_ts - _utc_ts(first_seen))
+                    est_sec = int(min(span, float(duration_sec)))
+                    parts.append((uid, label, est_sec))
+        else:
+            app_state.take_bot_vc_hint(chat_id)
 
         await asyncio.to_thread(
             dbmod.record_vc_session,
@@ -570,12 +654,23 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
         if not session or not session.participants:
             lines.append("")
-            lines.append(
-                "<i>No names recorded. Bots cannot see a full “who joined” list — only "
-                "some people appear when Telegram sends invite-style updates. "
-                "Try inviting members to the call, and ensure privacy is disabled "
-                "(@BotFather → /setprivacy → Disable).</i>"
-            )
+            if not app_state.assistant_running:
+                lines.append(
+                    "<i>No names recorded. Assistant is not running — set TELEGRAM_SESSION_STRING, "
+                    "TELEGRAM_API_ID, TELEGRAM_API_HASH, and ASSISTANT_GROUP_IDS on Render, then redeploy.</i>"
+                )
+            elif chat_id not in app_state.assistant_chat_ids:
+                lines.append(
+                    "<i>No names recorded. This group is not in ASSISTANT_GROUP_IDS — add its chat id "
+                    "to enable full VC tracking.</i>"
+                )
+            else:
+                lines.append(
+                    "<i>No names recorded. Bots cannot see a full “who joined” list — only "
+                    "some people appear when Telegram sends invite-style updates. "
+                    "Try inviting members to the call, and ensure privacy is disabled "
+                    "(@BotFather → /setprivacy → Disable).</i>"
+                )
         else:
             rows = sorted(parts, key=lambda x: -x[2])
             lines.append("")
