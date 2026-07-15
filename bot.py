@@ -788,15 +788,8 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if msg.video_chat_participants_invited and msg.video_chat_participants_invited.users:
-        session = _sessions.get(chat_id)
-        if session is None:
-            session = VCSession(started_at=now, participants={})
-            _sessions[chat_id] = session
-        for user in msg.video_chat_participants_invited.users:
-            if app_state.is_vc_participant(user.id, user.username) and user.id not in session.participants:
-                session.participants[user.id] = (_user_label(user), now)
         logger.info(
-            "VC participants invited chat_id=%s count=%s",
+            "VC participants invited chat_id=%s count=%s (not counted until they join)",
             chat_id,
             len(msg.video_chat_participants_invited.users),
         )

@@ -218,13 +218,12 @@ def _apply_bot_hints(st: _CallState, chat_id: int, now: datetime) -> None:
         return
     if hint.started_at and hint.started_at < st.started_at:
         st.started_at = hint.started_at
-    for uid, (label, first_seen) in hint.participants.items():
-        if not _is_trackable_user(uid):
-            continue
-        st.seen_ids.add(uid)
-        st.hint_labels[uid] = label
-        if uid not in st.join_at and uid not in st.accumulated:
-            st.join_at[uid] = first_seen
+    for uid, (label, _first_seen) in hint.participants.items():
+        if _is_trackable_user(uid):
+            st.hint_labels[uid] = label
+    for uid, label in hint.invite_labels.items():
+        if _is_trackable_user(uid):
+            st.hint_labels.setdefault(uid, label)
 
 
 def _label_from_state(st: _CallState, uid: int) -> str:
@@ -243,11 +242,7 @@ async def _finalize_call(
         st.accumulated[uid] = st.accumulated.get(uid, 0) + (ended_at - ja).total_seconds()
     st.join_at.clear()
 
-    all_uids = {
-        uid
-        for uid in (st.seen_ids | set(st.accumulated.keys()) | set(st.hint_labels.keys()))
-        if _is_trackable_user(uid)
-    }
+    all_uids = {uid for uid in st.accumulated if _is_trackable_user(uid)}
     await _resolve_users(client, st, all_uids)
 
     duration_sec = max(0, int((ended_at - st.started_at).total_seconds()))

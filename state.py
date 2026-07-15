@@ -38,10 +38,13 @@ def configured_assistant_groups() -> set[int]:
 
 @dataclass
 class BotVCHint:
-    """Participant names/times the Bot API saw (invite events, call starter)."""
+    """Hints from Bot API service messages while the assistant polls the live list."""
 
     started_at: datetime | None = None
+    # Confirmed joiners only (e.g. call starter) — not invitees who never joined.
     participants: dict[int, tuple[str, datetime]] = field(default_factory=dict)
+    # Display-name hints from invite events; not proof of participation.
+    invite_labels: dict[int, str] = field(default_factory=dict)
 
 
 # chat_id -> hints from Bot API while assistant polls the live list
@@ -82,8 +85,8 @@ def note_bot_vc_invited(chat_id: int, when: datetime, users: list[tuple[int, str
     if hint.started_at is None:
         hint.started_at = when
     for uid, label in users:
-        if is_vc_participant(uid) and uid not in hint.participants:
-            hint.participants[uid] = (label, when)
+        if is_vc_participant(uid):
+            hint.invite_labels[uid] = label
     signal_vc_wake(chat_id)
 
 
