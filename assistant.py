@@ -218,9 +218,15 @@ def _apply_bot_hints(st: _CallState, chat_id: int, now: datetime) -> None:
         return
     if hint.started_at and hint.started_at < st.started_at:
         st.started_at = hint.started_at
-    for uid, (label, _first_seen) in hint.participants.items():
-        if _is_trackable_user(uid):
-            st.hint_labels[uid] = label
+    for uid, (label, first_seen) in hint.participants.items():
+        if not _is_trackable_user(uid):
+            continue
+        st.hint_labels[uid] = label
+        # Confirmed joiner (e.g. call starter) — not the same as invite-only users.
+        if uid not in st.join_at and uid not in st.accumulated:
+            if first_seen.tzinfo is None:
+                first_seen = first_seen.replace(tzinfo=timezone.utc)
+            st.join_at[uid] = first_seen
     for uid, label in hint.invite_labels.items():
         if _is_trackable_user(uid):
             st.hint_labels.setdefault(uid, label)
@@ -232,6 +238,24 @@ def _label_from_state(st: _CallState, uid: int) -> str:
     return _user_label(st.user_cache.get(uid), uid)
 
 
+def _merge_confirmed_participants(st: _CallState, chat_id: int, ended_at: datetime) -> None:
+    """Backfill confirmed joiners the live poll may have missed (short calls, slow first fetch)."""
+    hint = app_state.peek_bot_vc_hint(chat_id)
+    if hint:
+        for uid, (label, first_seen) in hint.participants.items():
+            if not _is_trackable_user(uid) or uid in st.accumulated:
+                continue
+            st.hint_labels[uid] = label
+            if first_seen.tzinfo is None:
+                first_seen = first_seen.replace(tzinfo=timezone.utc)
+            st.accumulated[uid] = max(0.0, (ended_at - first_seen).total_seconds())
+
+    for uid in st.last_ids | st.seen_ids:
+        if not _is_trackable_user(uid) or uid in st.accumulated:
+            continue
+        st.accumulated[uid] = max(0.0, (ended_at - st.started_at).total_seconds())
+
+
 async def _finalize_call(
     client: TelegramClient,
     chat_id: int,
@@ -241,6 +265,8 @@ async def _finalize_call(
     for uid, ja in list(st.join_at.items()):
         st.accumulated[uid] = st.accumulated.get(uid, 0) + (ended_at - ja).total_seconds()
     st.join_at.clear()
+
+    _merge_confirmed_participants(st, chat_id, ended_at)
 
     all_uids = {uid for uid in st.accumulated if _is_trackable_user(uid)}
     await _resolve_users(client, st, all_uids)
