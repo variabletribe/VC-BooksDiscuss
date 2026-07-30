@@ -339,6 +339,7 @@ def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
     threshold_min = dbmod.present_threshold_sec() // 60
     lines = [
         "📋 <b>Present attendance</b>",
+        " <i>Counts from 1 July 2026</i>",
         f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
         "",
     ]
@@ -531,7 +532,7 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             + (f" | {row.present_days} present day(s)" if row.present_days else "")
         )
     lines.append("")
-    lines.append("Remove with: /removeuser USER_ID")
+     
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 

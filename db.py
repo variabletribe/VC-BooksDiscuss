@@ -507,6 +507,7 @@ def format_attendance_message(earned: list[AttendanceRow]) -> str:
     threshold_min = present_threshold_sec() // 60
     lines = [
         "📋 <b>Present attendance</b>",
+        " <i>Counts from 1 July 2026</i>",
         "",
         f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
         "",
