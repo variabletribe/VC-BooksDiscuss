@@ -1,7 +1,7 @@
 """
 Group voice/video chat tracker for Telegram.
 
-Telegram’s Bot API does not expose “everyone who joined the VC” or real per-user
+Telegram's Bot API does not expose "everyone who joined the VC" or real per-user
 durations. It only offers invite-style participant hints plus total call duration.
 This bot uses:
 - video_chat_participants_invited (subset of people, not all joiners)
@@ -361,8 +361,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day).\n"
         "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
         "• /attendance — present-day leaderboard for this group.\n"
-        "• /monthreport — previous calendar month’s participant stats.\n"
-        "• /vcstatus — show this group’s chat id and whether VC tracking is active.\n"
+        "• /monthreport — previous calendar month's participant stats.\n"
+        "• /level — your XP and level.\n"
+        "• /xpleaderboard — top XP earners in this group.\n"
+        "• /streak — your current and longest VC streak.\n"
+        "• /badges — your earned badges.\n"
+        "• /weekly — this week's digest (top hours + streaks).\n"
+        "• /vcstatus — show this group's chat id and whether VC tracking is active.\n"
         "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n"
         "• /removeuser USER_ID — admins only; remove a user from VC stats and attendance.\n"
         "• /finduser NAME — admins only; find a user's id by name or old @username.\n\n"
@@ -680,7 +685,7 @@ async def _assistant_vc_fallback_report(
     else:
         lines.append(
             "<i>No per-person breakdown: the assistant never saw an active group call in "
-            "Telegram’s channel state, and the Bot API did not report who joined. "
+            "Telegram's channel state, and the Bot API did not report who joined. "
             "Check TELEGRAM_SESSION_STRING, ASSISTANT_GROUP_IDS, and that the assistant "
             "user is in this supergroup. Add ASSISTANT_DEBUG=1 and check Render logs.</i>"
         )
@@ -692,6 +697,11 @@ async def _assistant_vc_fallback_report(
     earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, parts)
     attendance_text = dbmod.format_attendance_message(earned)
     await _http_bot_send_message(chat_id, attendance_text)
+
+    badges = await asyncio.to_thread(dbmod.check_and_award_session_badges, chat_id, parts)
+    if badges:
+        badge_text = _format_badges_earned_html(badges)
+        await _http_bot_send_message(chat_id, badge_text)
 
 
 class VideoChatServiceFilter(MessageFilter):
@@ -867,6 +877,11 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
         attendance_text = dbmod.format_attendance_message(earned)
         await msg.reply_text(attendance_text, parse_mode="HTML")
 
+        badges = await asyncio.to_thread(dbmod.check_and_award_session_badges, chat_id, parts)
+        if badges:
+            badge_text = _format_badges_earned_html(badges)
+            await msg.reply_text(badge_text, parse_mode="HTML")
+
         logger.info(
             "VC ended chat_id=%s duration=%s participants=%s",
             chat_id,
@@ -875,8 +890,102 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
 
+def _format_badges_earned_html(badges: list) -> str:
+    lines = ["🏅 <b>New badge(s) unlocked!</b>", ""]
+    by_user: dict[int, list] = {}
+    for b in badges:
+        by_user.setdefault(b.user_id, []).append(b)
+    for uid, blist in by_user.items():
+        safe = html.escape(blist[0].display_name, quote=False)
+        badge_labels = ", ".join(b.badge_label for b in blist)
+        lines.append(f"{safe}: {badge_labels}")
+    return "\n".join(lines)
+
+
+async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    user = update.effective_user
+    label = _user_label(user)
+    info = await asyncio.to_thread(dbmod.get_level_info, chat.id, user.id, label)
+    await update.message.reply_text(dbmod.format_level_message(info), parse_mode="HTML")
+
+
+async def cmd_xpleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    rows = await asyncio.to_thread(dbmod.fetch_xp_leaderboard, chat.id, 10)
+    if not rows:
+        await update.message.reply_text("No XP recorded in this group yet.")
+        return
+    lines = ["🎖️ <b>XP Leaderboard</b>", ""]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, row in enumerate(rows, start=1):
+        medal = medals.get(i, f"{i}.")
+        safe = html.escape(row.display_name, quote=False)
+        lines.append(f"{medal} {safe} — Level {row.level} ({row.xp} XP)")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    user = update.effective_user
+    label = _user_label(user)
+    info = await asyncio.to_thread(dbmod.get_streak_info, chat.id, user.id, label)
+    safe = html.escape(info.display_name or label, quote=False)
+    text = (
+        f"🔥 <b>{safe}</b>\n"
+        f"Current streak: <b>{info.current_streak}</b> day(s)\n"
+        f"Longest streak: <b>{info.longest_streak}</b> day(s)"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_badges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    user = update.effective_user
+    rows = await asyncio.to_thread(dbmod.get_user_badges, chat.id, user.id)
+    if not rows:
+        await update.message.reply_text("No badges earned yet — keep showing up to VCs!")
+        return
+    lines = ["🏅 <b>Your badges</b>", ""]
+    for b in rows:
+        lines.append(b.badge_label)
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    digest = await asyncio.to_thread(dbmod.fetch_weekly_digest, chat.id)
+    text = dbmod.format_weekly_digest_message(chat.title or "This group", digest)
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """On the 1st from MONTHLY_REPORT_HOUR_UTC onward, post last month’s leaderboard (retries if send fails)."""
+    """On the 1st from MONTHLY_REPORT_HOUR_UTC onward, post last month's leaderboard (retries if send fails)."""
     hour = int(os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
     now = datetime.now(timezone.utc)
     if now.day != 1 or now.hour < hour:
@@ -908,6 +1017,33 @@ async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Failed monthly report chat_id=%s", chat_id)
 
 
+async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every Monday from MONTHLY_REPORT_HOUR_UTC onward, post the weekly digest to all opted-in chats."""
+    hour = int(os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 0 or now.hour != hour:
+        # Only fire once, in the top-of-hour window matching hour setting, on Monday.
+        return
+
+    chat_ids = await asyncio.to_thread(dbmod.list_chats_with_monthly_reports)
+    bot = context.bot
+    for chat_id in chat_ids:
+        try:
+            digest = await asyncio.to_thread(dbmod.fetch_weekly_digest, chat_id)
+            if digest.total_sessions == 0:
+                continue
+            try:
+                chat = await bot.get_chat(chat_id)
+                title = chat.title or "This group"
+            except Exception:
+                title = "This group"
+            text = dbmod.format_weekly_digest_message(title, digest)
+            await bot.send_message(chat_id, text, parse_mode="HTML")
+            await asyncio.to_thread(dbmod.reset_expired_streaks, chat_id)
+        except Exception:
+            logger.exception("Failed weekly digest chat_id=%s", chat_id)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     err = context.error
     if isinstance(err, Conflict):
@@ -937,7 +1073,7 @@ async def _webhook_post_register_check(context: ContextTypes.DEFAULT_TYPE) -> No
     """Re-log getWebhookInfo after run_webhook has called setWebhook (first log is often stale)."""
     if not _use_webhook():
         return
-    logger.info("Webhook health check ~20s after boot (state should reflect this deploy’s setWebhook)")
+    logger.info("Webhook health check ~20s after boot (state should reflect this deploy's setWebhook)")
     _log_webhook_info(context.application.bot.token.strip())
 
 
@@ -960,7 +1096,14 @@ async def post_init(application: Application) -> None:
         first=20,
         name="hourly_monthly_gate",
     )
+    jq.run_repeating(
+        weekly_digest_job,
+        interval=3600,
+        first=25,
+        name="weekly_digest_job",
+    )
     logger.info("Scheduled hourly check for monthly VC reports (UTC hour=%s)", os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
+    logger.info("Scheduled hourly check for weekly digest (Mondays, UTC hour=%s)", os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
 
 
 def main() -> None:
@@ -988,6 +1131,11 @@ def main() -> None:
     app.add_handler(CommandHandler("reports", cmd_reports))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("finduser", cmd_finduser))
+    app.add_handler(CommandHandler("level", cmd_level))
+    app.add_handler(CommandHandler("xpleaderboard", cmd_xpleaderboard))
+    app.add_handler(CommandHandler("streak", cmd_streak))
+    app.add_handler(CommandHandler("badges", cmd_badges))
+    app.add_handler(CommandHandler("weekly", cmd_weekly))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
