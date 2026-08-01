@@ -1,23 +1,15 @@
-# Render Blueprint: Web Service + PostgreSQL
+# Render Blueprint: Web Service (MongoDB Atlas for storage)
 # https://render.com/docs/blueprint-spec
 #
 # Web service gets RENDER_EXTERNAL_URL + PORT so the bot can use Telegram webhooks (no getUpdates),
 # which avoids "Conflict: terminated by other getUpdates" when a second poller exists.
-# You cannot change an existing Worker into a Web service in place — create a Web service and
-# remove the old Worker if migrating.
 #
-# After deploy: set BOT_TOKEN in the Render dashboard (Environment) if not using a secret file.
+# After deploy: set BOT_TOKEN and MONGODB_URI in the Render dashboard (Environment) — both are
+# marked sync: false below, so Render will prompt you to fill them in manually.
 # Optional: TELEGRAM_WEBHOOK_SECRET (Telegram sends X-Telegram-Bot-Api-Secret-Token).
 # Optional: KEEP_ALIVE_INTERVAL_SECONDS (default 300), KEEP_ALIVE_DISABLE=1 to turn off self-ping.
 # If /start is dead on free Web tier (webhook 521): add FORCE_POLLING=1 — only when ONE service uses BOT_TOKEN.
 # Use exactly ONE service with this repo per BOT_TOKEN. Suspend any old Worker that still polls.
-# Dashboard → service → Settings: set Python to 3.12 if logs show 3.14 (match PYTHON_VERSION below).
-
-databases:
-  - name: vc-bot-db
-    databaseName: vc_bot
-    plan: free
-
 services:
   - type: web
     name: vc-bot
@@ -31,9 +23,7 @@ services:
         value: "3.12.0"
       - key: BOT_TOKEN
         sync: false
-      - key: DATABASE_URL
-        fromDatabase:
-          name: vc-bot-db
-          property: connectionString
+      - key: MONGODB_URI
+        sync: false
       - key: MONTHLY_REPORT_HOUR_UTC
         value: "9"
