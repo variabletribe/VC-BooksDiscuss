@@ -262,6 +262,17 @@ async def _finalize_call(
     st: _CallState,
     ended_at: datetime,
 ) -> None:
+    # Claim ownership of this VC-end event BEFORE any slow work (DB writes, resolving
+    # users, HTTP calls). bot.py's fallback report (_assistant_vc_fallback_report) also
+    # tries to claim before it writes; whichever path gets here first wins, and the
+    # other silently skips. This prevents every real call from being recorded twice.
+    if not app_state.try_claim_vc_finalize(chat_id):
+        logger.info(
+            "Assistant: VC end for chat_id=%s already claimed by another path; skipping duplicate record",
+            chat_id,
+        )
+        return
+
     for uid, ja in list(st.join_at.items()):
         st.accumulated[uid] = st.accumulated.get(uid, 0) + (ended_at - ja).total_seconds()
     st.join_at.clear()
@@ -309,8 +320,7 @@ async def _finalize_call(
         "<i>Tracked by the live participant list every few seconds. The time they spent in the call is listed here.</i>"
     )
     text = "\n".join(lines)
-    if await _post_vc_summary(client, chat_id, text):
-        app_state.assistant_vc_report_mono[chat_id] = time.monotonic()
+    await _post_vc_summary(client, chat_id, text)
 
     earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, rows)
     attendance_text = dbmod.format_attendance_message(earned)
