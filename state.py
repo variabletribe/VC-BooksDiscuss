@@ -13,8 +13,6 @@ GROUP_ANONYMOUS_BOT_ID = 1087968824
 assistant_running: bool = False
 # Populated when assistant thread connects; may be empty if session failed.
 assistant_chat_ids: set[int] = set()
-# Set when assistant successfully posts a VC end summary (time.monotonic()); used for fallback dedupe.
-assistant_vc_report_mono: dict[int, float] = {}
 
 
 def parse_assistant_group_ids(raw: str | None = None) -> set[int]:
@@ -51,6 +49,40 @@ class BotVCHint:
 bot_vc_hints: dict[int, BotVCHint] = {}
 # chat_id -> monotonic time; assistant shortens next sleep when bot signals VC activity
 vc_wake_mono: dict[int, float] = {}
+
+# --- VC-end finalize claim (prevents double DB writes) ---------------------
+# Two independent code paths can observe the same "VC ended" event: the Telethon
+# assistant's own poll loop (assistant.py:_finalize_call) and the Bot API fallback
+# (bot.py:_assistant_vc_fallback_report), which exists as a safety net for calls the
+# assistant might miss. Without coordination, both can end up calling
+# dbmod.record_vc_session for the exact same call, double-counting VCs and XP.
+#
+# try_claim_vc_finalize() gives atomic first-come-first-served ownership: whichever
+# path calls it first for a chat_id wins and should proceed with the DB write; the
+# other should skip. Must be called BEFORE any slow work (network calls, DB writes),
+# not after, or the race window reopens.
+_vc_finalize_claim_mono: dict[int, float] = {}
+
+
+def _vc_claim_window_sec() -> float:
+    try:
+        return max(1.0, float(os.getenv("VC_CLAIM_WINDOW_SEC", "45")))
+    except ValueError:
+        return 45.0
+
+
+def try_claim_vc_finalize(chat_id: int) -> bool:
+    """Return True if the caller may record+post this VC-ended event.
+
+    Returns False if another path already claimed this chat_id's VC-end within the
+    claim window (i.e. this is very likely a duplicate signal for the same call).
+    """
+    now = time.monotonic()
+    last = _vc_finalize_claim_mono.get(chat_id, 0.0)
+    if now - last < _vc_claim_window_sec():
+        return False
+    _vc_finalize_claim_mono[chat_id] = now
+    return True
 
 
 def is_vc_participant(user_id: int, username: str | None = None) -> bool:
