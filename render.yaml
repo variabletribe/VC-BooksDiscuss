@@ -25,5 +25,7 @@ services:
         sync: false
       - key: MONGODB_URI
         sync: false
+      - key: GROQ_API_KEY
+        sync: false
       - key: MONTHLY_REPORT_HOUR_UTC
         value: "9"
