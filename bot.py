@@ -633,13 +633,24 @@ async def _http_bot_send_message(chat_id: int, text: str) -> bool:
 
 async def _assistant_vc_fallback_report(
     chat_id: int,
-    signal_mono: float,
     duration_sec: int,
 ) -> None:
-    """If assistant never saw the call (short VC between polls), still post Telegram duration."""
+    """If assistant never saw the call (short VC between polls), still post Telegram duration.
+
+    Uses app_state.try_claim_vc_finalize() so this fallback and the assistant's own
+    _finalize_call (assistant.py) never both record the same VC end to the database.
+    Whichever path calls try_claim_vc_finalize() first for this chat_id wins and
+    proceeds; the other silently skips. This must stay a claim taken up-front (not a
+    timestamp comparison after the fact) or a slow assistant post (e.g. resolving many
+    usernames) can lose the race and get double-recorded.
+    """
     wait = float(os.getenv("ASSISTANT_FALLBACK_WAIT_SECONDS", "8"))
     await asyncio.sleep(wait)
-    if app_state.assistant_vc_report_mono.get(chat_id, 0) > signal_mono:
+    if not app_state.try_claim_vc_finalize(chat_id):
+        logger.info(
+            "Fallback: VC end for chat_id=%s already claimed (assistant got there first); skipping duplicate record",
+            chat_id,
+        )
         return
     ended = datetime.now(timezone.utc)
     hint = app_state.take_bot_vc_hint(chat_id)
@@ -767,14 +778,13 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
         if msg.video_chat_ended:
             _sessions.pop(chat_id, None)
             duration_sec = msg.video_chat_ended.duration
-            sig = time.monotonic()
             if not app_state.assistant_running:
                 logger.warning(
                     "VC ended chat_id=%s — assistant configured but not running; using hint fallback",
                     chat_id,
                 )
             asyncio.create_task(
-                _assistant_vc_fallback_report(chat_id, sig, duration_sec),
+                _assistant_vc_fallback_report(chat_id, duration_sec),
                 name=f"vc-fallback-{chat_id}",
             )
             return
