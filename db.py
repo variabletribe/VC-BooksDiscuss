@@ -359,6 +359,11 @@ def record_present_attendance(
     """+1 present day per user who stayed longer than the threshold in this call.
     Also awards XP (1 per minute of estimated_seconds, all participants regardless of
     threshold) and updates day-streaks for those who cross the present threshold.
+
+    IMPORTANT: MongoDB forbids a field appearing in both `$inc`/`$set` and
+    `$setOnInsert` in the same update — it raises a WriteError ("would create a
+    conflict"). We build the update dict per-user so a field is only ever placed
+    in one operator, never both.
     """
     coll = _coll("user_attendance")
     threshold = present_threshold_sec()
@@ -374,23 +379,23 @@ def record_present_attendance(
         longest_streak = int(existing.get("longest_streak", 0)) if existing else 0
         last_day_str = existing.get("last_present_date") if existing else None
 
-        update: dict = {
-            "$inc": {"xp": xp_gain},
-            "$set": {
-                "chat_id": chat_id,
-                "user_id": uid,
-                "display_name": name[:512],
-            },
-            "$setOnInsert": {
-                "present_days": 0,
-                "current_streak": 0,
-                "longest_streak": 0,
-                "badges": [],
-            },
+        inc: dict = {"xp": xp_gain}
+        set_fields: dict = {
+            "chat_id": chat_id,
+            "user_id": uid,
+            "display_name": name[:512],
+        }
+        set_on_insert: dict = {
+            "current_streak": 0,
+            "longest_streak": 0,
+            "badges": [],
         }
 
-        if sec > threshold:
-            update["$inc"]["present_days"] = 1
+        crosses_threshold = sec > threshold
+        if crosses_threshold:
+            # present_days is being $inc'd this call, so it must NOT also appear
+            # in $setOnInsert (that's the bug that silently broke every fresh doc).
+            inc["present_days"] = 1
             if last_day_str:
                 last_day = datetime.strptime(last_day_str, "%Y-%m-%d").date()
                 gap = (today - last_day).days
@@ -403,16 +408,22 @@ def record_present_attendance(
             else:
                 new_streak = 1
             new_longest = max(longest_streak, new_streak)
-            update["$set"]["current_streak"] = new_streak
-            update["$set"]["longest_streak"] = new_longest
-            update["$set"]["last_present_date"] = today.strftime("%Y-%m-%d")
+            set_fields["current_streak"] = new_streak
+            set_fields["longest_streak"] = new_longest
+            set_fields["last_present_date"] = today.strftime("%Y-%m-%d")
+        else:
+            # Not incrementing present_days this call, so it's safe to default it
+            # here on first-ever insert for this user.
+            set_on_insert["present_days"] = 0
+
+        update: dict = {"$inc": inc, "$set": set_fields, "$setOnInsert": set_on_insert}
 
         doc = coll.find_one_and_update(
             {"_id": doc_id}, update, upsert=True, return_document=True
         )
 
-        if sec > threshold:
-            earned.append(AttendanceRow(uid, name, int(doc["present_days"])))
+        if crosses_threshold:
+            earned.append(AttendanceRow(uid, name, int(doc.get("present_days", 1))))
 
     return earned
 
@@ -523,22 +534,53 @@ def check_and_award_session_badges(
     participants: Iterable[tuple[int, str, int]],
 ) -> list[BadgeEarned]:
     """Call after record_vc_session + record_present_attendance with the same participants.
-    Checks marathoner (single session 3+ hrs) and night_owl/veteran thresholds."""
+    Checks marathoner (3+ hr single session), iron streaks, night_owl (10 post-midnight-UTC
+    sessions), and veteran_100 (100 total sessions).
+
+    Same MongoDB rule applies here: session_count / night_owl_count must not appear in both
+    $inc and $setOnInsert within the same update call.
+    """
     newly_earned: list[BadgeEarned] = []
     coll = _coll("user_attendance")
     now_hour = datetime.now(timezone.utc).hour
+    is_midnight_window = now_hour == 0  # UTC hour 0; widen this window if desired
 
     for uid, name, sec in participants:
         if sec >= 3 * 3600:
             if award_badge(chat_id, uid, name, "marathoner"):
                 newly_earned.append(BadgeEarned(uid, name, "marathoner", BADGES["marathoner"]["label"]))
 
-        doc = coll.find_one({"_id": f"{chat_id}:{uid}"})
-        streak = int(doc.get("current_streak", 0)) if doc else 0
+        doc_id = f"{chat_id}:{uid}"
+        inc: dict = {"session_count": 1}
+        set_on_insert: dict = {
+            "xp": 0,
+            "present_days": 0,
+            "current_streak": 0,
+            "longest_streak": 0,
+            "badges": [],
+        }
+        if is_midnight_window:
+            inc["night_owl_count"] = 1
+        else:
+            set_on_insert["night_owl_count"] = 0
+
+        update = {
+            "$inc": inc,
+            "$set": {"chat_id": chat_id, "user_id": uid, "display_name": name[:512]},
+            "$setOnInsert": set_on_insert,
+        }
+        doc = coll.find_one_and_update({"_id": doc_id}, update, upsert=True, return_document=True)
+
+        streak = int(doc.get("current_streak", 0))
         if streak >= 7 and award_badge(chat_id, uid, name, "iron_streak_7"):
             newly_earned.append(BadgeEarned(uid, name, "iron_streak_7", BADGES["iron_streak_7"]["label"]))
         if streak >= 30 and award_badge(chat_id, uid, name, "iron_streak_30"):
             newly_earned.append(BadgeEarned(uid, name, "iron_streak_30", BADGES["iron_streak_30"]["label"]))
+
+        if int(doc.get("night_owl_count", 0)) >= 10 and award_badge(chat_id, uid, name, "night_owl"):
+            newly_earned.append(BadgeEarned(uid, name, "night_owl", BADGES["night_owl"]["label"]))
+        if int(doc.get("session_count", 0)) >= 100 and award_badge(chat_id, uid, name, "veteran_100"):
+            newly_earned.append(BadgeEarned(uid, name, "veteran_100", BADGES["veteran_100"]["label"]))
 
     return newly_earned
 
@@ -601,8 +643,12 @@ def format_level_message(info: LevelInfo) -> str:
     if info.xp_for_next_level == -1:
         progress = f"MAX LEVEL — {info.xp} XP total"
     else:
-        needed = info.xp_for_next_level - (info.xp - info.xp_into_level)
-        progress = f"{info.xp_into_level}/{needed + info.xp_into_level} XP to Level {info.level + 1}"
+        # xp_for_next_level is the *cumulative* XP threshold for the next level, and
+        # (info.xp - info.xp_into_level) is the current level's own threshold, so the
+        # difference is already the full XP span needed for this level — do not add
+        # xp_into_level again or the denominator ends up too large.
+        span = info.xp_for_next_level - (info.xp - info.xp_into_level)
+        progress = f"{info.xp_into_level}/{span} XP to Level {info.level + 1}"
     return f"🎖️ <b>{safe}</b> — Level {info.level}\n<i>{progress}</i>"
 
 
