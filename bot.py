@@ -358,7 +358,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          
         " This is a customised private and personal bot for BOOKSDISCUSS telegram group.\n"
         "This bot tracks the number of VC calls joined and the total hours spent in calls along with present attendance (20+ min = +1 day).\n\n"
-        "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day).\n"
+        "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day) + an AI recap.\n"
         "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
         "• /attendance — present-day leaderboard for this group.\n"
         "• /monthreport — previous calendar month's participant stats.\n"
@@ -703,6 +703,11 @@ async def _assistant_vc_fallback_report(
         badge_text = _format_badges_earned_html(badges)
         await _http_bot_send_message(chat_id, badge_text)
 
+    ai_summary = await generate_ai_vc_summary("this group", duration_sec, parts)
+    if ai_summary:
+        safe_summary = html.escape(ai_summary, quote=False)
+        await _http_bot_send_message(chat_id, f"🤖 <i>{safe_summary}</i>")
+
 
 class VideoChatServiceFilter(MessageFilter):
     def filter(self, message) -> bool:
@@ -882,6 +887,11 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
             badge_text = _format_badges_earned_html(badges)
             await msg.reply_text(badge_text, parse_mode="HTML")
 
+        ai_summary = await generate_ai_vc_summary(chat.title or "this group", duration_sec, parts)
+        if ai_summary:
+            safe_summary = html.escape(ai_summary, quote=False)
+            await msg.reply_text(f"🤖 <i>{safe_summary}</i>", parse_mode="HTML")
+
         logger.info(
             "VC ended chat_id=%s duration=%s participants=%s",
             chat_id,
@@ -900,6 +910,62 @@ def _format_badges_earned_html(badges: list) -> str:
         badge_labels = ", ".join(b.badge_label for b in blist)
         lines.append(f"{safe}: {badge_labels}")
     return "\n".join(lines)
+
+
+async def generate_ai_vc_summary(
+    chat_title: str,
+    duration_sec: int,
+    parts: list[tuple[int, str, int]],
+) -> str | None:
+    """Ask Groq (free tier, Llama 3.3 70B) for a short natural-language VC recap.
+    Returns None if GROQ_API_KEY is missing or the call fails — caller should skip silently."""
+    api_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not api_key:
+        return None
+    if not parts:
+        return None
+
+    rows = sorted(parts, key=lambda x: -x[2])
+    roster_lines = []
+    for _uid, label, sec in rows:
+        m = sec // 60
+        roster_lines.append(f"- {label}: {m} min")
+    roster_text = "\n".join(roster_lines)
+    total_min = duration_sec // 60
+
+    prompt = (
+        f"Write a short, upbeat 2-3 sentence recap of a voice chat that just ended in the "
+        f"Telegram group \"{chat_title}\". The call lasted {total_min} minutes total. "
+        f"Participants and their approximate time in the call:\n{roster_text}\n\n"
+        f"Mention who stayed longest and roughly how many people joined. Keep it casual and "
+        f"friendly, like a group chat bot, not formal. Do not use markdown formatting, just plain text. "
+        f"Keep it under 400 characters."
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 200,
+                    "temperature": 0.8,
+                },
+            )
+        if r.status_code != 200:
+            logger.warning("Groq summary failed: HTTP %s %s", r.status_code, r.text[:300])
+            return None
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        return text or None
+    except Exception:
+        logger.exception("Groq summary request failed")
+        return None
 
 
 async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
