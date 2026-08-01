@@ -1,4 +1,4 @@
-"""Persistence for VC stats: SQLite locally or PostgreSQL on Render (DATABASE_URL)."""
+"""Persistence for VC stats: MongoDB Atlas (MONGODB_URI)."""
 
 from __future__ import annotations
 
@@ -7,57 +7,8 @@ import os
 from datetime import datetime, timezone
 from typing import Iterable, NamedTuple
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, delete, func, select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
-
-
-class Base(DeclarativeBase):
-    pass
-
-
-class ChatSettings(Base):
-    __tablename__ = "chat_settings"
-
-    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    monthly_reports: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
-
-
-class VCSessionRow(Base):
-    __tablename__ = "vc_sessions"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    chat_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    duration_sec: Mapped[int] = mapped_column(Integer, nullable=False)
-
-    participants: Mapped[list["VCParticipantRow"]] = relationship(back_populates="session")
-
-
-class MonthlyReportSent(Base):
-    """Tracks auto monthly posts so restarts on the 1st do not duplicate."""
-
-    __tablename__ = "monthly_report_sent"
-    __table_args__ = (UniqueConstraint("chat_id", "year", "month", name="uq_monthly_chat"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    chat_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
-    year: Mapped[int] = mapped_column(Integer, nullable=False)
-    month: Mapped[int] = mapped_column(Integer, nullable=False)
-
-
-class VCParticipantRow(Base):
-    __tablename__ = "vc_participants"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("vc_sessions.id"), nullable=False, index=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    display_name: Mapped[str] = mapped_column(String(512), nullable=False)
-    estimated_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
-
-    session: Mapped["VCSessionRow"] = relationship(back_populates="participants")
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError
 
 
 class LeaderRow(NamedTuple):
@@ -71,17 +22,6 @@ class VCStatsRow(NamedTuple):
     display_name: str
     vc_count: int
     total_seconds: int
-
-
-class UserAttendance(Base):
-    """Cumulative present days: +1 per VC when user stays more than PRESENT_MIN_SECONDS."""
-
-    __tablename__ = "user_attendance"
-
-    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    display_name: Mapped[str] = mapped_column(String(512), nullable=False)
-    present_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class AttendanceRow(NamedTuple):
@@ -105,66 +45,67 @@ class FindUserRow(NamedTuple):
     present_days: int
 
 
-_engine = None
-SessionLocal = None
-
-
-def _normalize_database_url(url: str) -> str:
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+psycopg2://", 1)
-    if url.startswith("postgresql://") and "+psycopg2" not in url:
-        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+_client: MongoClient | None = None
+_db = None
 
 
 def init_db() -> None:
-    global _engine, SessionLocal
-    url = os.environ.get("DATABASE_URL", "sqlite:///./vc_stats.db")
-    url = _normalize_database_url(url)
-    kwargs: dict = {}
-    if url.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False}
-    _engine = create_engine(url, **kwargs)
-    SessionLocal = sessionmaker(_engine, expire_on_commit=False)
-    Base.metadata.create_all(_engine)
+    """Connect to MongoDB Atlas and ensure indexes exist."""
+    global _client, _db
+    uri = os.environ.get("MONGODB_URI")
+    if not uri:
+        raise RuntimeError("MONGODB_URI environment variable is not set")
+    _client = MongoClient(uri)
+    db_name = os.environ.get("MONGODB_DB_NAME", "vc_bot")
+    _db = _client[db_name]
+
+    # chat_settings: _id = chat_id
+    # vc_sessions: participants embedded, indexed by chat_id + ended_at for range queries
+    _db.vc_sessions.create_index([("chat_id", ASCENDING), ("ended_at", ASCENDING)])
+    _db.vc_sessions.create_index([("participants.user_id", ASCENDING)])
+    # monthly_report_sent: unique per chat/year/month
+    _db.monthly_report_sent.create_index(
+        [("chat_id", ASCENDING), ("year", ASCENDING), ("month", ASCENDING)],
+        unique=True,
+    )
+    # user_attendance: _id = "chat_id:user_id"
+    _db.user_attendance.create_index([("chat_id", ASCENDING)])
+
+
+def _coll(name: str):
+    assert _db is not None, "init_db() must be called first"
+    return _db[name]
 
 
 def ensure_chat(chat_id: int, title: str | None = None) -> None:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        row = s.get(ChatSettings, chat_id)
-        if row is None:
-            s.add(ChatSettings(chat_id=chat_id, monthly_reports=True, title=title))
-        elif title:
-            row.title = title
-        s.commit()
+    coll = _coll("chat_settings")
+    update: dict = {"$setOnInsert": {"monthly_reports": True}}
+    if title:
+        update["$set"] = {"title": title}
+    coll.update_one({"_id": chat_id}, update, upsert=True)
 
 
 def set_monthly_reports(chat_id: int, enabled: bool) -> None:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        row = s.get(ChatSettings, chat_id)
-        if row is None:
-            s.add(ChatSettings(chat_id=chat_id, monthly_reports=enabled, title=None))
-        else:
-            row.monthly_reports = enabled
-        s.commit()
+    coll = _coll("chat_settings")
+    coll.update_one(
+        {"_id": chat_id},
+        {"$set": {"monthly_reports": enabled}, "$setOnInsert": {}},
+        upsert=True,
+    )
 
 
 def get_monthly_reports_enabled(chat_id: int) -> bool:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        row = s.get(ChatSettings, chat_id)
-        if row is None:
-            return True
-        return row.monthly_reports
+    coll = _coll("chat_settings")
+    doc = coll.find_one({"_id": chat_id})
+    if doc is None:
+        return True
+    return bool(doc.get("monthly_reports", True))
 
 
 def list_chats_with_monthly_reports() -> list[int]:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        q = select(ChatSettings.chat_id).where(ChatSettings.monthly_reports.is_(True))
-        return list(s.scalars(q).all())
+    coll = _coll("chat_settings")
+    cursor = coll.find({"monthly_reports": True}, {"_id": 1})
+    return [int(d["_id"]) for d in cursor]
 
 
 def record_vc_session(
@@ -175,31 +116,25 @@ def record_vc_session(
     participants: Iterable[tuple[int, str, int]],
 ) -> None:
     """participants: (user_id, display_name, estimated_seconds)."""
-    assert SessionLocal is not None
+    coll = _coll("vc_sessions")
     if ended_at.tzinfo is None:
         ended_at = ended_at.replace(tzinfo=timezone.utc)
     if started_at and started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
 
-    with SessionLocal() as s:
-        row = VCSessionRow(
-            chat_id=chat_id,
-            started_at=started_at,
-            ended_at=ended_at,
-            duration_sec=duration_sec,
-        )
-        s.add(row)
-        s.flush()
-        for uid, name, est in participants:
-            s.add(
-                VCParticipantRow(
-                    session_id=row.id,
-                    user_id=uid,
-                    display_name=name[:512],
-                    estimated_seconds=est,
-                )
-            )
-        s.commit()
+    participant_docs = [
+        {"user_id": uid, "display_name": name[:512], "estimated_seconds": est}
+        for uid, name, est in participants
+    ]
+    coll.insert_one(
+        {
+            "chat_id": chat_id,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_sec": duration_sec,
+            "participants": participant_docs,
+        }
+    )
 
 
 def month_bounds_utc(year: int, month: int) -> tuple[datetime, datetime]:
@@ -211,35 +146,42 @@ def month_bounds_utc(year: int, month: int) -> tuple[datetime, datetime]:
     return start, end
 
 
+def _match_stage(chat_id: int, period_start: datetime | None, period_end_exclusive: datetime | None) -> dict:
+    match: dict = {"chat_id": chat_id}
+    ended_at_filter: dict = {}
+    if period_start is not None:
+        if period_start.tzinfo is None:
+            period_start = period_start.replace(tzinfo=timezone.utc)
+        ended_at_filter["$gte"] = period_start
+    if period_end_exclusive is not None:
+        if period_end_exclusive.tzinfo is None:
+            period_end_exclusive = period_end_exclusive.replace(tzinfo=timezone.utc)
+        ended_at_filter["$lt"] = period_end_exclusive
+    if ended_at_filter:
+        match["ended_at"] = ended_at_filter
+    return match
+
+
 def fetch_leaderboard(
     chat_id: int,
     period_start: datetime,
     period_end_exclusive: datetime,
 ) -> list[LeaderRow]:
-    assert SessionLocal is not None
-    if period_start.tzinfo is None:
-        period_start = period_start.replace(tzinfo=timezone.utc)
-    if period_end_exclusive.tzinfo is None:
-        period_end_exclusive = period_end_exclusive.replace(tzinfo=timezone.utc)
-
-    uid = VCParticipantRow.user_id
-    name = func.max(VCParticipantRow.display_name).label("dname")
-    total = func.sum(VCParticipantRow.estimated_seconds).label("total")
-
-    with SessionLocal() as s:
-        q = (
-            select(uid, name, total)
-            .join(VCSessionRow, VCParticipantRow.session_id == VCSessionRow.id)
-            .where(
-                VCSessionRow.chat_id == chat_id,
-                VCSessionRow.ended_at >= period_start,
-                VCSessionRow.ended_at < period_end_exclusive,
-            )
-            .group_by(uid)
-            .order_by(total.desc())
-        )
-        rows = s.execute(q).all()
-        return [LeaderRow(int(r[0]), str(r[1]), int(r[2])) for r in rows]
+    coll = _coll("vc_sessions")
+    pipeline = [
+        {"$match": _match_stage(chat_id, period_start, period_end_exclusive)},
+        {"$unwind": "$participants"},
+        {
+            "$group": {
+                "_id": "$participants.user_id",
+                "dname": {"$last": "$participants.display_name"},
+                "total": {"$sum": "$participants.estimated_seconds"},
+            }
+        },
+        {"$sort": {"total": -1}},
+    ]
+    rows = list(coll.aggregate(pipeline))
+    return [LeaderRow(int(r["_id"]), str(r["dname"]), int(r["total"])) for r in rows]
 
 
 def previous_calendar_month(year: int, month: int) -> tuple[int, int]:
@@ -249,24 +191,16 @@ def previous_calendar_month(year: int, month: int) -> tuple[int, int]:
 
 
 def monthly_report_already_sent(chat_id: int, year: int, month: int) -> bool:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        q = select(MonthlyReportSent.id).where(
-            MonthlyReportSent.chat_id == chat_id,
-            MonthlyReportSent.year == year,
-            MonthlyReportSent.month == month,
-        )
-        return s.scalar(q) is not None
+    coll = _coll("monthly_report_sent")
+    return coll.find_one({"chat_id": chat_id, "year": year, "month": month}) is not None
 
 
 def mark_monthly_report_sent(chat_id: int, year: int, month: int) -> None:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        s.add(MonthlyReportSent(chat_id=chat_id, year=year, month=month))
-        try:
-            s.commit()
-        except IntegrityError:
-            s.rollback()
+    coll = _coll("monthly_report_sent")
+    try:
+        coll.insert_one({"chat_id": chat_id, "year": year, "month": month})
+    except DuplicateKeyError:
+        pass
 
 
 def fetch_month_leaderboard(chat_id: int, year: int, month: int) -> list[LeaderRow]:
@@ -279,22 +213,21 @@ def fetch_vc_date_range(
     period_start: datetime | None = None,
     period_end_exclusive: datetime | None = None,
 ) -> tuple[datetime | None, datetime | None]:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        q = select(
-            func.min(VCSessionRow.ended_at),
-            func.max(VCSessionRow.ended_at),
-        ).where(VCSessionRow.chat_id == chat_id)
-        if period_start is not None:
-            if period_start.tzinfo is None:
-                period_start = period_start.replace(tzinfo=timezone.utc)
-            q = q.where(VCSessionRow.ended_at >= period_start)
-        if period_end_exclusive is not None:
-            if period_end_exclusive.tzinfo is None:
-                period_end_exclusive = period_end_exclusive.replace(tzinfo=timezone.utc)
-            q = q.where(VCSessionRow.ended_at < period_end_exclusive)
-        row = s.execute(q).one()
-        return row[0], row[1]
+    coll = _coll("vc_sessions")
+    pipeline = [
+        {"$match": _match_stage(chat_id, period_start, period_end_exclusive)},
+        {
+            "$group": {
+                "_id": None,
+                "min_ended": {"$min": "$ended_at"},
+                "max_ended": {"$max": "$ended_at"},
+            }
+        },
+    ]
+    rows = list(coll.aggregate(pipeline))
+    if not rows:
+        return None, None
+    return rows[0]["min_ended"], rows[0]["max_ended"]
 
 
 def fetch_vc_stats(
@@ -302,33 +235,25 @@ def fetch_vc_stats(
     period_start: datetime | None = None,
     period_end_exclusive: datetime | None = None,
 ) -> list[VCStatsRow]:
-    assert SessionLocal is not None
-    if period_start is not None and period_start.tzinfo is None:
-        period_start = period_start.replace(tzinfo=timezone.utc)
-    if period_end_exclusive is not None and period_end_exclusive.tzinfo is None:
-        period_end_exclusive = period_end_exclusive.replace(tzinfo=timezone.utc)
-
-    uid = VCParticipantRow.user_id
-    name = func.max(VCParticipantRow.display_name).label("dname")
-    vc_count = func.count(func.distinct(VCSessionRow.id)).label("vcs")
-    total = func.sum(VCParticipantRow.estimated_seconds).label("total")
-
-    with SessionLocal() as s:
-        q = (
-            select(uid, name, vc_count, total)
-            .join(VCSessionRow, VCParticipantRow.session_id == VCSessionRow.id)
-            .where(VCSessionRow.chat_id == chat_id)
-        )
-        if period_start is not None:
-            q = q.where(VCSessionRow.ended_at >= period_start)
-        if period_end_exclusive is not None:
-            q = q.where(VCSessionRow.ended_at < period_end_exclusive)
-        q = q.group_by(uid).order_by(total.desc(), vc_count.desc())
-        rows = s.execute(q).all()
-        return [
-            VCStatsRow(int(r[0]), str(r[1]), int(r[2] or 0), int(r[3] or 0))
-            for r in rows
-        ]
+    coll = _coll("vc_sessions")
+    pipeline = [
+        {"$match": _match_stage(chat_id, period_start, period_end_exclusive)},
+        {"$unwind": "$participants"},
+        {
+            "$group": {
+                "_id": "$participants.user_id",
+                "dname": {"$last": "$participants.display_name"},
+                "vcs": {"$sum": 1},
+                "total": {"$sum": "$participants.estimated_seconds"},
+            }
+        },
+        {"$sort": {"total": -1, "vcs": -1}},
+    ]
+    rows = list(coll.aggregate(pipeline))
+    return [
+        VCStatsRow(int(r["_id"]), str(r["dname"]), int(r["vcs"] or 0), int(r["total"] or 0))
+        for r in rows
+    ]
 
 
 def fetch_alltime_vc_stats(chat_id: int) -> tuple[list[VCStatsRow], datetime | None, datetime | None]:
@@ -356,151 +281,138 @@ def record_present_attendance(
     participants: Iterable[tuple[int, str, int]],
 ) -> list[AttendanceRow]:
     """+1 present day per user who stayed longer than the threshold in this call."""
-    assert SessionLocal is not None
+    coll = _coll("user_attendance")
     threshold = present_threshold_sec()
     earned: list[AttendanceRow] = []
-    with SessionLocal() as s:
-        for uid, name, sec in participants:
-            if sec <= threshold:
-                continue
-            row = s.get(UserAttendance, (chat_id, uid))
-            if row is None:
-                row = UserAttendance(
-                    chat_id=chat_id,
-                    user_id=uid,
-                    display_name=name[:512],
-                    present_days=1,
-                )
-                s.add(row)
-            else:
-                row.present_days += 1
-                row.display_name = name[:512]
-            earned.append(AttendanceRow(uid, name, row.present_days))
-        s.commit()
+    for uid, name, sec in participants:
+        if sec <= threshold:
+            continue
+        doc_id = f"{chat_id}:{uid}"
+        doc = coll.find_one_and_update(
+            {"_id": doc_id},
+            {
+                "$inc": {"present_days": 1},
+                "$set": {
+                    "chat_id": chat_id,
+                    "user_id": uid,
+                    "display_name": name[:512],
+                },
+            },
+            upsert=True,
+            return_document=True,
+        )
+        earned.append(AttendanceRow(uid, name, int(doc["present_days"])))
     return earned
 
 
 def remove_user_from_chat(chat_id: int, user_id: int) -> RemoveUserResult:
-    """Delete all VC participant rows and attendance for one user in this group."""
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        name = s.scalar(
-            select(VCParticipantRow.display_name)
-            .join(VCSessionRow, VCParticipantRow.session_id == VCSessionRow.id)
-            .where(
-                VCSessionRow.chat_id == chat_id,
-                VCParticipantRow.user_id == user_id,
-            )
-            .order_by(VCSessionRow.ended_at.desc())
-            .limit(1)
-        )
-        if name is None:
-            att = s.get(UserAttendance, (chat_id, user_id))
-            if att is not None:
-                name = att.display_name
+    """Delete all VC participant entries and attendance for one user in this group."""
+    sessions_coll = _coll("vc_sessions")
+    attendance_coll = _coll("user_attendance")
 
-        session_ids = select(VCSessionRow.id).where(VCSessionRow.chat_id == chat_id)
-        vc_deleted = s.execute(
-            delete(VCParticipantRow).where(
-                VCParticipantRow.user_id == user_id,
-                VCParticipantRow.session_id.in_(session_ids),
-            )
-        ).rowcount
-        att_deleted = s.execute(
-            delete(UserAttendance).where(
-                UserAttendance.chat_id == chat_id,
-                UserAttendance.user_id == user_id,
-            )
-        ).rowcount
-        s.commit()
-        return RemoveUserResult(
-            user_id=user_id,
-            display_name=str(name) if name else None,
-            vc_rows_deleted=int(vc_deleted or 0),
-            attendance_rows_deleted=int(att_deleted or 0),
-        )
+    name = None
+    latest = sessions_coll.find(
+        {"chat_id": chat_id, "participants.user_id": user_id},
+        {"participants.$": 1, "ended_at": 1},
+    ).sort("ended_at", DESCENDING).limit(1)
+    latest = list(latest)
+    if latest:
+        parts = latest[0].get("participants", [])
+        if parts:
+            name = parts[0].get("display_name")
+
+    if name is None:
+        att = attendance_coll.find_one({"_id": f"{chat_id}:{user_id}"})
+        if att is not None:
+            name = att.get("display_name")
+
+    # Count sessions containing this user before removal (approximation of rows deleted)
+    vc_deleted = sessions_coll.count_documents(
+        {"chat_id": chat_id, "participants.user_id": user_id}
+    )
+    sessions_coll.update_many(
+        {"chat_id": chat_id, "participants.user_id": user_id},
+        {"$pull": {"participants": {"user_id": user_id}}},
+    )
+
+    att_result = attendance_coll.delete_one({"_id": f"{chat_id}:{user_id}"})
+
+    return RemoveUserResult(
+        user_id=user_id,
+        display_name=str(name) if name else None,
+        vc_rows_deleted=int(vc_deleted or 0),
+        attendance_rows_deleted=int(att_result.deleted_count or 0),
+    )
 
 
 def find_users_in_chat(chat_id: int, query: str, limit: int = 15) -> list[FindUserRow]:
     """Search stored display names (includes old @usernames) for this group."""
-    assert SessionLocal is not None
     term = query.strip().lstrip("@")
     if not term:
         return []
-    pattern = f"%{term}%"
 
-    uid = VCParticipantRow.user_id
-    name = func.max(VCParticipantRow.display_name).label("dname")
-    vc_count = func.count(func.distinct(VCSessionRow.id)).label("vcs")
-    total = func.coalesce(func.sum(VCParticipantRow.estimated_seconds), 0).label("total")
+    sessions_coll = _coll("vc_sessions")
+    attendance_coll = _coll("user_attendance")
 
-    with SessionLocal() as s:
-        by_id: dict[int, FindUserRow] = {}
+    by_id: dict[int, FindUserRow] = {}
 
-        vc_q = (
-            select(uid, name, vc_count, total)
-            .join(VCSessionRow, VCParticipantRow.session_id == VCSessionRow.id)
-            .where(
-                VCSessionRow.chat_id == chat_id,
-                VCParticipantRow.display_name.ilike(pattern),
-            )
-            .group_by(uid)
-            .order_by(total.desc())
-            .limit(limit)
+    pipeline = [
+        {"$match": {"chat_id": chat_id}},
+        {"$unwind": "$participants"},
+        {"$match": {"participants.display_name": {"$regex": term, "$options": "i"}}},
+        {
+            "$group": {
+                "_id": "$participants.user_id",
+                "dname": {"$last": "$participants.display_name"},
+                "vcs": {"$sum": 1},
+                "total": {"$sum": "$participants.estimated_seconds"},
+            }
+        },
+        {"$sort": {"total": -1}},
+        {"$limit": limit},
+    ]
+    for r in sessions_coll.aggregate(pipeline):
+        by_id[int(r["_id"])] = FindUserRow(
+            int(r["_id"]), str(r["dname"]), int(r["vcs"] or 0), int(r["total"] or 0), 0
         )
-        for r in s.execute(vc_q).all():
-            by_id[int(r[0])] = FindUserRow(
-                int(r[0]), str(r[1]), int(r[2] or 0), int(r[3] or 0), 0
+
+    att_rows = attendance_coll.find(
+        {"chat_id": chat_id, "display_name": {"$regex": term, "$options": "i"}}
+    )
+    for att in att_rows:
+        uid = int(att["user_id"])
+        if uid in by_id:
+            row = by_id[uid]
+            by_id[uid] = FindUserRow(
+                row.user_id, row.display_name, row.vc_count, row.total_seconds, int(att["present_days"])
+            )
+        else:
+            by_id[uid] = FindUserRow(
+                uid, att["display_name"], 0, 0, int(att["present_days"])
             )
 
-        att_rows = s.scalars(
-            select(UserAttendance).where(
-                UserAttendance.chat_id == chat_id,
-                UserAttendance.display_name.ilike(pattern),
+    for user_id, row in list(by_id.items()):
+        if row.present_days:
+            continue
+        att = attendance_coll.find_one({"_id": f"{chat_id}:{user_id}"})
+        if att:
+            by_id[user_id] = FindUserRow(
+                row.user_id, row.display_name, row.vc_count, row.total_seconds, int(att["present_days"])
             )
-        ).all()
-        for att in att_rows:
-            if att.user_id in by_id:
-                row = by_id[att.user_id]
-                by_id[att.user_id] = FindUserRow(
-                    row.user_id,
-                    row.display_name,
-                    row.vc_count,
-                    row.total_seconds,
-                    att.present_days,
-                )
-            else:
-                by_id[att.user_id] = FindUserRow(
-                    att.user_id, att.display_name, 0, 0, att.present_days
-                )
 
-        for user_id, row in list(by_id.items()):
-            if row.present_days:
-                continue
-            att = s.get(UserAttendance, (chat_id, user_id))
-            if att:
-                by_id[user_id] = FindUserRow(
-                    row.user_id,
-                    row.display_name,
-                    row.vc_count,
-                    row.total_seconds,
-                    att.present_days,
-                )
-
-        rows = sorted(by_id.values(), key=lambda x: (-x.total_seconds, x.display_name.lower()))
-        return rows[:limit]
+    rows = sorted(by_id.values(), key=lambda x: (-x.total_seconds, x.display_name.lower()))
+    return rows[:limit]
 
 
 def fetch_all_attendance(chat_id: int) -> list[AttendanceRow]:
-    assert SessionLocal is not None
-    with SessionLocal() as s:
-        q = (
-            select(UserAttendance)
-            .where(UserAttendance.chat_id == chat_id)
-            .order_by(UserAttendance.present_days.desc(), UserAttendance.display_name)
-        )
-        rows = s.scalars(q).all()
-        return [AttendanceRow(r.user_id, r.display_name, r.present_days) for r in rows]
+    coll = _coll("user_attendance")
+    cursor = coll.find({"chat_id": chat_id}).sort(
+        [("present_days", DESCENDING), ("display_name", ASCENDING)]
+    )
+    return [
+        AttendanceRow(int(d["user_id"]), str(d["display_name"]), int(d["present_days"]))
+        for d in cursor
+    ]
 
 
 def format_attendance_message(earned: list[AttendanceRow]) -> str:
