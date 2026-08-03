@@ -354,24 +354,41 @@ def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await update.message.reply_text(
-         
-        " This is a customised private and personal bot for BOOKSDISCUSS telegram group.\n"
-        "This bot tracks the number of VC calls joined and the total hours spent in calls along with present attendance (20+ min = +1 day).\n\n"
-        "• After each VC ends, I post the call summary + present attendance (20+ min = +1 day) + an AI recap.\n"
-        "• /vcreport — all-time stats: VCs joined and total hours (first recorded call → now).\n"
-        "• /attendance — present-day leaderboard for this group.\n"
-        "• /monthreport — previous calendar month's participant stats.\n"
-        "• /level — your XP and level.\n"
-        "• /xpleaderboard — top XP earners in this group.\n"
-        "• /streak — your current and longest VC streak.\n"
-        "• /badges — your earned badges.\n"
-        "• /weekly — this week's digest (top hours + streaks).\n"
-        "• /vcstatus — show this group's chat id and whether VC tracking is active.\n"
-        "• /reports on|off — admins only; automatic monthly report on the 1st (UTC).\n"
-        "• /removeuser USER_ID — admins only; remove a user from VC stats and attendance.\n"
-        "• /finduser NAME — admins only; find a user's id by name or old @username.\n\n"
-        "If I miss events: @BotFather → /setprivacy → Disable."
+   await update.message.reply_text(
+        "🎙️ <b>BooksDiscuss VC Bot</b>\n"
+        "<i>Your private, personal tracker for BOOKSDISCUSS voice/video chats.</i>\n\n"
+
+        "📊 <b>What I track</b>\n"
+        "VCs joined, total hours in calls, and present attendance "
+        "(20+ min in a call = +1 present day).\n"
+        "After every VC ends, I post the call summary, present attendance, "
+        "and an AI recap — automatically.\n\n"
+
+        "📅 <b>Tracking started: 3 August 2026</b>\n"
+        "<i>All stats below are counted from this date onward.</i>\n\n"
+
+        "<b>📈 Stats &amp; Reports</b>\n"
+        "• /vcreport — all-time stats: VCs joined and total hours\n"
+        "• /attendance — present-day leaderboard for this group\n"
+        "• /monthreport — previous month's participant stats\n"
+        "• /weekly — this week's digest (top hours + streaks)\n\n"
+
+        "<b>🎮 Your Progress</b>\n"
+        "• /level — your XP and level\n"
+        "• /xpleaderboard — top XP earners in this group\n"
+        "• /streak — your current and longest VC streak\n"
+        "• /badges — your earned badges\n\n"
+
+        "<b>🔧 Utility</b>\n"
+        "• /vcstatus — this group's chat id + whether tracking is active\n\n"
+
+        "<b>🛠️ Admin only</b>\n"
+        "• /reports on|off — toggle automatic monthly report (posted on the 1st, UTC)\n"
+        "• /removeuser USER_ID — remove a user from VC stats and attendance\n"
+        "• /finduser NAME — find a user's id by name or old @username\n\n"
+
+        "<i>This bot belongs to @booksdiscuss</i>",
+        parse_mode="HTML",
     )
 
 
