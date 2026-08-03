@@ -26,6 +26,18 @@ KEEP_ALIVE_INTERVAL_SECONDS (default 300). Disable with KEEP_ALIVE_DISABLE=1.
 For long cold starts, use an external uptime monitor or a paid instance.
 
 Privacy: @BotFather -> /setprivacy -> Disable if service messages are missing.
+
+--- Admin DM relay + broadcast --------------------------------------------
+ADMIN_RELAY_CHAT_ID = chat id of a private admin group (bot must be a member).
+    Any private DM sent to the bot gets copied into this group with a small
+    header. Admins reply (native Telegram reply, long-press -> Reply) to that
+    copied message inside the admin group, and the bot delivers the reply back
+    to the original sender. A plain new message in the admin group does NOT
+    get routed anywhere — only replies to a relayed message do.
+ADMIN_USER_IDS = comma-separated Telegram user ids allowed to use /message,
+    /broadcast, and reply-relay in the admin group.
+BROADCAST_CHAT_ID (optional) = which tracked group's VC participant list
+    /broadcast targets. Defaults to the first id in ASSISTANT_GROUP_IDS.
 """
 
 from __future__ import annotations
@@ -355,9 +367,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     await update.message.reply_text(
-         
         "🎙️ <b>BooksDiscuss VC Tracker Bot</b>\n"
-         
 
         "📊 <b>What I track</b>\n"
         "VCs joined, total hours in calls, and present attendance "
@@ -386,7 +396,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>🛠️ Admin only</b>\n"
         "• /reports on|off — toggle automatic monthly report (posted on the 1st, UTC)\n"
         "• /removeuser USER_ID — remove a user from VC stats and attendance\n"
-        "• /finduser NAME — find a user's id by name or old @username\n\n"
+        "• /finduser NAME — find a user's id by name or old @username\n"
+        "• /message USER_ID text — DM any known user directly\n"
+        "• /broadcast text — message everyone who has joined a VC\n\n"
 
         "<i>This bot belongd to→ @BooksDiscuss </i>",
         parse_mode="HTML",
@@ -555,7 +567,7 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             + (f" | {row.present_days} present day(s)" if row.present_days else "")
         )
     lines.append("")
-     
+
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -625,6 +637,175 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await asyncio.to_thread(dbmod.set_monthly_reports, chat.id, enabled)
     await update.message.reply_text(
         "Monthly auto-reports are now " + ("enabled" if enabled else "disabled") + " for this group."
+    )
+
+
+# --- Admin DM relay + direct message + broadcast ----------------------------
+
+
+def _is_admin_user(user_id: int) -> bool:
+    return user_id in app_state.parse_admin_user_ids()
+
+
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any non-command DM sent to the bot gets copied into the private admin relay group.
+
+    Does NOT go to the bot's Saved Messages or anywhere else — only into
+    ADMIN_RELAY_CHAT_ID, exactly as configured.
+    """
+    msg = update.message
+    if not msg or not update.effective_user:
+        return
+
+    relay_chat_id = app_state.admin_relay_chat_id()
+    if not relay_chat_id:
+        logger.warning("Got a DM but ADMIN_RELAY_CHAT_ID is not set; nothing to relay to.")
+        return
+
+    user = update.effective_user
+    label = _user_label(user)
+    header = f"📩 <b>New message</b> from {html.escape(label, quote=False)} (<code>{user.id}</code>)"
+
+    try:
+        info_msg = await context.bot.send_message(relay_chat_id, header, parse_mode="HTML")
+        copied = await context.bot.copy_message(
+            chat_id=relay_chat_id,
+            from_chat_id=user.id,
+            message_id=msg.message_id,
+        )
+        # Map both the header line and the copied content — replying to either
+        # one in the admin group will correctly route back to this user.
+        await asyncio.to_thread(dbmod.save_relay_mapping, info_msg.message_id, user.id, label)
+        await asyncio.to_thread(dbmod.save_relay_mapping, copied.message_id, user.id, label)
+    except Exception:
+        logger.exception("Failed to relay DM from user_id=%s", user.id)
+
+
+async def on_admin_relay_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A reply inside the admin relay group gets delivered back to the original DM sender.
+
+    Only fires for messages that are (a) inside the configured admin relay group,
+    (b) sent by an allow-listed admin, and (c) an actual Telegram reply to a
+    previously relayed message. A fresh, non-reply message in the admin group is
+    left alone (so normal chat there doesn't get misrouted).
+    """
+    msg = update.message
+    if not msg or not msg.reply_to_message or not update.effective_user or not update.effective_chat:
+        return
+
+    relay_chat_id = app_state.admin_relay_chat_id()
+    if not relay_chat_id or update.effective_chat.id != relay_chat_id:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        return
+
+    mapping = await asyncio.to_thread(dbmod.get_relay_mapping, msg.reply_to_message.message_id)
+    if not mapping:
+        await msg.reply_text(
+            "⚠️ Can't find who this belongs to — reply directly to the forwarded "
+            "message (long-press → Reply), not a fresh message."
+        )
+        return
+
+    target_user_id = mapping["user_chat_id"]
+    try:
+        await context.bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=relay_chat_id,
+            message_id=msg.message_id,
+        )
+        await msg.reply_text(f"✅ Delivered to {mapping.get('display_name') or target_user_id}")
+    except Exception:
+        logger.exception("Failed to deliver relay reply to user_id=%s", target_user_id)
+        await msg.reply_text("❌ Failed to deliver — the user may have blocked the bot.")
+
+
+async def cmd_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /message USER_ID text — DM anyone by Telegram user id directly."""
+    if not update.message or not update.effective_user:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Admins only.")
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage: /message USER_ID your text here")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("USER_ID must be a number.")
+        return
+
+    text = " ".join(context.args[1:])
+    try:
+        await context.bot.send_message(target_id, text)
+        await update.message.reply_text("✅ Sent.")
+    except Exception:
+        logger.exception("cmd_message failed target=%s", target_id)
+        await update.message.reply_text(
+            "❌ Failed to send — user may have blocked the bot or never messaged it before."
+        )
+
+
+def _broadcast_target_chat_id() -> int | None:
+    raw = (os.environ.get("BROADCAST_CHAT_ID") or "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    configured = app_state.configured_assistant_groups()
+    return sorted(configured)[0] if configured else None
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /broadcast text — or reply to any message with /broadcast to
+    resend that exact content (photo, poll, text, whatever) to everyone who has
+    ever joined a tracked VC in the target group."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Admins only.")
+        return
+
+    target_chat_id = _broadcast_target_chat_id()
+    if target_chat_id is None:
+        await update.message.reply_text(
+            "No target group configured. Set BROADCAST_CHAT_ID, or make sure ASSISTANT_GROUP_IDS is set."
+        )
+        return
+
+    users = await asyncio.to_thread(dbmod.fetch_all_known_user_ids, target_chat_id)
+    if not users:
+        await update.message.reply_text("No VC participants recorded yet to broadcast to.")
+        return
+
+    source_msg = update.message.reply_to_message
+    text_arg = " ".join(context.args) if context.args else None
+    if not source_msg and not text_arg:
+        await update.message.reply_text(
+            "Usage: /broadcast your text  — or reply to a message with /broadcast"
+        )
+        return
+
+    sent, failed = 0, 0
+    for uid, _label in users:
+        try:
+            if source_msg:
+                await context.bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=update.effective_chat.id,
+                    message_id=source_msg.message_id,
+                )
+            else:
+                await context.bot.send_message(uid, text_arg)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await update.message.reply_text(
+        f"📣 Broadcast done: {sent} sent, {failed} failed (out of {len(users)})."
     )
 
 
@@ -1210,6 +1391,16 @@ def main() -> None:
 
     dbmod.init_db()
 
+    if not app_state.admin_relay_chat_id():
+        logger.warning(
+            "ADMIN_RELAY_CHAT_ID is not set — DM relay is disabled (private messages to the "
+            "bot will just be ignored)."
+        )
+    if not app_state.parse_admin_user_ids():
+        logger.warning(
+            "ADMIN_USER_IDS is not set — /message, /broadcast, and admin-group reply relay are disabled."
+        )
+
     app = (
         Application.builder()
         .token(token)
@@ -1230,11 +1421,22 @@ def main() -> None:
     app.add_handler(CommandHandler("streak", cmd_streak))
     app.add_handler(CommandHandler("badges", cmd_badges))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
+    app.add_handler(CommandHandler("message", cmd_message))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
             on_video_chat_service,
         )
+    )
+    # Admin relay: any non-command private DM to the bot -> copied into admin group.
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_private_message)
+    )
+    # Admin relay: a reply inside a group chat (checked against ADMIN_RELAY_CHAT_ID
+    # inside the handler itself) -> routed back to the DM sender.
+    app.add_handler(
+        MessageHandler(filters.REPLY & filters.ChatType.GROUPS, on_admin_relay_reply)
     )
     app.add_error_handler(error_handler)
 

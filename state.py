@@ -34,6 +34,33 @@ def configured_assistant_groups() -> set[int]:
     return parse_assistant_group_ids()
 
 
+def parse_admin_user_ids(raw: str | None = None) -> set[int]:
+    """Parse ADMIN_USER_IDS env (comma-separated Telegram user ids allowed to use
+    admin-only relay/broadcast commands: /message, /broadcast, replies in the
+    admin relay group)."""
+    text = (raw if raw is not None else os.environ.get("ADMIN_USER_IDS") or "").strip()
+    out: set[int] = set()
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            pass
+    return out
+
+
+def admin_relay_chat_id() -> int | None:
+    """The private admin group chat id where inbound DMs get relayed to."""
+    raw = (os.environ.get("ADMIN_RELAY_CHAT_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 @dataclass
 class BotVCHint:
     """Hints from Bot API service messages while the assistant polls the live list."""
