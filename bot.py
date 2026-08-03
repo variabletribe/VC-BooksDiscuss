@@ -354,15 +354,16 @@ def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-   await update.message.reply_text(
-        "🎙️ <b>BooksDiscuss VC Bot</b>\n"
-        "<i>Your private, personal tracker for BOOKSDISCUSS voice/video chats.</i>\n\n"
+    await update.message.reply_text(
+         
+        "🎙️ <b>BooksDiscuss VC Tracker Bot</b>\n"
+         
 
         "📊 <b>What I track</b>\n"
         "VCs joined, total hours in calls, and present attendance "
         "(20+ min in a call = +1 present day).\n"
         "After every VC ends, I post the call summary, present attendance, "
-        "and an AI recap — automatically.\n\n"
+        "and an AI recap, automatically.\n\n"
 
         "📅 <b>Tracking started: 3 August 2026</b>\n"
         "<i>All stats below are counted from this date onward.</i>\n\n"
@@ -387,7 +388,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /removeuser USER_ID — remove a user from VC stats and attendance\n"
         "• /finduser NAME — find a user's id by name or old @username\n\n"
 
-        "<i>This bot belongs to @booksdiscuss</i>",
+        "<i>This bot belongd to→ @BooksDiscuss </i>",
         parse_mode="HTML",
     )
 
