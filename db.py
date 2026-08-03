@@ -146,6 +146,9 @@ def init_db() -> None:
     _db.user_attendance.create_index([("chat_id", ASCENDING)])
     _db.user_attendance.create_index([("chat_id", ASCENDING), ("xp", DESCENDING)])
     _db.user_attendance.create_index([("chat_id", ASCENDING), ("current_streak", DESCENDING)])
+    # relay_map: _id = the forwarded/info message id in the admin relay chat.
+    # Auto-expires after 30 days so this collection doesn't grow forever.
+    _db.relay_map.create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 30)
 
 
 def _coll(name: str):
@@ -780,3 +783,51 @@ def format_attendance_message(earned: list[AttendanceRow]) -> str:
         lines.append("<i>No one reached the present threshold in this call.</i>")
 
     return "\n".join(lines)
+
+
+# --- DM relay (bot <-> admin private group) ---------------------------------
+
+def save_relay_mapping(message_id: int, user_chat_id: int, display_name: str) -> None:
+    """Remember which private-chat user a forwarded/info message in the admin relay
+    chat came from, so a reply to that message can be routed back to them."""
+    coll = _coll("relay_map")
+    coll.update_one(
+        {"_id": message_id},
+        {
+            "$set": {
+                "user_chat_id": user_chat_id,
+                "display_name": display_name[:512],
+                "created_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+def get_relay_mapping(message_id: int) -> dict | None:
+    coll = _coll("relay_map")
+    doc = coll.find_one({"_id": message_id})
+    if not doc:
+        return None
+    return {
+        "user_chat_id": int(doc["user_chat_id"]),
+        "display_name": str(doc.get("display_name", "")),
+    }
+
+
+def fetch_all_known_user_ids(chat_id: int) -> list[tuple[int, str]]:
+    """Distinct users who have appeared in at least one VC session for this chat —
+    used as the /broadcast audience ("those who have used the VC once")."""
+    coll = _coll("vc_sessions")
+    pipeline = [
+        {"$match": {"chat_id": chat_id}},
+        {"$unwind": "$participants"},
+        {
+            "$group": {
+                "_id": "$participants.user_id",
+                "display_name": {"$last": "$participants.display_name"},
+            }
+        },
+    ]
+    rows = list(coll.aggregate(pipeline))
+    return [(int(r["_id"]), str(r["display_name"])) for r in rows]
