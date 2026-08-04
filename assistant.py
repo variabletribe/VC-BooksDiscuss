@@ -70,6 +70,7 @@ class _CallState:
     accumulated: Dict[int, float] = field(default_factory=dict)
     user_cache: Dict[int, User] = field(default_factory=dict)
     hint_labels: Dict[int, str] = field(default_factory=dict)
+    vc_title: str | None = None
 
 
 async def _send_bot_message(chat_id: int, text: str) -> bool:
@@ -124,20 +125,31 @@ def _is_trackable_user(uid: int, user: User | None = None) -> bool:
     return app_state.is_vc_participant(uid, username)
 
 
-async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], Dict[int, User]]:
-    """Merge GetGroupCall + GetGroupParticipants for the fullest participant list."""
+async def _fetch_participants(
+    client: TelegramClient, call
+) -> tuple[Set[int], Dict[int, User], str | None]:
+    """Merge GetGroupCall + GetGroupParticipants for the fullest participant list.
+
+    Also returns the group call's title (the VC "topic"/name, if the call was
+    started or renamed with one) — only available via phone.GetGroupCallRequest,
+    not from the lightweight InputGroupCall handed to us by GetFullChannelRequest.
+    """
     from telethon.tl.types import InputGroupCall
 
     pair = _call_input(call)
     if not pair:
-        return set(), {}
+        return set(), {}, None
     cid, ah = pair
     inp = InputGroupCall(id=cid, access_hash=ah)
     ids: Set[int] = set()
     users: Dict[int, User] = {}
+    title: str | None = None
 
     try:
         res = await client(functions.phone.GetGroupCallRequest(call=inp, limit=500))
+        raw_title = getattr(res.call, "title", None)
+        if raw_title and raw_title.strip():
+            title = raw_title.strip()
         for p in res.participants:
             peer = p.peer
             if isinstance(peer, PeerUser) and _is_trackable_user(peer.user_id):
@@ -146,7 +158,11 @@ async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], D
             if isinstance(u, User) and _is_trackable_user(u.id, u):
                 users[u.id] = u
         if os.getenv("ASSISTANT_DEBUG"):
-            logger.info("Assistant GetGroupCall: %s participant user id(s)", len(ids))
+            logger.info(
+                "Assistant GetGroupCall: %s participant user id(s), title=%r",
+                len(ids),
+                title,
+            )
     except Exception:
         logger.exception("Assistant GetGroupCall failed; falling back to GetGroupParticipants")
 
@@ -177,7 +193,7 @@ async def _fetch_participants(client: TelegramClient, call) -> tuple[Set[int], D
             break
     if os.getenv("ASSISTANT_DEBUG"):
         logger.info("Assistant merged participant ids: %s", len(ids))
-    return ids, users
+    return ids, users, title
 
 
 async def _resolve_users(client: TelegramClient, st: _CallState, uids: Set[int]) -> None:
@@ -317,11 +333,14 @@ async def _finalize_call(
     lines = [
         "📞 <b>Voice/video chat ended</b>",
         "",
-        f"<b>Call length (tracked):</b> {duration_sec // 60} min {duration_sec % 60} s",
-        "",
-        f"<b>People in VC (assistant):</b> {len(rows)}",
-        "",
     ]
+    if st.vc_title:
+        lines.append(f"<b>Topic:</b> {html.escape(st.vc_title, quote=False)}")
+        lines.append("")
+    lines.append(f"<b>Call length (tracked):</b> {duration_sec // 60} min {duration_sec % 60} s")
+    lines.append("")
+    lines.append(f"<b>People in VC (assistant):</b> {len(rows)}")
+    lines.append("")
     for rank, (_uid, label, sec) in enumerate(rows, start=1):
         mp, sp = sec // 60, sec % 60
         safe = html.escape(label, quote=False)
@@ -358,7 +377,9 @@ async def _finalize_call(
         from bot import generate_ai_vc_summary
 
         chat_title = await _get_chat_title(client, chat_id)
-        ai_summary = await generate_ai_vc_summary(chat_title, duration_sec, rows)
+        ai_summary = await generate_ai_vc_summary(
+            chat_title, duration_sec, rows, vc_topic=st.vc_title
+        )
         if ai_summary:
             safe_summary = html.escape(ai_summary, quote=False)
             await _post_vc_summary(client, chat_id, f"🤖 <i>{safe_summary}</i>")
@@ -419,9 +440,11 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
 
                 _apply_bot_hints(st, chat_id, now)
 
-                current_ids, user_map = await _fetch_participants(client, call)
+                current_ids, user_map, call_title = await _fetch_participants(client, call)
                 st.user_cache.update(user_map)
                 st.seen_ids.update(current_ids)
+                if call_title:
+                    st.vc_title = call_title
 
                 joined = current_ids - st.last_ids
                 left = st.last_ids - current_ids

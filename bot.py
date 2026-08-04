@@ -386,7 +386,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         "<b>🎮 Your Progress</b>\n"
         "• /level — your XP and level\n"
-        "• /xp — top XP earners in this group\n"
+        "• /xpleaderboard — top XP earners in this group\n"
         "• /streak — your current and longest VC streak\n"
         "• /badges — your earned badges\n\n"
 
@@ -400,7 +400,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /message USER_ID text — DM any known user directly\n"
         "• /broadcast text — message everyone who has joined a VC\n\n"
 
-        "<i>This bot belongd to→ @BooksDiscuss </i>",
+        "<i>This bot belongs to→ @BooksDiscuss </i>",
         parse_mode="HTML",
     )
 
@@ -1125,9 +1125,15 @@ async def generate_ai_vc_summary(
     chat_title: str,
     duration_sec: int,
     parts: list[tuple[int, str, int]],
+    vc_topic: str | None = None,
 ) -> str | None:
     """Ask Groq (free tier, Llama 3.3 70B) for a short natural-language VC recap.
-    Returns None if GROQ_API_KEY is missing or the call fails — caller should skip silently."""
+    Returns None if GROQ_API_KEY is missing or the call fails — caller should skip silently.
+
+    vc_topic: the voice chat's title/topic, if one was set (e.g. renamed via Telegram's
+    "Set chat title" option on the group call). Only the Telethon assistant path can supply
+    this today (it comes from phone.GetGroupCallRequest, which needs a user account, not a
+    bot). Bot-API-only fallback paths pass None, and the recap simply omits it."""
     api_key = (os.environ.get("GROQ_API_KEY") or "").strip()
     if not api_key:
         return None
@@ -1142,13 +1148,18 @@ async def generate_ai_vc_summary(
     roster_text = "\n".join(roster_lines)
     total_min = duration_sec // 60
 
+    topic_line = f' The voice chat was titled "{vc_topic}".' if vc_topic else ""
+    topic_instruction = (
+        " and naturally mention the chat's topic/title in the recap" if vc_topic else ""
+    )
+
     prompt = (
         f"Write a short, upbeat 2-3 sentence recap of a voice chat that just ended in the "
-        f"Telegram group \"{chat_title}\". The call lasted {total_min} minutes total. "
+        f"Telegram group \"{chat_title}\".{topic_line} The call lasted {total_min} minutes total. "
         f"Participants and their approximate time in the call:\n{roster_text}\n\n"
-        f"Mention who stayed longest and roughly how many people joined. Keep it casual and "
-        f"friendly, like a group chat bot, not formal. Do not use markdown formatting, just plain text. "
-        f"Keep it under 400 characters."
+        f"Mention who stayed longest and roughly how many people joined{topic_instruction}. "
+        f"Keep it casual and friendly, like a group chat bot, not formal. Do not use markdown "
+        f"formatting, just plain text. Keep it under 400 characters."
     )
 
     try:
@@ -1417,7 +1428,7 @@ def main() -> None:
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("finduser", cmd_finduser))
     app.add_handler(CommandHandler("level", cmd_level))
-    app.add_handler(CommandHandler("xp", cmd_xpleaderboard))
+    app.add_handler(CommandHandler("xpleaderboard", cmd_xpleaderboard))
     app.add_handler(CommandHandler("streak", cmd_streak))
     app.add_handler(CommandHandler("badges", cmd_badges))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
