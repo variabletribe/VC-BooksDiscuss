@@ -256,6 +256,17 @@ def _merge_confirmed_participants(st: _CallState, chat_id: int, ended_at: dateti
         st.accumulated[uid] = max(0.0, (ended_at - st.started_at).total_seconds())
 
 
+async def _get_chat_title(client: TelegramClient, chat_id: int) -> str:
+    try:
+        entity = await client.get_entity(chat_id)
+        title = getattr(entity, "title", None)
+        if title:
+            return title
+    except Exception:
+        logger.exception("Assistant could not resolve chat title for chat_id=%s", chat_id)
+    return "this group"
+
+
 async def _finalize_call(
     client: TelegramClient,
     chat_id: int,
@@ -325,6 +336,34 @@ async def _finalize_call(
     earned = await asyncio.to_thread(dbmod.record_present_attendance, chat_id, rows)
     attendance_text = dbmod.format_attendance_message(earned)
     await _post_vc_summary(client, chat_id, attendance_text)
+
+    # --- Badges + AI recap ---------------------------------------------------
+    # These previously only ran in bot.py's fallback path (_assistant_vc_fallback_report).
+    # The healthy/normal path is THIS function (the Telethon assistant), so badges and
+    # the AI-generated recap were never actually sent while the assistant was working.
+    # Imported lazily (not at module top) to avoid a circular import: bot.py imports
+    # assistant.py from inside main(), so by the time this function runs, bot.py's
+    # module-level code has already finished executing.
+    try:
+        badges = await asyncio.to_thread(dbmod.check_and_award_session_badges, chat_id, rows)
+        if badges:
+            from bot import _format_badges_earned_html
+
+            badge_text = _format_badges_earned_html(badges)
+            await _post_vc_summary(client, chat_id, badge_text)
+    except Exception:
+        logger.exception("Assistant: badge check/post failed chat_id=%s", chat_id)
+
+    try:
+        from bot import generate_ai_vc_summary
+
+        chat_title = await _get_chat_title(client, chat_id)
+        ai_summary = await generate_ai_vc_summary(chat_title, duration_sec, rows)
+        if ai_summary:
+            safe_summary = html.escape(ai_summary, quote=False)
+            await _post_vc_summary(client, chat_id, f"🤖 <i>{safe_summary}</i>")
+    except Exception:
+        logger.exception("Assistant: AI recap failed chat_id=%s", chat_id)
 
     logger.info("Assistant finalized VC chat_id=%s participants=%s", chat_id, len(rows))
 
