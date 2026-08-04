@@ -386,7 +386,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         "<b>🎮 Your Progress</b>\n"
         "• /level — your XP and level\n"
-        "• /xpleaderboard — top XP earners in this group\n"
+        "• /xp — top XP earners in this group\n"
         "• /streak — your current and longest VC streak\n"
         "• /badges — your earned badges\n\n"
 
@@ -1417,7 +1417,7 @@ def main() -> None:
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("finduser", cmd_finduser))
     app.add_handler(CommandHandler("level", cmd_level))
-    app.add_handler(CommandHandler("xpleaderboard", cmd_xpleaderboard))
+    app.add_handler(CommandHandler("xp", cmd_xpleaderboard))
     app.add_handler(CommandHandler("streak", cmd_streak))
     app.add_handler(CommandHandler("badges", cmd_badges))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
