@@ -351,7 +351,7 @@ def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
     threshold_min = dbmod.present_threshold_sec() // 60
     lines = [
         "📋 <b>Present attendance</b>",
-        " <i>Counts from 1 July 2026</i>",
+        " <i>Counts from 4 August 2026</i>",
         f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
         "",
     ]
