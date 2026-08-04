@@ -372,7 +372,11 @@ def record_present_attendance(
     IMPORTANT: MongoDB forbids a field appearing in both `$inc`/`$set` and
     `$setOnInsert` in the same update — it raises a WriteError ("would create a
     conflict"). We build the update dict per-user so a field is only ever placed
-    in one operator, never both.
+    in one operator, never both. This applies to present_days AND to
+    current_streak/longest_streak: whichever branch (crossing vs. not crossing
+    the threshold) sets them via $set must NOT also default them via
+    $setOnInsert in that same call, or every present-day write throws and the
+    whole update (including the xp $inc) silently fails to apply.
     """
     coll = _coll("user_attendance")
     threshold = present_threshold_sec()
@@ -395,15 +399,16 @@ def record_present_attendance(
             "display_name": name[:512],
         }
         set_on_insert: dict = {
-            "current_streak": 0,
-            "longest_streak": 0,
             "badges": {},
         }
 
         crosses_threshold = sec > threshold
         if crosses_threshold:
-            # present_days is being $inc'd this call, so it must NOT also appear
-            # in $setOnInsert (that's the bug that silently broke every fresh doc).
+            # present_days AND current_streak/longest_streak are all being
+            # $set/$inc'd this call, so none of them may also appear in
+            # $setOnInsert (that's the bug that made every present-day write
+            # for a fresh OR existing doc throw a WriteError and silently
+            # drop the whole update, including present_days and xp).
             inc["present_days"] = 1
             if last_day_str:
                 last_day = datetime.strptime(last_day_str, "%Y-%m-%d").date()
@@ -421,9 +426,11 @@ def record_present_attendance(
             set_fields["longest_streak"] = new_longest
             set_fields["last_present_date"] = today.strftime("%Y-%m-%d")
         else:
-            # Not incrementing present_days this call, so it's safe to default it
-            # here on first-ever insert for this user.
+            # Not incrementing/setting these this call, so it's safe to default
+            # them here on first-ever insert for this user.
             set_on_insert["present_days"] = 0
+            set_on_insert["current_streak"] = 0
+            set_on_insert["longest_streak"] = 0
 
         update: dict = {"$inc": inc, "$set": set_fields, "$setOnInsert": set_on_insert}
 
