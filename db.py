@@ -66,6 +66,8 @@ class BadgeEarned(NamedTuple):
     display_name: str
     badge_id: str
     badge_label: str
+    badge_desc: str
+    count: int
 
 
 class WeeklyDigest(NamedTuple):
@@ -91,12 +93,16 @@ LEVEL_THRESHOLDS: list[tuple[int, int]] = [
     (10, 75000),
 ]
 
+# Simple, repeatable badge system: every badge can be earned more than once and
+# is tracked as a per-badge count (e.g. "Marathoner ×3"), rather than a flat
+# earned-once list. Kept intentionally short — five badges, no tiers/rarity —
+# so it stays easy to remember while still feeling premium via formatting.
 BADGES: dict[str, dict] = {
-    "night_owl": {"label": "🦉 Night Owl", "desc": "In a VC after midnight, 10 times"},
-    "marathoner": {"label": "🏃 Marathoner", "desc": "Single session 3+ hours"},
-    "iron_streak_7": {"label": "🔥 Week Warrior", "desc": "7-day streak"},
-    "iron_streak_30": {"label": "⚡ Iron Streak", "desc": "30-day streak"},
-    "veteran_100": {"label": "🎖️ Veteran", "desc": "100 total sessions"},
+    "marathoner": {"label": "🏃 Marathoner", "desc": "Spent 3+ hours in a single VC"},
+    "night_owl": {"label": "🦉 Night Owl", "desc": "Joined a VC after midnight"},
+    "week_warrior": {"label": "🔥 Week Warrior", "desc": "Kept a 7-day attendance streak"},
+    "iron_streak": {"label": "⚡ Iron Streak", "desc": "Kept a 30-day attendance streak"},
+    "veteran": {"label": "🎖️ Veteran", "desc": "Joined 100 VC sessions"},
 }
 
 
@@ -391,7 +397,7 @@ def record_present_attendance(
         set_on_insert: dict = {
             "current_streak": 0,
             "longest_streak": 0,
-            "badges": [],
+            "badges": {},
         }
 
         crosses_threshold = sec > threshold
@@ -500,22 +506,47 @@ def reset_expired_streaks(chat_id: int) -> int:
     return reset_count
 
 
-def award_badge(chat_id: int, user_id: int, display_name: str, badge_id: str) -> bool:
-    """Award a badge if not already held. Returns True if newly awarded."""
+def _migrate_badges_field(doc: dict) -> dict:
+    """Older data stored `badges` as a flat list of earned-once ids
+    (e.g. ["night_owl", "marathoner"]). The current schema stores a
+    {badge_id: count} map so repeatable badges can show "×3" etc. If we find
+    the old list format on a user's doc, convert it in place (count=1 each)
+    the first time we touch it, so old earned badges aren't lost."""
+    badges = doc.get("badges")
+    if isinstance(badges, list):
+        counts = {bid: 1 for bid in badges if bid in BADGES}
+        coll = _coll("user_attendance")
+        coll.update_one({"_id": doc["_id"]}, {"$set": {"badges": counts}})
+        doc["badges"] = counts
+    elif not isinstance(badges, dict):
+        doc["badges"] = {}
+    return doc
+
+
+def award_badge(chat_id: int, user_id: int, display_name: str, badge_id: str) -> int:
+    """Increment this user's count for badge_id and return the new count.
+    Badges are repeatable by design (e.g. Marathoner ×3) — call this only when
+    the calling code has already confirmed the condition was met this call."""
     if badge_id not in BADGES:
-        return False
+        return 0
     coll = _coll("user_attendance")
     doc_id = f"{chat_id}:{user_id}"
-    result = coll.update_one(
-        {"_id": doc_id, "badges": {"$ne": badge_id}},
+
+    existing = coll.find_one({"_id": doc_id})
+    if existing is not None:
+        _migrate_badges_field(existing)
+
+    doc = coll.find_one_and_update(
+        {"_id": doc_id},
         {
-            "$addToSet": {"badges": badge_id},
+            "$inc": {f"badges.{badge_id}": 1},
             "$set": {"chat_id": chat_id, "user_id": user_id, "display_name": display_name[:512]},
             "$setOnInsert": {"xp": 0, "present_days": 0, "current_streak": 0, "longest_streak": 0},
         },
         upsert=True,
+        return_document=True,
     )
-    return result.modified_count > 0 or result.upserted_id is not None
+    return int((doc.get("badges") or {}).get(badge_id, 1))
 
 
 def get_user_badges(chat_id: int, user_id: int) -> list[BadgeEarned]:
@@ -523,12 +554,17 @@ def get_user_badges(chat_id: int, user_id: int) -> list[BadgeEarned]:
     doc = coll.find_one({"_id": f"{chat_id}:{user_id}"})
     if not doc:
         return []
+    doc = _migrate_badges_field(doc)
     name = str(doc.get("display_name", ""))
+    badges_map: dict = doc.get("badges") or {}
+
+    order = {bid: i for i, bid in enumerate(BADGES.keys())}
     out = []
-    for bid in doc.get("badges", []):
+    for bid, count in badges_map.items():
         meta = BADGES.get(bid)
-        if meta:
-            out.append(BadgeEarned(user_id, name, bid, meta["label"]))
+        if meta and int(count) > 0:
+            out.append(BadgeEarned(user_id, name, bid, meta["label"], meta["desc"], int(count)))
+    out.sort(key=lambda b: order.get(b.badge_id, 999))
     return out
 
 
@@ -537,11 +573,17 @@ def check_and_award_session_badges(
     participants: Iterable[tuple[int, str, int]],
 ) -> list[BadgeEarned]:
     """Call after record_vc_session + record_present_attendance with the same participants.
-    Checks marathoner (3+ hr single session), iron streaks, night_owl (10 post-midnight-UTC
-    sessions), and veteran_100 (100 total sessions).
 
-    Same MongoDB rule applies here: session_count / night_owl_count must not appear in both
-    $inc and $setOnInsert within the same update call.
+    Repeatable badge triggers:
+    - marathoner: every session with 3+ hours in a single VC.
+    - night_owl: every 10th post-midnight-UTC session (10, 20, 30, ...).
+    - week_warrior: every time the attendance streak reaches exactly 7 days
+      (fires again if the streak resets and climbs back to 7).
+    - iron_streak: every time the attendance streak reaches exactly 30 days.
+    - veteran: every 100th total VC session (100, 200, 300, ...).
+
+    Same MongoDB rule applies here: session_count / night_owl_count must not
+    appear in both $inc and $setOnInsert within the same update call.
     """
     newly_earned: list[BadgeEarned] = []
     coll = _coll("user_attendance")
@@ -550,8 +592,9 @@ def check_and_award_session_badges(
 
     for uid, name, sec in participants:
         if sec >= 3 * 3600:
-            if award_badge(chat_id, uid, name, "marathoner"):
-                newly_earned.append(BadgeEarned(uid, name, "marathoner", BADGES["marathoner"]["label"]))
+            count = award_badge(chat_id, uid, name, "marathoner")
+            meta = BADGES["marathoner"]
+            newly_earned.append(BadgeEarned(uid, name, "marathoner", meta["label"], meta["desc"], count))
 
         doc_id = f"{chat_id}:{uid}"
         inc: dict = {"session_count": 1}
@@ -560,7 +603,7 @@ def check_and_award_session_badges(
             "present_days": 0,
             "current_streak": 0,
             "longest_streak": 0,
-            "badges": [],
+            "badges": {},
         }
         if is_midnight_window:
             inc["night_owl_count"] = 1
@@ -575,15 +618,26 @@ def check_and_award_session_badges(
         doc = coll.find_one_and_update({"_id": doc_id}, update, upsert=True, return_document=True)
 
         streak = int(doc.get("current_streak", 0))
-        if streak >= 7 and award_badge(chat_id, uid, name, "iron_streak_7"):
-            newly_earned.append(BadgeEarned(uid, name, "iron_streak_7", BADGES["iron_streak_7"]["label"]))
-        if streak >= 30 and award_badge(chat_id, uid, name, "iron_streak_30"):
-            newly_earned.append(BadgeEarned(uid, name, "iron_streak_30", BADGES["iron_streak_30"]["label"]))
+        if streak == 7:
+            count = award_badge(chat_id, uid, name, "week_warrior")
+            meta = BADGES["week_warrior"]
+            newly_earned.append(BadgeEarned(uid, name, "week_warrior", meta["label"], meta["desc"], count))
+        if streak == 30:
+            count = award_badge(chat_id, uid, name, "iron_streak")
+            meta = BADGES["iron_streak"]
+            newly_earned.append(BadgeEarned(uid, name, "iron_streak", meta["label"], meta["desc"], count))
 
-        if int(doc.get("night_owl_count", 0)) >= 10 and award_badge(chat_id, uid, name, "night_owl"):
-            newly_earned.append(BadgeEarned(uid, name, "night_owl", BADGES["night_owl"]["label"]))
-        if int(doc.get("session_count", 0)) >= 100 and award_badge(chat_id, uid, name, "veteran_100"):
-            newly_earned.append(BadgeEarned(uid, name, "veteran_100", BADGES["veteran_100"]["label"]))
+        night_owl_count = int(doc.get("night_owl_count", 0))
+        if is_midnight_window and night_owl_count > 0 and night_owl_count % 10 == 0:
+            count = award_badge(chat_id, uid, name, "night_owl")
+            meta = BADGES["night_owl"]
+            newly_earned.append(BadgeEarned(uid, name, "night_owl", meta["label"], meta["desc"], count))
+
+        session_count = int(doc.get("session_count", 0))
+        if session_count > 0 and session_count % 100 == 0:
+            count = award_badge(chat_id, uid, name, "veteran")
+            meta = BADGES["veteran"]
+            newly_earned.append(BadgeEarned(uid, name, "veteran", meta["label"], meta["desc"], count))
 
     return newly_earned
 
@@ -769,7 +823,7 @@ def format_attendance_message(earned: list[AttendanceRow]) -> str:
     threshold_min = present_threshold_sec() // 60
     lines = [
         "📋 <b>Present attendance</b>",
-        " <i>Counts from 1 July 2026</i>",
+        " <i>Counts from 4 August 2026</i>",
         "",
         f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
         "",
