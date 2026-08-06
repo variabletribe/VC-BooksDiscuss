@@ -25,6 +25,7 @@ from typing import Dict, Set
 
 import httpx
 from telethon import TelegramClient, functions, utils
+from telethon.errors import AuthKeyDuplicatedError
 from telethon.sessions import StringSession
 from telethon.tl.types import GroupCallDiscarded, PeerUser, User
 
@@ -32,6 +33,14 @@ import db as dbmod
 import state as app_state
 
 logger = logging.getLogger(__name__)
+
+
+class AssistantConfigError(Exception):
+    """Raised for problems that a retry will never fix: missing env vars, an
+    unauthorized session, or a session that belongs to a bot account. The
+    background retry loop in start_assistant_background() logs these once and
+    stops — unlike transient errors (network blips, AuthKeyDuplicatedError),
+    which it retries with backoff."""
 
 
 def _format_duration(seconds: int) -> str:
@@ -479,12 +488,12 @@ async def run_assistant() -> None:
             "Assistant disabled (set TELEGRAM_SESSION_STRING, TELEGRAM_API_ID, "
             "TELEGRAM_API_HASH, ASSISTANT_GROUP_IDS to enable)."
         )
-        return
+        raise AssistantConfigError("missing required env var(s)")
 
     chat_ids = _parse_group_ids(raw_ids)
     if not chat_ids:
         logger.warning("ASSISTANT_GROUP_IDS has no valid ids: %r", raw_ids)
-        return
+        raise AssistantConfigError("ASSISTANT_GROUP_IDS has no valid ids")
 
     client = TelegramClient(StringSession(session_s), api_id, api_hash)
     try:
@@ -493,7 +502,7 @@ async def run_assistant() -> None:
             logger.error(
                 "Assistant: session not authorized. Run session_login.py locally and set TELEGRAM_SESSION_STRING."
             )
-            return
+            raise AssistantConfigError("session not authorized")
 
         me = await client.get_me()
         if getattr(me, "bot", False):
@@ -505,7 +514,7 @@ async def run_assistant() -> None:
                 "Put the printed StringSession in TELEGRAM_SESSION_STRING. "
                 "Until then, remove ASSISTANT_GROUP_IDS or fix the session so the bot can use invite-based VC again."
             )
-            return
+            raise AssistantConfigError("session belongs to a bot account")
 
         app_state.assistant_chat_ids = set(chat_ids)
         app_state.assistant_running = True
@@ -525,11 +534,57 @@ async def run_assistant() -> None:
 
 
 def start_assistant_background() -> None:
+    """Runs the assistant in a background thread and keeps it alive.
+
+    Transient failures — network hiccups, and especially AuthKeyDuplicatedError,
+    which Telegram raises when the same session is briefly used from two IPs at
+    once (typical for a few seconds right after a Render redeploy, while the old
+    instance is still shutting down as the new one boots) — are retried with
+    exponential backoff instead of permanently killing VC tracking until the next
+    manual deploy.
+
+    Permanent configuration problems (missing env vars, an unauthorized session,
+    a bot-token session) raise AssistantConfigError and are logged once, then
+    left alone — retrying those forever would just spam the logs for no benefit.
+    """
+
     def _runner() -> None:
-        try:
-            asyncio.run(run_assistant())
-        except Exception:
-            logger.exception("Assistant thread crashed")
+        base_delay = 5.0
+        max_delay = 300.0
+        delay = base_delay
+        while True:
+            started = time.monotonic()
+            try:
+                asyncio.run(run_assistant())
+                logger.warning(
+                    "Assistant: run_assistant() returned without error (unexpected); not retrying."
+                )
+                return
+            except AssistantConfigError as exc:
+                logger.error("Assistant permanently disabled (config issue): %s", exc)
+                return
+            except AuthKeyDuplicatedError:
+                logger.error(
+                    "Assistant: AuthKeyDuplicatedError — TELEGRAM_SESSION_STRING was used from "
+                    "two IPs at the same time. This is common for a few seconds right after a "
+                    "Render redeploy (the old instance is still shutting down) and usually "
+                    "clears up on its own once that instance fully stops. If it keeps recurring, "
+                    "something else is also using this exact session string at the same time "
+                    "(e.g. still running session_login.py locally, or a second Render service/"
+                    "instance) — stop that, or generate a fresh session with session_login.py "
+                    "and update TELEGRAM_SESSION_STRING. Retrying in %.0fs.",
+                    delay,
+                )
+            except Exception:
+                logger.exception("Assistant thread crashed; retrying in %.0fs", delay)
+
+            # Ran for a while before failing -> treat the next failure as fresh
+            # rather than climbing the backoff toward max_delay forever.
+            if time.monotonic() - started > 60:
+                delay = base_delay
+            else:
+                delay = min(delay * 2, max_delay)
+            time.sleep(delay)
 
     import threading
 
