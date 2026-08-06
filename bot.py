@@ -364,10 +364,75 @@ def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
     return "\n".join(lines)
 
 
+COMMAND_AUTODELETE_SECONDS = 30
+
+
+async def _delete_messages_later(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """job_queue callback: deletes a batch of message ids in one chat.
+
+    Only ever scheduled by _reply_autodelete (i.e. only for command replies). The bot's
+    own automatic posts — VC summaries, attendance, badges, AI recap, monthly/weekly
+    reports, admin-relay messages — always go straight through reply_text/send_message
+    and never touch this function, so they're never auto-deleted.
+    """
+    data = context.job.data or {}
+    chat_id = data.get("chat_id")
+    message_ids = data.get("message_ids") or []
+    for mid in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            logger.debug(
+                "Autodelete: could not delete message_id=%s in chat_id=%s (already gone, "
+                "or the bot isn't a group admin with 'Delete messages' rights)",
+                mid,
+                chat_id,
+            )
+
+
+async def _reply_autodelete(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    parse_mode: str | None = None,
+):
+    """Reply to a command, then — only in groups — schedule both that reply and the
+    person's own /command message for deletion after COMMAND_AUTODELETE_SECONDS.
+
+    Every cmd_* handler below uses this instead of update.message.reply_text directly.
+    Nothing the bot posts on its own initiative goes through this helper, so this only
+    ever affects command-and-response pairs, never the bot's automatic messages.
+
+    Requires the bot to be a group admin with "Delete messages" permission — without it,
+    Telegram just silently refuses the delete (logged at debug level); nothing breaks,
+    the messages simply stay visible.
+    """
+    if not update.message or not update.effective_chat:
+        return None
+    sent = await update.message.reply_text(text, parse_mode=parse_mode)
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return sent
+    jq = context.job_queue
+    if jq is None:
+        return sent
+    jq.run_once(
+        _delete_messages_later,
+        when=COMMAND_AUTODELETE_SECONDS,
+        data={
+            "chat_id": update.effective_chat.id,
+            "message_ids": [update.message.message_id, sent.message_id],
+        },
+        name=f"autodelete-{update.effective_chat.id}-{sent.message_id}",
+    )
+    return sent
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await update.message.reply_text(
+    await _reply_autodelete(
+        update,
+        context,
         "🎙️ <b>BooksDiscuss VC Tracker Bot</b>\n"
 
         "📊 <b>What I track</b>\n"
@@ -423,16 +488,16 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
 
     rows, start, end = await asyncio.to_thread(dbmod.fetch_alltime_vc_stats, chat.id)
     if not rows:
-        await update.message.reply_text("No recorded VC data in this group yet.")
+        await _reply_autodelete(update, context, "No recorded VC data in this group yet.")
         return
     subtitle = f"{_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
     text = _format_vc_stats_html("All-time VC report", subtitle, rows)
-    await update.message.reply_text(text, parse_mode="HTML")
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
 
 
 async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,19 +505,21 @@ async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
 
     rows = await asyncio.to_thread(dbmod.fetch_all_attendance, chat.id)
     if not rows:
         threshold_min = dbmod.present_threshold_sec() // 60
-        await update.message.reply_text(
+        await _reply_autodelete(
+            update,
+            context,
             f"No present attendance recorded in this group yet.\n\n"
-            f"Stay more than {threshold_min} minutes in a voice/video call to earn +1 present day."
+            f"Stay more than {threshold_min} minutes in a voice/video call to earn +1 present day.",
         )
         return
 
-    await update.message.reply_text(_format_attendance_html(rows), parse_mode="HTML")
+    await _reply_autodelete(update, context, _format_attendance_html(rows), parse_mode="HTML")
 
 
 async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -460,15 +527,15 @@ async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
 
     now = datetime.now(timezone.utc)
     y, m = dbmod.previous_calendar_month(now.year, now.month)
     rows, start, end = await asyncio.to_thread(dbmod.fetch_month_vc_stats, chat.id, y, m)
     if not rows:
-        await update.message.reply_text(
-            f"No recorded VC data for {_month_name(m)} {y} in this group."
+        await _reply_autodelete(
+            update, context, f"No recorded VC data for {_month_name(m)} {y} in this group."
         )
         return
     if start and end:
@@ -476,7 +543,7 @@ async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         subtitle = f"{_month_name(m)} {y} (UTC)"
     text = _format_vc_stats_html(f"Monthly VC report — {_month_name(m)} {y}", subtitle, rows)
-    await update.message.reply_text(text, parse_mode="HTML")
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
 
 
 async def cmd_vcstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -484,7 +551,7 @@ async def cmd_vcstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
 
     configured = app_state.configured_assistant_groups()
@@ -528,7 +595,7 @@ async def cmd_vcstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"TELEGRAM_API_ID/HASH set: {'yes' if has_api else 'no'}",
         f"ASSISTANT_GROUP_IDS: <code>{html.escape(os.environ.get('ASSISTANT_GROUP_IDS', '') or '(not set)', quote=False)}</code>",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -536,15 +603,17 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     if not await _is_group_admin(update, context):
-        await update.message.reply_text("Only group admins can search the database.")
+        await _reply_autodelete(update, context, "Only group admins can search the database.")
         return
 
     query = " ".join(context.args).strip().lstrip("@")
     if not query:
-        await update.message.reply_text(
+        await _reply_autodelete(
+            update,
+            context,
             "Usage: /finduser NAME_OR_USERNAME\n\n"
             "Examples:\n"
             "/finduser udvega\n"
@@ -555,7 +624,9 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     rows = await asyncio.to_thread(dbmod.find_users_in_chat, chat.id, query)
     if not rows:
-        await update.message.reply_text(
+        await _reply_autodelete(
+            update,
+            context,
             f"No database records match <code>{html.escape(query, quote=False)}</code> in this group.",
             parse_mode="HTML",
         )
@@ -571,7 +642,7 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     lines.append("")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -579,14 +650,16 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     if not await _is_group_admin(update, context):
-        await update.message.reply_text("Only group admins can remove users from the database.")
+        await _reply_autodelete(update, context, "Only group admins can remove users from the database.")
         return
 
     if not context.args:
-        await update.message.reply_text(
+        await _reply_autodelete(
+            update,
+            context,
             "Usage: /removeuser &lt;telegram_user_id&gt;\n\n"
             "Example: /removeuser 1087968824\n\n"
             "Run /finduser NAME to look up a user's numeric id.",
@@ -598,15 +671,17 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         user_id = int(raw)
     except ValueError:
-        await update.message.reply_text("User id must be a number, e.g. /removeuser 1087968824")
+        await _reply_autodelete(update, context, "User id must be a number, e.g. /removeuser 1087968824")
         return
     if user_id <= 0:
-        await update.message.reply_text("User id must be a positive Telegram user id.")
+        await _reply_autodelete(update, context, "User id must be a positive Telegram user id.")
         return
 
     result = await asyncio.to_thread(dbmod.remove_user_from_chat, chat.id, user_id)
     if result.vc_rows_deleted == 0 and result.attendance_rows_deleted == 0:
-        await update.message.reply_text(
+        await _reply_autodelete(
+            update,
+            context,
             f"No database records found for user id <code>{user_id}</code> in this group.",
             parse_mode="HTML",
         )
@@ -618,7 +693,7 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"• VC call records deleted: <b>{result.vc_rows_deleted}</b>",
         f"• Attendance records deleted: <b>{result.attendance_rows_deleted}</b>",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -626,20 +701,22 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this in a group.")
+        await _reply_autodelete(update, context, "Use this in a group.")
         return
     if not await _is_group_admin(update, context):
-        await update.message.reply_text("Only group admins can change this setting.")
+        await _reply_autodelete(update, context, "Only group admins can change this setting.")
         return
 
     arg = (context.args[0].lower() if context.args else "").strip()
     if arg not in ("on", "off"):
-        await update.message.reply_text("Usage: /reports on  or  /reports off")
+        await _reply_autodelete(update, context, "Usage: /reports on  or  /reports off")
         return
     enabled = arg == "on"
     await asyncio.to_thread(dbmod.set_monthly_reports, chat.id, enabled)
-    await update.message.reply_text(
-        "Monthly auto-reports are now " + ("enabled" if enabled else "disabled") + " for this group."
+    await _reply_autodelete(
+        update,
+        context,
+        "Monthly auto-reports are now " + ("enabled" if enabled else "disabled") + " for this group.",
     )
 
 
@@ -751,25 +828,25 @@ async def cmd_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message or not update.effective_user:
         return
     if not _is_admin_user(update.effective_user.id):
-        await update.message.reply_text("Admins only.")
+        await _reply_autodelete(update, context, "Admins only.")
         return
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: /message USER_ID your text here")
+        await _reply_autodelete(update, context, "Usage: /message USER_ID your text here")
         return
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("USER_ID must be a number.")
+        await _reply_autodelete(update, context, "USER_ID must be a number.")
         return
 
     text = " ".join(context.args[1:])
     try:
         await context.bot.send_message(target_id, text)
-        await update.message.reply_text("✅ Sent.")
+        await _reply_autodelete(update, context, "✅ Sent.")
     except Exception:
         logger.exception("cmd_message failed target=%s", target_id)
-        await update.message.reply_text(
-            "❌ Failed to send — user may have blocked the bot or never messaged it before."
+        await _reply_autodelete(
+            update, context, "❌ Failed to send — user may have blocked the bot or never messaged it before."
         )
 
 
@@ -791,26 +868,28 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.message or not update.effective_user or not update.effective_chat:
         return
     if not _is_admin_user(update.effective_user.id):
-        await update.message.reply_text("Admins only.")
+        await _reply_autodelete(update, context, "Admins only.")
         return
 
     target_chat_id = _broadcast_target_chat_id()
     if target_chat_id is None:
-        await update.message.reply_text(
-            "No target group configured. Set BROADCAST_CHAT_ID, or make sure ASSISTANT_GROUP_IDS is set."
+        await _reply_autodelete(
+            update,
+            context,
+            "No target group configured. Set BROADCAST_CHAT_ID, or make sure ASSISTANT_GROUP_IDS is set.",
         )
         return
 
     users = await asyncio.to_thread(dbmod.fetch_all_known_user_ids, target_chat_id)
     if not users:
-        await update.message.reply_text("No VC participants recorded yet to broadcast to.")
+        await _reply_autodelete(update, context, "No VC participants recorded yet to broadcast to.")
         return
 
     source_msg = update.message.reply_to_message
     text_arg = " ".join(context.args) if context.args else None
     if not source_msg and not text_arg:
-        await update.message.reply_text(
-            "Usage: /broadcast your text  — or reply to a message with /broadcast"
+        await _reply_autodelete(
+            update, context, "Usage: /broadcast your text  — or reply to a message with /broadcast"
         )
         return
 
@@ -830,8 +909,8 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             failed += 1
         await asyncio.sleep(0.05)
 
-    await update.message.reply_text(
-        f"📣 Broadcast done: {sent} sent, {failed} failed (out of {len(users)})."
+    await _reply_autodelete(
+        update, context, f"📣 Broadcast done: {sent} sent, {failed} failed (out of {len(users)})."
     )
 
 
@@ -1219,12 +1298,12 @@ async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     user = update.effective_user
     label = _user_label(user)
     info = await asyncio.to_thread(dbmod.get_level_info, chat.id, user.id, label)
-    await update.message.reply_text(dbmod.format_level_message(info), parse_mode="HTML")
+    await _reply_autodelete(update, context, dbmod.format_level_message(info), parse_mode="HTML")
 
 
 async def cmd_xpleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1232,11 +1311,11 @@ async def cmd_xpleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     rows = await asyncio.to_thread(dbmod.fetch_xp_leaderboard, chat.id, 10)
     if not rows:
-        await update.message.reply_text("No XP recorded in this group yet.")
+        await _reply_autodelete(update, context, "No XP recorded in this group yet.")
         return
     lines = ["🎖️ <b>XP Leaderboard</b>", ""]
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -1244,7 +1323,7 @@ async def cmd_xpleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         medal = medals.get(i, f"{i}.")
         safe = html.escape(row.display_name, quote=False)
         lines.append(f"{medal} {safe} — Level {row.level} ({row.xp} XP)")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1252,7 +1331,7 @@ async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     user = update.effective_user
     label = _user_label(user)
@@ -1263,7 +1342,7 @@ async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Current streak: <b>{info.current_streak}</b> day(s)\n"
         f"Longest streak: <b>{info.longest_streak}</b> day(s)"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
 
 
 async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1271,12 +1350,12 @@ async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     user = update.effective_user
     label = _user_label(user)
     stats = await asyncio.to_thread(dbmod.get_my_stats, chat.id, user.id, label)
-    await update.message.reply_text(dbmod.format_my_stats_message(stats), parse_mode="HTML")
+    await _reply_autodelete(update, context, dbmod.format_my_stats_message(stats), parse_mode="HTML")
 
 
 async def cmd_streakboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1284,16 +1363,16 @@ async def cmd_streakboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     if not await _is_group_admin(update, context):
-        await update.message.reply_text("Only group admins can view the streakboard.")
+        await _reply_autodelete(update, context, "Only group admins can view the streakboard.")
         return
     rows = await asyncio.to_thread(dbmod.fetch_full_streakboard, chat.id)
     if not rows:
-        await update.message.reply_text("No streak data recorded in this group yet.")
+        await _reply_autodelete(update, context, "No streak data recorded in this group yet.")
         return
-    await update.message.reply_text(dbmod.format_streakboard_html(rows), parse_mode="HTML")
+    await _reply_autodelete(update, context, dbmod.format_streakboard_html(rows), parse_mode="HTML")
 
 
 async def cmd_badges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1301,17 +1380,17 @@ async def cmd_badges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     user = update.effective_user
     rows = await asyncio.to_thread(dbmod.get_user_badges, chat.id, user.id)
     if not rows:
-        await update.message.reply_text("No badges earned yet — keep showing up to VCs!")
+        await _reply_autodelete(update, context, "No badges earned yet — keep showing up to VCs!")
         return
     lines = ["🏅 <b>Your badges</b>", ""]
     for b in rows:
         lines.append(b.badge_label)
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1319,11 +1398,11 @@ async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("Use this command in a group.")
+        await _reply_autodelete(update, context, "Use this command in a group.")
         return
     digest = await asyncio.to_thread(dbmod.fetch_weekly_digest, chat.id)
     text = dbmod.format_weekly_digest_message(chat.title or "This group", digest)
-    await update.message.reply_text(text, parse_mode="HTML")
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
 
 
 async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:

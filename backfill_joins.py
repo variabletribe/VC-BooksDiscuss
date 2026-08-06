@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import os
 
+from dotenv import load_dotenv
 from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -125,6 +126,7 @@ async def backfill_chat(client: TelegramClient, chat_id: int) -> None:
 
 
 async def main() -> None:
+    load_dotenv()
     session_s = (os.environ.get("TELEGRAM_SESSION_STRING") or "").strip()
     api_id = int((os.environ.get("TELEGRAM_API_ID") or "0").strip() or "0")
     api_hash = (os.environ.get("TELEGRAM_API_HASH") or "").strip()
