@@ -499,6 +499,38 @@ def get_user_vc_stats(chat_id: int, user_id: int) -> UserVCStats:
     return UserVCStats(int(r.get("vcs", 0) or 0), int(r.get("total", 0) or 0), r.get("first_at"))
 
 
+def set_group_join_backfill(chat_id: int, user_id: int, display_name: str, when: datetime) -> None:
+    """Overwrite group_joined_at with an authoritative value sourced straight from Telegram's
+    own participant records (the `date` field on a ChannelParticipant, fetched via the
+    Telethon assistant's channels.GetParticipantsRequest — only a user account can see this,
+    not a bot). Unlike record_group_join (which only fills the field if it's still empty,
+    for live "X joined" events), this always overwrites — it's meant for the one-time
+    backfill_joins.py script, which is the actually-correct source of truth."""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    coll = _coll("user_attendance")
+    doc_id = f"{chat_id}:{user_id}"
+    coll.update_one(
+        {"_id": doc_id},
+        {
+            "$set": {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "display_name": display_name[:512],
+                "group_joined_at": when,
+            },
+            "$setOnInsert": {
+                "xp": 0,
+                "present_days": 0,
+                "current_streak": 0,
+                "longest_streak": 0,
+                "badges": {},
+            },
+        },
+        upsert=True,
+    )
+
+
 def record_group_join(chat_id: int, user_id: int, display_name: str, when: datetime) -> None:
     """Record the first known "joined the group" timestamp for a user.
 
