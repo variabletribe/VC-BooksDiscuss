@@ -1054,13 +1054,8 @@ def find_users_in_chat(chat_id: int, query: str, limit: int = 15) -> list[FindUs
 
 
 def fetch_all_attendance(chat_id: int) -> list[AttendanceRow]:
-    """Only people with real present-day attendance — NOT everyone who merely has a
-    user_attendance doc (e.g. from backfill_joins.py, which creates a doc per member
-    just to store their join date, regardless of whether they've ever attended a VC).
-    Without this filter, a large group can produce a message far beyond Telegram's
-    4096-char limit and fail outright ("Text is too long")."""
     coll = _coll("user_attendance")
-    cursor = coll.find({"chat_id": chat_id, "present_days": {"$gt": 0}}).sort(
+    cursor = coll.find({"chat_id": chat_id}).sort(
         [("present_days", DESCENDING), ("display_name", ASCENDING)]
     )
     return [
