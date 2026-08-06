@@ -51,6 +51,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from datetime import time as dt_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict
 
@@ -385,6 +386,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /weekly — this week's digest (top hours + streaks)\n\n"
 
         "<b>🎮 Your Progress</b>\n"
+        "• /mystats — your full profile: attendance, VCs, hours, join dates, streak, XP, level\n"
         "• /level — your XP and level\n"
         "• /xpleaderboard — top XP earners in this group\n"
         "• /streak — your current and longest VC streak\n"
@@ -394,13 +396,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /vcstatus — this group's chat id + whether tracking is active\n\n"
 
         "<b>🛠️ Admin only</b>\n"
+        "• /streakboard — everyone's current + best streak, ranked\n"
         "• /reports on|off — toggle automatic monthly report (posted on the 1st, UTC)\n"
         "• /removeuser USER_ID — remove a user from VC stats and attendance\n"
         "• /finduser NAME — find a user's id by name or old @username\n"
         "• /message USER_ID text — DM any known user directly\n"
         "• /broadcast text — message everyone who has joined a VC\n\n"
 
-        "<i>This bot belongs to→ @BooksDiscuss </i>",
+        "<i>This bot belongd to→ @BooksDiscuss </i>",
         parse_mode="HTML",
     )
 
@@ -638,6 +641,29 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "Monthly auto-reports are now " + ("enabled" if enabled else "disabled") + " for this group."
     )
+
+
+async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Records when someone joins the group, for /mystats's "Joined group" field.
+
+    Fires off Telegram's "X joined the group" service message. Two known limits, both
+    unavoidable without Telegram giving us historical data:
+    - No join date exists for anyone who was already in the group before this shipped.
+    - If the group has "Hide join/leave messages" turned on, this event never fires for
+      them either — /mystats will show "Unknown" in both cases, which is accurate, not a bug.
+    """
+    msg = update.message
+    if not msg or not msg.chat or not msg.new_chat_members:
+        return
+    chat = msg.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    when = msg.date or datetime.now(timezone.utc)
+    for user in msg.new_chat_members:
+        if user.is_bot:
+            continue
+        label = _user_label(user)
+        await asyncio.to_thread(dbmod.record_group_join, chat.id, user.id, label, when)
 
 
 # --- Admin DM relay + direct message + broadcast ----------------------------
@@ -1240,6 +1266,36 @@ async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    user = update.effective_user
+    label = _user_label(user)
+    stats = await asyncio.to_thread(dbmod.get_my_stats, chat.id, user.id, label)
+    await update.message.reply_text(dbmod.format_my_stats_message(stats), parse_mode="HTML")
+
+
+async def cmd_streakboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await update.message.reply_text("Only group admins can view the streakboard.")
+        return
+    rows = await asyncio.to_thread(dbmod.fetch_full_streakboard, chat.id)
+    if not rows:
+        await update.message.reply_text("No streak data recorded in this group yet.")
+        return
+    await update.message.reply_text(dbmod.format_streakboard_html(rows), parse_mode="HTML")
+
+
 async def cmd_badges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or not update.effective_user:
         return
@@ -1301,6 +1357,20 @@ async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:
             await asyncio.to_thread(dbmod.mark_monthly_report_sent, chat_id, report_y, report_m)
         except Exception:
             logger.exception("Failed monthly report chat_id=%s", chat_id)
+
+
+async def daily_streak_reset_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs once daily, just after UTC midnight: zeroes current_streak for anyone who didn't
+    cross the present threshold (20+ min in a call) on any day now more than 1 day in the past.
+    This is what makes a broken streak show 0 the next day, instead of staying stale until
+    the person's next VC (which would recompute it) or the weekly digest (which only ran
+    weekly and could leave a dead streak visible for up to 6 extra days)."""
+    try:
+        reset_count = await asyncio.to_thread(dbmod.reset_expired_streaks_all)
+        if reset_count:
+            logger.info("Daily streak reset: cleared %s expired streak(s)", reset_count)
+    except Exception:
+        logger.exception("Daily streak reset job failed")
 
 
 async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1388,8 +1458,14 @@ async def post_init(application: Application) -> None:
         first=25,
         name="weekly_digest_job",
     )
+    jq.run_daily(
+        daily_streak_reset_job,
+        time=dt_time(hour=0, minute=5, tzinfo=timezone.utc),
+        name="daily_streak_reset_job",
+    )
     logger.info("Scheduled hourly check for monthly VC reports (UTC hour=%s)", os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
     logger.info("Scheduled hourly check for weekly digest (Mondays, UTC hour=%s)", os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
+    logger.info("Scheduled daily streak reset job (00:05 UTC)")
 
 
 def main() -> None:
@@ -1432,12 +1508,22 @@ def main() -> None:
     app.add_handler(CommandHandler("streak", cmd_streak))
     app.add_handler(CommandHandler("badges", cmd_badges))
     app.add_handler(CommandHandler("weekly", cmd_weekly))
+    app.add_handler(CommandHandler("mystats", cmd_mystats))
+    app.add_handler(CommandHandler("streakboard", cmd_streakboard))
     app.add_handler(CommandHandler("message", cmd_message))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
             on_video_chat_service,
+        )
+    )
+    # Records "joined the group" timestamps for /mystats (going forward only — see
+    # on_new_chat_members's docstring for what this can't recover historically).
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            on_new_chat_members,
         )
     )
     # Admin relay: any non-command private DM to the bot -> copied into admin group.

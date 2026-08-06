@@ -70,6 +70,28 @@ class BadgeEarned(NamedTuple):
     count: int
 
 
+class UserVCStats(NamedTuple):
+    vc_count: int
+    total_seconds: int
+    first_vc_at: datetime | None
+
+
+class MyStats(NamedTuple):
+    user_id: int
+    display_name: str
+    present_days: int
+    vc_count: int
+    total_seconds: int
+    group_joined_at: datetime | None
+    first_vc_at: datetime | None
+    current_streak: int
+    longest_streak: int
+    xp: int
+    level: int
+    xp_into_level: int
+    xp_for_next_level: int
+
+
 class WeeklyDigest(NamedTuple):
     period_start: datetime
     period_end: datetime
@@ -451,6 +473,190 @@ def get_level_info(chat_id: int, user_id: int, display_name: str = "") -> LevelI
     name = doc["display_name"] if doc else display_name
     level, into_level, for_next = _level_for_xp(xp)
     return LevelInfo(user_id, str(name), xp, level, into_level, for_next)
+
+
+def get_user_vc_stats(chat_id: int, user_id: int) -> UserVCStats:
+    """VC count, total seconds, and first-ever-joined-a-VC date for one user,
+    derived from vc_sessions (no separate tracking needed — this data already exists)."""
+    coll = _coll("vc_sessions")
+    pipeline = [
+        {"$match": {"chat_id": chat_id, "participants.user_id": user_id}},
+        {"$unwind": "$participants"},
+        {"$match": {"participants.user_id": user_id}},
+        {
+            "$group": {
+                "_id": None,
+                "vcs": {"$sum": 1},
+                "total": {"$sum": "$participants.estimated_seconds"},
+                "first_at": {"$min": {"$ifNull": ["$started_at", "$ended_at"]}},
+            }
+        },
+    ]
+    rows = list(coll.aggregate(pipeline))
+    if not rows:
+        return UserVCStats(0, 0, None)
+    r = rows[0]
+    return UserVCStats(int(r.get("vcs", 0) or 0), int(r.get("total", 0) or 0), r.get("first_at"))
+
+
+def record_group_join(chat_id: int, user_id: int, display_name: str, when: datetime) -> None:
+    """Record the first known "joined the group" timestamp for a user.
+
+    Only ever set once — a later leave+rejoin does not overwrite the original first-seen
+    date. There is NO historical join date for members who were already in the group before
+    this feature shipped; for them group_joined_at stays unset and /mystats notes that
+    tracking only starts from the day this was added, going forward.
+    """
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    coll = _coll("user_attendance")
+    doc_id = f"{chat_id}:{user_id}"
+    existing = coll.find_one({"_id": doc_id})
+    if existing and existing.get("group_joined_at"):
+        return
+    coll.update_one(
+        {"_id": doc_id},
+        {
+            "$set": {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "display_name": display_name[:512],
+                "group_joined_at": when,
+            },
+            "$setOnInsert": {
+                "xp": 0,
+                "present_days": 0,
+                "current_streak": 0,
+                "longest_streak": 0,
+                "badges": {},
+            },
+        },
+        upsert=True,
+    )
+
+
+def get_my_stats(chat_id: int, user_id: int, fallback_display_name: str = "") -> MyStats:
+    """Everything shown by /mystats, gathered in one place."""
+    coll = _coll("user_attendance")
+    doc = coll.find_one({"_id": f"{chat_id}:{user_id}"})
+
+    display_name = (str(doc["display_name"]) if doc and doc.get("display_name") else "") or fallback_display_name
+    present_days = int(doc.get("present_days", 0)) if doc else 0
+    current_streak = int(doc.get("current_streak", 0)) if doc else 0
+    longest_streak = int(doc.get("longest_streak", 0)) if doc else 0
+    xp = int(doc.get("xp", 0)) if doc else 0
+    group_joined_at = doc.get("group_joined_at") if doc else None
+
+    level, into_level, for_next = _level_for_xp(xp)
+    vc_stats = get_user_vc_stats(chat_id, user_id)
+
+    return MyStats(
+        user_id=user_id,
+        display_name=display_name,
+        present_days=present_days,
+        vc_count=vc_stats.vc_count,
+        total_seconds=vc_stats.total_seconds,
+        group_joined_at=group_joined_at,
+        first_vc_at=vc_stats.first_vc_at,
+        current_streak=current_streak,
+        longest_streak=longest_streak,
+        xp=xp,
+        level=level,
+        xp_into_level=into_level,
+        xp_for_next_level=for_next,
+    )
+
+
+def _fmt_date_or_none(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%d %b %Y")
+
+
+def format_my_stats_message(stats: MyStats) -> str:
+    safe = html.escape(stats.display_name, quote=False)
+    joined_group = _fmt_date_or_none(stats.group_joined_at) or "Unknown (joined before join-tracking started)"
+    first_vc = _fmt_date_or_none(stats.first_vc_at) or "Hasn't joined a VC yet"
+
+    hrs = stats.total_seconds / 3600
+    vc_word = "VC" if stats.vc_count == 1 else "VCs"
+    day_word = "day" if stats.present_days == 1 else "days"
+
+    if stats.xp_for_next_level == -1:
+        level_line = f"Level {stats.level} (MAX) — {stats.xp} XP total"
+    else:
+        span = stats.xp_for_next_level - (stats.xp - stats.xp_into_level)
+        level_line = f"Level {stats.level} — {stats.xp_into_level}/{span} XP to Level {stats.level + 1}"
+
+    lines = [
+        f"📇 <b>{safe}'s stats</b>",
+        "",
+        f"📅 Joined group: <b>{joined_group}</b>",
+        f"🎙️ First VC: <b>{first_vc}</b>",
+        "",
+        f"📋 Present days: <b>{stats.present_days}</b> {day_word}",
+        f"📞 VCs joined: <b>{stats.vc_count}</b> {vc_word}",
+        f"⏱️ Total time in calls: <b>{hrs:.1f}h</b>",
+        "",
+        f"🔥 Current streak: <b>{stats.current_streak}</b> day(s)",
+        f"🏆 Longest streak: <b>{stats.longest_streak}</b> day(s)",
+        "",
+        f"🎖️ {level_line}",
+    ]
+    return "\n".join(lines)
+
+
+def fetch_full_streakboard(chat_id: int) -> list[StreakInfo]:
+    """Every tracked user's streaks in this group, no limit — for the admin /streakboard command."""
+    coll = _coll("user_attendance")
+    cursor = coll.find({"chat_id": chat_id}).sort(
+        [
+            ("current_streak", DESCENDING),
+            ("longest_streak", DESCENDING),
+            ("display_name", ASCENDING),
+        ]
+    )
+    return [
+        StreakInfo(
+            int(d["user_id"]),
+            str(d["display_name"]),
+            int(d.get("current_streak", 0)),
+            int(d.get("longest_streak", 0)),
+        )
+        for d in cursor
+    ]
+
+
+def format_streakboard_html(rows: list[StreakInfo]) -> str:
+    lines = ["🔥 <b>Streak board</b>", "<i>Current streak (best streak)</i>", ""]
+    for i, row in enumerate(rows, start=1):
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+        safe = html.escape(row.display_name, quote=False)
+        lines.append(f"{medal} {safe} — <b>{row.current_streak}</b>🔥 (best: {row.longest_streak})")
+    return "\n".join(lines)
+
+
+def reset_expired_streaks_all() -> int:
+    """Zero out current_streak for ANY user in ANY chat whose last_present_date is more than
+    1 day in the past — i.e. at least one full calendar day passed with no present-attendance
+    (20+ min) call. Meant to run once daily, shortly after UTC midnight, so a broken streak
+    shows 0 the next day rather than staying stale until the person's next VC or the weekly
+    digest catches it."""
+    coll = _coll("user_attendance")
+    today = datetime.now(timezone.utc).date()
+    cutoff = today.toordinal() - 1
+    reset_count = 0
+    for doc in coll.find({"current_streak": {"$gt": 0}}):
+        last_day_str = doc.get("last_present_date")
+        if not last_day_str:
+            continue
+        last_day = datetime.strptime(last_day_str, "%Y-%m-%d").date()
+        if last_day.toordinal() < cutoff:
+            coll.update_one({"_id": doc["_id"]}, {"$set": {"current_streak": 0}})
+            reset_count += 1
+    return reset_count
 
 
 def fetch_xp_leaderboard(chat_id: int, limit: int = 10) -> list[LevelInfo]:
