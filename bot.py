@@ -474,7 +474,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.effective_user or not update.effective_chat:
+    if not update.effective_chat:
+        return False
+
+    # Anonymous admins ("send as group") show up with sender_chat == the group
+    # itself, and update.effective_user is Telegram's GroupAnonymousBot
+    # placeholder (state.GROUP_ANONYMOUS_BOT_ID) — not a real member, so
+    # get_chat_member() below always fails for them even though they ARE an
+    # admin. Telegram only allows group admins to post anonymously in the
+    # first place, so this is a safe short-circuit.
+    msg = update.message
+    if msg and msg.sender_chat and msg.sender_chat.id == update.effective_chat.id:
+        return True
+
+    if not update.effective_user:
         return False
     try:
         m = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
