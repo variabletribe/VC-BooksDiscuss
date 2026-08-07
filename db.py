@@ -101,6 +101,22 @@ class WeeklyDigest(NamedTuple):
     total_participant_seconds: int
 
 
+class ExportRow(NamedTuple):
+    """One row of /exportdata — everything about a user who has joined at least one VC."""
+
+    user_id: int
+    display_name: str
+    vc_count: int
+    total_seconds: int
+    present_days: int
+    current_streak: int
+    longest_streak: int
+    xp: int
+    level: int
+    group_joined_at: datetime | None
+    first_vc_at: datetime | None
+
+
 # XP: 1 XP per minute in VC. Level thresholds are cumulative XP required.
 LEVEL_THRESHOLDS: list[tuple[int, int]] = [
     (1, 0),
@@ -1161,3 +1177,118 @@ def fetch_all_known_user_ids(chat_id: int) -> list[tuple[int, str]]:
     ]
     rows = list(coll.aggregate(pipeline))
     return [(int(r["_id"]), str(r["display_name"])) for r in rows]
+
+
+# --- Admin-only export / lookup (bot.py: /exportdata, /user) ----------------
+
+
+def fetch_export_data(chat_id: int) -> list[ExportRow]:
+    """Full stats for every user who has joined at least one VC in this chat —
+    the base set is fetch_vc_stats() (derived from vc_sessions), NOT every
+    user_attendance doc, so users who only exist there for unrelated reasons
+    (group-join backfill, badge bumps with 0 VC time) are correctly excluded.
+    Attendance/XP/streak fields are merged in from user_attendance where present,
+    defaulting to 0/None for a user who somehow has vc_sessions rows but no
+    attendance doc yet (shouldn't normally happen, but kept defensive)."""
+    vc_rows = fetch_vc_stats(chat_id)
+    if not vc_rows:
+        return []
+
+    user_ids = [r.user_id for r in vc_rows]
+    att_coll = _coll("user_attendance")
+    att_docs = {
+        int(d["user_id"]): d
+        for d in att_coll.find({"chat_id": chat_id, "user_id": {"$in": user_ids}})
+    }
+
+    sessions_coll = _coll("vc_sessions")
+    pipeline = [
+        {"$match": {"chat_id": chat_id}},
+        {"$unwind": "$participants"},
+        {
+            "$group": {
+                "_id": "$participants.user_id",
+                "first_at": {"$min": {"$ifNull": ["$started_at", "$ended_at"]}},
+            }
+        },
+    ]
+    first_vc_map = {int(r["_id"]): r.get("first_at") for r in sessions_coll.aggregate(pipeline)}
+
+    out: list[ExportRow] = []
+    for r in vc_rows:
+        doc = att_docs.get(r.user_id)
+        xp = int(doc.get("xp", 0)) if doc else 0
+        level, _, _ = _level_for_xp(xp)
+        out.append(
+            ExportRow(
+                user_id=r.user_id,
+                display_name=r.display_name,
+                vc_count=r.vc_count,
+                total_seconds=r.total_seconds,
+                present_days=int(doc.get("present_days", 0)) if doc else 0,
+                current_streak=int(doc.get("current_streak", 0)) if doc else 0,
+                longest_streak=int(doc.get("longest_streak", 0)) if doc else 0,
+                xp=xp,
+                level=level,
+                group_joined_at=doc.get("group_joined_at") if doc else None,
+                first_vc_at=first_vc_map.get(r.user_id),
+            )
+        )
+
+    out.sort(key=lambda x: -x.total_seconds)
+    return out
+
+
+def export_rows_to_csv(rows: list[ExportRow]) -> bytes:
+    """Render ExportRow list as CSV bytes (UTF-8), ready to send as a Telegram document."""
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "user_id",
+            "display_name",
+            "vc_count",
+            "total_seconds",
+            "total_hours",
+            "present_days",
+            "current_streak",
+            "longest_streak",
+            "xp",
+            "level",
+            "group_joined_at_utc",
+            "first_vc_at_utc",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.user_id,
+                row.display_name,
+                row.vc_count,
+                row.total_seconds,
+                round(row.total_seconds / 3600, 2),
+                row.present_days,
+                row.current_streak,
+                row.longest_streak,
+                row.xp,
+                row.level,
+                _fmt_date_or_none(row.group_joined_at) or "",
+                _fmt_date_or_none(row.first_vc_at) or "",
+            ]
+        )
+    return buf.getvalue().encode("utf-8")
+
+
+def has_any_data(chat_id: int, user_id: int) -> bool:
+    """True if this user has an attendance doc OR appears in any vc_sessions
+    participant list for this chat — used by /user to distinguish "genuinely
+    no data" from get_my_stats()'s zero-filled defaults (which it returns even
+    for a completely unknown user_id)."""
+    if _coll("user_attendance").find_one({"_id": f"{chat_id}:{user_id}"}):
+        return True
+    if _coll("vc_sessions").find_one({"chat_id": chat_id, "participants.user_id": user_id}):
+        return True
+    return False

@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import io
 import logging
 import os
 import threading
@@ -57,7 +58,7 @@ from typing import Dict
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.constants import ChatMemberStatus
 from telegram.error import Conflict, InvalidToken
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, MessageHandler, filters
@@ -466,7 +467,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /removeuser USER_ID — remove a user from VC stats and attendance\n"
         "• /finduser NAME — find a user's id by name or old @username\n"
         "• /message USER_ID text — DM any known user directly\n"
-        "• /broadcast text — message everyone who has joined a VC\n\n"
+        "• /broadcast text — message everyone who has joined a VC\n"
+        "• /exportdata [chat_id] — CSV of every VC participant (DM only)\n"
+        "• /user USER_ID [chat_id] — full stats for one user (DM only)\n\n"
 
         "<i>This bot belongd to→ @BooksDiscuss </i>",
         parse_mode="HTML",
@@ -925,6 +928,106 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply_autodelete(
         update, context, f"📣 Broadcast done: {sent} sent, {failed} failed (out of {len(users)})."
     )
+
+
+async def cmd_exportdata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only, DM-only: /exportdata [chat_id] — CSV of every user who has
+    joined at least one VC in the given group (or the default tracked group
+    if chat_id is omitted). Sent as a document, not posted to any group."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("This command only works in a private chat with me.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Admins only.")
+        return
+
+    if context.args:
+        try:
+            chat_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("chat_id must be a number.\nUsage: /exportdata [chat_id]")
+            return
+    else:
+        chat_id = _broadcast_target_chat_id()
+        if chat_id is None:
+            await update.message.reply_text(
+                "No chat_id given and no default group configured "
+                "(set BROADCAST_CHAT_ID or ASSISTANT_GROUP_IDS).\nUsage: /exportdata <chat_id>"
+            )
+            return
+
+    rows = await asyncio.to_thread(dbmod.fetch_export_data, chat_id)
+    if not rows:
+        await update.message.reply_text(f"No VC data found for chat_id <code>{chat_id}</code>.", parse_mode="HTML")
+        return
+
+    csv_bytes = await asyncio.to_thread(dbmod.export_rows_to_csv, rows)
+    filename = f"vc_export_{chat_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=InputFile(io.BytesIO(csv_bytes), filename=filename),
+        caption=f"📊 VC data export for chat_id <code>{chat_id}</code> — {len(rows)} user(s).",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only, DM-only: /user <user_id> [chat_id] — full stats for one user
+    in the given group (or the default tracked group if chat_id is omitted).
+    Use /finduser NAME in the group first if you don't know their numeric id."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("This command only works in a private chat with me.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /user <user_id> [chat_id]\n\n"
+            "Omit chat_id to use the default tracked group.\n"
+            "Don't know their id? Run /finduser NAME in the group first."
+        )
+        return
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id must be a number.")
+        return
+
+    if len(context.args) >= 2:
+        try:
+            chat_id = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text("chat_id must be a number.")
+            return
+    else:
+        chat_id = _broadcast_target_chat_id()
+        if chat_id is None:
+            await update.message.reply_text(
+                "No chat_id given and no default group configured "
+                "(set BROADCAST_CHAT_ID or ASSISTANT_GROUP_IDS).\nUsage: /user <user_id> <chat_id>"
+            )
+            return
+
+    exists = await asyncio.to_thread(dbmod.has_any_data, chat_id, user_id)
+    if not exists:
+        await update.message.reply_text(
+            f"No data found for user_id <code>{user_id}</code> in chat_id <code>{chat_id}</code>.",
+            parse_mode="HTML",
+        )
+        return
+
+    stats = await asyncio.to_thread(dbmod.get_my_stats, chat_id, user_id)
+    text = (
+        dbmod.format_my_stats_message(stats)
+        + f"\n\n<code>user_id: {user_id}</code>\n<code>chat_id: {chat_id}</code>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def _http_bot_send_message(chat_id: int, text: str) -> bool:
@@ -1614,6 +1717,8 @@ def main() -> None:
     app.add_handler(CommandHandler("streakboard", cmd_streakboard))
     app.add_handler(CommandHandler("message", cmd_message))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("exportdata", cmd_exportdata))
+    app.add_handler(CommandHandler("user", cmd_user))
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
