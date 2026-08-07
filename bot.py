@@ -1381,11 +1381,21 @@ async def cmd_streakboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await _is_group_admin(update, context):
         await _reply_autodelete(update, context, "Only group admins can view the streakboard.")
         return
-    rows = await asyncio.to_thread(dbmod.fetch_full_streakboard, chat.id)
-    if not rows:
-        await _reply_autodelete(update, context, "No streak data recorded in this group yet.")
-        return
-    await _reply_autodelete(update, context, dbmod.format_streakboard_html(rows), parse_mode="HTML")
+    try:
+        rows = await asyncio.to_thread(dbmod.fetch_full_streakboard, chat.id)
+        if not rows:
+            await _reply_autodelete(update, context, "No streak data recorded in this group yet.")
+            return
+        text = dbmod.format_streakboard_html(rows)
+        await _reply_autodelete(update, context, text, parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("cmd_streakboard failed chat_id=%s", chat.id)
+        await _reply_autodelete(
+            update,
+            context,
+            f"⚠️ /streakboard failed: <code>{html.escape(repr(exc)[:500], quote=False)}</code>",
+            parse_mode="HTML",
+        )
 
 
 async def cmd_badges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

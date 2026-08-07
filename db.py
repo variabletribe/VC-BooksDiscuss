@@ -641,9 +641,26 @@ def format_my_stats_message(stats: MyStats) -> str:
 
 
 def fetch_full_streakboard(chat_id: int) -> list[StreakInfo]:
-    """Every tracked user's streaks in this group, no limit — for the admin /streakboard command."""
+    """Users with real streak data in this group, no limit — for the admin /streakboard command.
+
+    Filters out users who only have a user_attendance doc for unrelated reasons (e.g.
+    backfill_joins.py creates one per member just to store their join date, and
+    check_and_award_session_badges/session_count bumps can also create docs with no
+    streak at all). Without this filter the query returns every member ever seen,
+    and in a large group the formatted message blows past Telegram's 4096-char
+    limit, so reply_text() throws BadRequest("Text is too long") and the command
+    fails silently (see fetch_all_attendance, which has the same guard for
+    present_days)."""
     coll = _coll("user_attendance")
-    cursor = coll.find({"chat_id": chat_id}).sort(
+    cursor = coll.find(
+        {
+            "chat_id": chat_id,
+            "$or": [
+                {"current_streak": {"$gt": 0}},
+                {"longest_streak": {"$gt": 0}},
+            ],
+        }
+    ).sort(
         [
             ("current_streak", DESCENDING),
             ("longest_streak", DESCENDING),
@@ -662,11 +679,20 @@ def fetch_full_streakboard(chat_id: int) -> list[StreakInfo]:
 
 
 def format_streakboard_html(rows: list[StreakInfo]) -> str:
+    """Renders up to 60 rows and truncates with a note if there are more — a second
+    safety net alongside the fetch_full_streakboard filter above, so even a chat with
+    an unusually large number of users with real streaks can't regenerate the same
+    'Text is too long' failure."""
     lines = ["🔥 <b>Streak board</b>", "<i>Current streak (best streak)</i>", ""]
-    for i, row in enumerate(rows, start=1):
+    MAX_ROWS = 60
+    shown = rows[:MAX_ROWS]
+    for i, row in enumerate(shown, start=1):
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
         safe = html.escape(row.display_name, quote=False)
         lines.append(f"{medal} {safe} — <b>{row.current_streak}</b>🔥 (best: {row.longest_streak})")
+    if len(rows) > MAX_ROWS:
+        lines.append("")
+        lines.append(f"<i>+ {len(rows) - MAX_ROWS} more not shown.</i>")
     return "\n".join(lines)
 
 
