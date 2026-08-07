@@ -48,17 +48,18 @@ import html
 import io
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict
 
 import httpx
 from dotenv import load_dotenv
-from telegram import InputFile, Update
+from telegram import ChatPermissions, InputFile, Update
 from telegram.constants import ChatMemberStatus
 from telegram.error import Conflict, InvalidToken
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, MessageHandler, filters
@@ -497,6 +498,783 @@ async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         return False
     return m.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+
+
+# =============================================================================
+# Moderation: warn / ban / tban / kick / mute / tmute / blocklist
+# (command names and behavior modeled on Rose bot)
+# =============================================================================
+
+WARN_MODES = ("ban", "mute", "kick")
+BLOCKLIST_MODES = ("delete", "warn", "mute", "kick", "ban")
+
+# Telegram's ban_chat_member/restrict_chat_member until_date must be at least
+# 30s and at most 366 days out, or Telegram treats it as a permanent action.
+_MIN_TIMED_ACTION_SECONDS = 30
+_MAX_TIMED_ACTION_SECONDS = 366 * 24 * 3600
+
+_DURATION_RE = re.compile(r"^(\d+)([mhdw])$", re.IGNORECASE)
+
+
+def _parse_duration(text: str) -> timedelta | None:
+    """Rose-style duration shorthand: 30m, 2h, 1d, 1w. Returns None if invalid."""
+    m = _DURATION_RE.match(text.strip())
+    if not m:
+        return None
+    n = int(m.group(1))
+    if n <= 0:
+        return None
+    unit = m.group(2).lower()
+    if unit == "m":
+        return timedelta(minutes=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    if unit == "d":
+        return timedelta(days=n)
+    if unit == "w":
+        return timedelta(weeks=n)
+    return None
+
+
+def _clamp_until(delta: timedelta) -> datetime:
+    total = max(_MIN_TIMED_ACTION_SECONDS, min(delta.total_seconds(), _MAX_TIMED_ACTION_SECONDS))
+    return datetime.now(timezone.utc) + timedelta(seconds=total)
+
+
+async def _resolve_user_ref(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, ref: str
+) -> tuple[int, str] | None:
+    """Resolve a bare numeric user id or @username into (user_id, label).
+    Falls back to (id, id-as-string) for a numeric id that isn't currently a
+    chat member (still lets admins act on someone who already left), but
+    returns None for an @username Telegram can't resolve at all."""
+    if ref.lstrip("-").isdigit():
+        try:
+            member = await context.bot.get_chat_member(chat_id, int(ref))
+            return member.user.id, _user_label(member.user)
+        except Exception:
+            return int(ref), ref
+    if ref.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(ref)
+            label = f"@{chat.username}" if chat.username else (chat.first_name or ref)
+            return chat.id, label
+        except Exception:
+            return None
+    return None
+
+
+async def _resolve_target_and_reason(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[int, str, str] | None:
+    """(user_id, label, reason) from a reply, or from args[0] (id/@username) +
+    the rest of args as the reason. Replies with a usage hint and returns None
+    if nothing usable was given."""
+    msg = update.message
+    args = context.args or []
+
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        return u.id, _user_label(u), " ".join(args).strip()
+
+    if not args:
+        await msg.reply_text(
+            "Reply to a user's message, or give their user id / @username as the first argument."
+        )
+        return None
+
+    resolved = await _resolve_user_ref(context, update.effective_chat.id, args[0])
+    if resolved is None:
+        await msg.reply_text(
+            f"Couldn't resolve {html.escape(args[0], quote=False)} — try replying to their message instead."
+        )
+        return None
+    uid, label = resolved
+    return uid, label, " ".join(args[1:]).strip()
+
+
+async def _resolve_target_time_reason(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[int, str, timedelta, str] | None:
+    """(user_id, label, duration, reason) for /tban and /tmute. Replies with a
+    usage hint and returns None if the target or duration couldn't be parsed."""
+    msg = update.message
+    args = context.args or []
+
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        if not args:
+            await msg.reply_text(
+                "Usage (replying to a user): <command> <time> [reason]  e.g. 2h spamming"
+            )
+            return None
+        duration = _parse_duration(args[0])
+        if duration is None:
+            await msg.reply_text("Invalid time — use a number + m/h/d/w, e.g. 30m, 2h, 1d, 1w.")
+            return None
+        return u.id, _user_label(u), duration, " ".join(args[1:]).strip()
+
+    if len(args) < 2:
+        await msg.reply_text(
+            "Usage: <command> <user_id or @username> <time> [reason]  e.g. 12345 2h spamming"
+        )
+        return None
+
+    resolved = await _resolve_user_ref(context, update.effective_chat.id, args[0])
+    if resolved is None:
+        await msg.reply_text(
+            f"Couldn't resolve {html.escape(args[0], quote=False)} — try replying to their message instead."
+        )
+        return None
+    duration = _parse_duration(args[1])
+    if duration is None:
+        await msg.reply_text("Invalid time — use a number + m/h/d/w, e.g. 30m, 2h, 1d, 1w.")
+        return None
+    uid, label = resolved
+    return uid, label, duration, " ".join(args[2:]).strip()
+
+
+async def _target_is_protected(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int) -> bool:
+    """True for the bot itself or any owner/admin — these commands must never act on them,
+    so a misfired blocklist word or a mistaken command can't lock mods out of their own group."""
+    if target_id == context.bot.id:
+        return True
+    try:
+        m = await context.bot.get_chat_member(update.effective_chat.id, target_id)
+    except Exception:
+        return False
+    return m.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+
+
+_MUTE_PERMISSIONS = ChatPermissions(
+    can_send_messages=False,
+    can_send_audios=False,
+    can_send_documents=False,
+    can_send_photos=False,
+    can_send_videos=False,
+    can_send_video_notes=False,
+    can_send_voice_notes=False,
+    can_send_polls=False,
+    can_send_other_messages=False,
+    can_add_web_page_previews=False,
+)
+
+_UNMUTE_FALLBACK_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
+
+
+async def _apply_punishment(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    target_id: int,
+    target_label: str,
+    mode: str,
+) -> str:
+    """Executes ban/mute/kick on target_id and returns a short description for the reply.
+    Shared by /warn (once the warn limit is hit) and blocklist enforcement."""
+    chat_id = update.effective_chat.id
+    safe = html.escape(target_label, quote=False)
+    try:
+        if mode == "ban":
+            await context.bot.ban_chat_member(chat_id, target_id)
+            return f"{safe} banned"
+        if mode == "mute":
+            await context.bot.restrict_chat_member(chat_id, target_id, permissions=_MUTE_PERMISSIONS)
+            return f"{safe} muted"
+        if mode == "kick":
+            await context.bot.ban_chat_member(chat_id, target_id)
+            await context.bot.unban_chat_member(chat_id, target_id)
+            return f"{safe} kicked"
+    except Exception:
+        logger.exception("Punishment action failed mode=%s chat_id=%s target=%s", mode, chat_id, target_id)
+        return f"couldn't act on {safe} (check my admin rights)"
+    return f"no action taken for {safe} (unknown mode {mode})"
+
+
+# --- /warn, /warns, /resetwarn, /warnlimit, /warnmode -----------------------
+
+
+async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can warn users.")
+        return
+
+    resolved = await _resolve_target_and_reason(update, context)
+    if resolved is None:
+        return
+    target_id, target_label, reason = resolved
+    if await _target_is_protected(update, context, target_id):
+        await _reply_autodelete(update, context, "I can't warn an admin.")
+        return
+
+    settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
+    count, _entries = await asyncio.to_thread(
+        dbmod.add_warning,
+        chat.id,
+        target_id,
+        target_label,
+        reason,
+        update.effective_user.id,
+        _user_label(update.effective_user),
+    )
+
+    safe_target = html.escape(target_label, quote=False)
+    safe_reason = html.escape(reason, quote=False) if reason else "No reason given"
+    limit = settings["warn_limit"]
+    lines = [f"⚠️ Warned {safe_target} ({count}/{limit})", f"Reason: {safe_reason}"]
+
+    if count >= limit:
+        action_text = await _apply_punishment(update, context, target_id, target_label, settings["warn_mode"])
+        await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
+        lines.append("")
+        lines.append(f"🚫 Warn limit reached — {action_text}. Warnings reset.")
+
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone can check warnings (their own, or — like Rose — any member's), matching
+    Rose's behavior of treating warn counts as visible group info, not a private admin log."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+
+    args = context.args or []
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        target_id, target_label = u.id, _user_label(u)
+    elif args:
+        resolved = await _resolve_user_ref(context, chat.id, args[0])
+        if resolved is None:
+            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
+            return
+        target_id, target_label = resolved
+    elif update.effective_user:
+        target_id, target_label = update.effective_user.id, _user_label(update.effective_user)
+    else:
+        return
+
+    count, entries, stored_name = await asyncio.to_thread(dbmod.get_warnings, chat.id, target_id)
+    label = stored_name or target_label
+    safe = html.escape(label, quote=False)
+    if count == 0:
+        await _reply_autodelete(update, context, f"{safe} has no warnings.", parse_mode="HTML")
+        return
+
+    settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
+    lines = [f"⚠️ <b>{safe}</b> — {count}/{settings['warn_limit']} warning(s)", ""]
+    for i, e in enumerate(entries[-10:], start=1):
+        reason = html.escape(e.get("reason") or "No reason given", quote=False)
+        lines.append(f"{i}. {reason}")
+    if count > 10:
+        lines.append("")
+        lines.append(f"<i>+ {count - 10} more not shown.</i>")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_resetwarn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can reset warnings.")
+        return
+
+    args = context.args or []
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        target_id, target_label = u.id, _user_label(u)
+    elif args:
+        resolved = await _resolve_user_ref(context, chat.id, args[0])
+        if resolved is None:
+            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
+            return
+        target_id, target_label = resolved
+    else:
+        await _reply_autodelete(update, context, "Reply to a user, or give their user id / @username.")
+        return
+
+    cleared = await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
+    safe = html.escape(target_label, quote=False)
+    text = f"Warnings cleared for {safe}." if cleared else f"{safe} had no warnings."
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
+
+
+async def cmd_warnlimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
+    if not context.args:
+        await _reply_autodelete(update, context, f"Current warn limit: {settings['warn_limit']}")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can change this.")
+        return
+    try:
+        limit = int(context.args[0])
+    except ValueError:
+        await _reply_autodelete(update, context, "Usage: /warnlimit <number>")
+        return
+    if limit < 1:
+        await _reply_autodelete(update, context, "Warn limit must be at least 1.")
+        return
+    await asyncio.to_thread(dbmod.set_warn_limit, chat.id, limit)
+    await _reply_autodelete(update, context, f"Warn limit set to {limit}.")
+
+
+async def cmd_warnmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
+    if not context.args:
+        await _reply_autodelete(
+            update, context,
+            f"Current warn mode: {settings['warn_mode']}\nOptions: {', '.join(WARN_MODES)}",
+        )
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can change this.")
+        return
+    mode = context.args[0].lower()
+    if mode not in WARN_MODES:
+        await _reply_autodelete(update, context, f"Invalid mode. Options: {', '.join(WARN_MODES)}")
+        return
+    await asyncio.to_thread(dbmod.set_warn_mode, chat.id, mode)
+    await _reply_autodelete(update, context, f"Warn mode set to {mode}.")
+
+
+# --- /ban, /tban, /unban, /kick ----------------------------------------------
+
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can ban users.")
+        return
+    resolved = await _resolve_target_and_reason(update, context)
+    if resolved is None:
+        return
+    target_id, target_label, reason = resolved
+    if await _target_is_protected(update, context, target_id):
+        await _reply_autodelete(update, context, "I can't ban an admin.")
+        return
+    try:
+        await context.bot.ban_chat_member(chat.id, target_id)
+    except Exception:
+        logger.exception("ban failed chat_id=%s target=%s", chat.id, target_id)
+        await _reply_autodelete(update, context, "Couldn't ban — check that I'm an admin with ban rights.")
+        return
+    safe = html.escape(target_label, quote=False)
+    safe_reason = html.escape(reason, quote=False) if reason else "No reason given"
+    await _reply_autodelete(update, context, f"🚫 Banned {safe}\nReason: {safe_reason}", parse_mode="HTML")
+
+
+async def cmd_tban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can ban users.")
+        return
+    resolved = await _resolve_target_time_reason(update, context)
+    if resolved is None:
+        return
+    target_id, target_label, duration, reason = resolved
+    if await _target_is_protected(update, context, target_id):
+        await _reply_autodelete(update, context, "I can't ban an admin.")
+        return
+    # Telegram itself lifts the ban at until_date — no scheduler/job needed on our side,
+    # and it survives bot restarts/redeploys since Telegram enforces it server-side.
+    until = _clamp_until(duration)
+    try:
+        await context.bot.ban_chat_member(chat.id, target_id, until_date=until)
+    except Exception:
+        logger.exception("tban failed chat_id=%s target=%s", chat.id, target_id)
+        await _reply_autodelete(update, context, "Couldn't ban — check that I'm an admin with ban rights.")
+        return
+    safe = html.escape(target_label, quote=False)
+    safe_reason = html.escape(reason, quote=False) if reason else "No reason given"
+    await _reply_autodelete(
+        update, context,
+        f"🚫 Banned {safe} for {_format_duration(int(duration.total_seconds()))}\n"
+        f"Auto-unbanned at: {until.strftime('%d %b %Y %H:%M UTC')}\n"
+        f"Reason: {safe_reason}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can unban users.")
+        return
+    args = context.args or []
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        target_id, target_label = u.id, _user_label(u)
+    elif args:
+        resolved = await _resolve_user_ref(context, chat.id, args[0])
+        if resolved is None:
+            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
+            return
+        target_id, target_label = resolved
+    else:
+        await _reply_autodelete(update, context, "Usage: /unban <user_id or @username>")
+        return
+    try:
+        await context.bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
+    except Exception:
+        logger.exception("unban failed chat_id=%s target=%s", chat.id, target_id)
+        await _reply_autodelete(update, context, "Couldn't unban — check that I'm an admin with ban rights.")
+        return
+    safe = html.escape(target_label, quote=False)
+    await _reply_autodelete(update, context, f"✅ Unbanned {safe}.", parse_mode="HTML")
+
+
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can kick users.")
+        return
+    resolved = await _resolve_target_and_reason(update, context)
+    if resolved is None:
+        return
+    target_id, target_label, reason = resolved
+    if await _target_is_protected(update, context, target_id):
+        await _reply_autodelete(update, context, "I can't kick an admin.")
+        return
+    try:
+        # ban immediately followed by unban = removed from the group but free to rejoin
+        await context.bot.ban_chat_member(chat.id, target_id)
+        await context.bot.unban_chat_member(chat.id, target_id)
+    except Exception:
+        logger.exception("kick failed chat_id=%s target=%s", chat.id, target_id)
+        await _reply_autodelete(update, context, "Couldn't kick — check that I'm an admin with ban rights.")
+        return
+    safe = html.escape(target_label, quote=False)
+    safe_reason = html.escape(reason, quote=False) if reason else "No reason given"
+    await _reply_autodelete(update, context, f"👢 Kicked {safe}\nReason: {safe_reason}", parse_mode="HTML")
+
+
+# --- /mute, /tmute, /unmute --------------------------------------------------
+
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can mute users.")
+        return
+    resolved = await _resolve_target_and_reason(update, context)
+    if resolved is None:
+        return
+    target_id, target_label, reason = resolved
+    if await _target_is_protected(update, context, target_id):
+        await _reply_autodelete(update, context, "I can't mute an admin.")
+        return
+    try:
+        await context.bot.restrict_chat_member(chat.id, target_id, permissions=_MUTE_PERMISSIONS)
+    except Exception:
+        logger.exception("mute failed chat_id=%s target=%s", chat.id, target_id)
+        await _reply_autodelete(update, context, "Couldn't mute — check that I'm an admin with restrict rights.")
+        return
+    safe = html.escape(target_label, quote=False)
+    safe_reason = html.escape(reason, quote=False) if reason else "No reason given"
+    await _reply_autodelete(update, context, f"🔇 Muted {safe}\nReason: {safe_reason}", parse_mode="HTML")
+
+
+async def cmd_tmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can mute users.")
+        return
+    resolved = await _resolve_target_time_reason(update, context)
+    if resolved is None:
+        return
+    target_id, target_label, duration, reason = resolved
+    if await _target_is_protected(update, context, target_id):
+        await _reply_autodelete(update, context, "I can't mute an admin.")
+        return
+    until = _clamp_until(duration)
+    try:
+        await context.bot.restrict_chat_member(
+            chat.id, target_id, permissions=_MUTE_PERMISSIONS, until_date=until
+        )
+    except Exception:
+        logger.exception("tmute failed chat_id=%s target=%s", chat.id, target_id)
+        await _reply_autodelete(update, context, "Couldn't mute — check that I'm an admin with restrict rights.")
+        return
+    safe = html.escape(target_label, quote=False)
+    safe_reason = html.escape(reason, quote=False) if reason else "No reason given"
+    await _reply_autodelete(
+        update, context,
+        f"🔇 Muted {safe} for {_format_duration(int(duration.total_seconds()))}\n"
+        f"Auto-unmuted at: {until.strftime('%d %b %Y %H:%M UTC')}\n"
+        f"Reason: {safe_reason}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can unmute users.")
+        return
+    args = context.args or []
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        target_id, target_label = u.id, _user_label(u)
+    elif args:
+        resolved = await _resolve_user_ref(context, chat.id, args[0])
+        if resolved is None:
+            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
+            return
+        target_id, target_label = resolved
+    else:
+        await _reply_autodelete(update, context, "Reply to a user, or give their user id / @username.")
+        return
+
+    try:
+        # Restore this group's actual default permissions if we can read them,
+        # rather than always granting the maximal permission set.
+        restore = _UNMUTE_FALLBACK_PERMISSIONS
+        try:
+            group_chat = await context.bot.get_chat(chat.id)
+            if group_chat.permissions:
+                restore = group_chat.permissions
+        except Exception:
+            pass
+        await context.bot.restrict_chat_member(chat.id, target_id, permissions=restore)
+    except Exception:
+        logger.exception("unmute failed chat_id=%s target=%s", chat.id, target_id)
+        await _reply_autodelete(update, context, "Couldn't unmute — check that I'm an admin with restrict rights.")
+        return
+    safe = html.escape(target_label, quote=False)
+    await _reply_autodelete(update, context, f"🔊 Unmuted {safe}.", parse_mode="HTML")
+
+
+# --- Blocklist: /blocklist, /addblocklist, /unblocklist, /blocklistmode -----
+
+
+async def cmd_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View the current blocklisted words — open to any member, like Rose."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    words, mode = await asyncio.to_thread(dbmod.get_blocklist, chat.id)
+    if not words:
+        await _reply_autodelete(
+            update, context,
+            f"No blocklisted words yet.\nMode: {mode}\n\nAdd some with /addblocklist word1 word2 ...",
+        )
+        return
+    safe_words = "\n".join(f"• {html.escape(w, quote=False)}" for w in words)
+    await _reply_autodelete(
+        update, context,
+        f"🚫 <b>Blocklisted words</b> ({len(words)})\nMode: <b>{html.escape(mode, quote=False)}</b>\n\n{safe_words}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_addblocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can edit the blocklist.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, "Usage: /addblocklist word1 word2 ...")
+        return
+    added = await asyncio.to_thread(dbmod.add_blocklist_words, chat.id, context.args)
+    if not added:
+        await _reply_autodelete(update, context, "Those word(s) are already blocklisted.")
+        return
+    safe = ", ".join(html.escape(w, quote=False) for w in added)
+    await _reply_autodelete(update, context, f"Added to blocklist: {safe}", parse_mode="HTML")
+
+
+async def cmd_unblocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can edit the blocklist.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, "Usage: /unblocklist word1 word2 ...")
+        return
+    removed = await asyncio.to_thread(dbmod.remove_blocklist_words, chat.id, context.args)
+    if not removed:
+        await _reply_autodelete(update, context, "None of those word(s) were on the blocklist.")
+        return
+    safe = ", ".join(html.escape(w, quote=False) for w in removed)
+    await _reply_autodelete(update, context, f"Removed from blocklist: {safe}", parse_mode="HTML")
+
+
+async def cmd_blocklistmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    _words, mode = await asyncio.to_thread(dbmod.get_blocklist, chat.id)
+    if not context.args:
+        await _reply_autodelete(
+            update, context,
+            f"Current blocklist mode: {mode}\nOptions: {', '.join(BLOCKLIST_MODES)}",
+        )
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can change this.")
+        return
+    new_mode = context.args[0].lower()
+    if new_mode not in BLOCKLIST_MODES:
+        await _reply_autodelete(update, context, f"Invalid mode. Options: {', '.join(BLOCKLIST_MODES)}")
+        return
+    await asyncio.to_thread(dbmod.set_blocklist_mode, chat.id, new_mode)
+    await _reply_autodelete(
+        update, context,
+        f"Blocklist mode set to {new_mode}.\n"
+        f"<i>'delete' just removes the message; the others also warn/mute/kick/ban the sender.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def on_text_check_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs on every plain-text group message; deletes it (and optionally punishes the
+    sender) if it contains a blocklisted word. Registered in a separate handler group
+    (group=1) so it always runs alongside whatever fires in the default group (group=0),
+    instead of competing with other MessageHandlers for "first match wins"."""
+    msg = update.message
+    if not msg or not msg.text or not msg.from_user or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    # Never act on admins/owners — a bad blocklist word must not be able to gag the mods.
+    try:
+        member = await context.bot.get_chat_member(chat.id, msg.from_user.id)
+        if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+            return
+    except Exception:
+        pass
+
+    matched = await asyncio.to_thread(dbmod.find_blocked_word, chat.id, msg.text)
+    if not matched:
+        return
+
+    try:
+        await msg.delete()
+    except Exception:
+        logger.debug(
+            "Blocklist: couldn't delete message chat_id=%s (bot may lack delete rights)", chat.id
+        )
+
+    _words, mode = await asyncio.to_thread(dbmod.get_blocklist, chat.id)
+    if mode == "delete":
+        return
+
+    target_id = msg.from_user.id
+    target_label = _user_label(msg.from_user)
+
+    if mode == "warn":
+        settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
+        count, _entries = await asyncio.to_thread(
+            dbmod.add_warning,
+            chat.id,
+            target_id,
+            target_label,
+            f"Used a blocklisted word ({matched})",
+            context.bot.id,
+            "Blocklist",
+        )
+        safe = html.escape(target_label, quote=False)
+        text = f"⚠️ {safe} warned for a blocklisted word ({count}/{settings['warn_limit']})."
+        if count >= settings["warn_limit"]:
+            action_text = await _apply_punishment(update, context, target_id, target_label, settings["warn_mode"])
+            await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
+            text += f"\n🚫 Warn limit reached — {action_text}."
+        await context.bot.send_message(chat.id, text, parse_mode="HTML")
+        return
+
+    action_text = await _apply_punishment(update, context, target_id, target_label, mode)
+    await context.bot.send_message(
+        chat.id, f"🚫 {action_text} for using a blocklisted word.", parse_mode="HTML"
+    )
 
 
 async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
