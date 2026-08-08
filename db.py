@@ -1332,6 +1332,28 @@ def set_warn_mode(chat_id: int, mode: str) -> None:
     )
 
 
+def get_locked_types(chat_id: int) -> list[str]:
+    """Content types currently locked (e.g. 'links') for /lock, /unlock, /locks."""
+    coll = _coll("chat_settings")
+    doc = coll.find_one({"_id": chat_id}) or {}
+    return sorted(doc.get("locked_types", []))
+
+
+def lock_type(chat_id: int, lock_type_name: str) -> None:
+    coll = _coll("chat_settings")
+    coll.update_one(
+        {"_id": chat_id},
+        {"$addToSet": {"locked_types": lock_type_name}, "$setOnInsert": {"monthly_reports": True}},
+        upsert=True,
+    )
+
+
+def unlock_type(chat_id: int, lock_type_name: str) -> bool:
+    coll = _coll("chat_settings")
+    result = coll.update_one({"_id": chat_id}, {"$pull": {"locked_types": lock_type_name}})
+    return result.modified_count > 0
+
+
 def add_warning(
     chat_id: int,
     user_id: int,
@@ -1439,25 +1461,30 @@ def find_blocked_word(chat_id: int, text: str) -> str | None:
 
 
 # --- Filters (Rose's /filter: keyword -> canned auto-reply) -----------------
+#
+# Each filter is stored as a dict, not a plain string, so bold/italic/spacing and
+# non-text content (photo/video/sticker/etc.) survive round-tripping intact:
+#   {"type": "text"|"photo"|"video"|"sticker"|"document"|"animation"|"voice"|"audio"|"video_note",
+#    "text": str | None,       # body for text, caption for media, None for sticker/video_note
+#    "entities": [ {type, offset, length, url?, language?, custom_emoji_id?}, ... ],
+#    "file_id": str | None}    # None for type "text"
 
 
-def get_filters(chat_id: int) -> dict[str, str]:
-    """{keyword: reply_text}, keywords lowercase."""
+def get_filters(chat_id: int) -> dict[str, dict]:
+    """{keyword: filter_data}, keywords lowercase."""
     coll = _coll("filters")
     doc = coll.find_one({"_id": chat_id})
     if not doc:
         return {}
-    return {str(k): str(v) for k, v in (doc.get("filters") or {}).items()}
+    return {str(k): v for k, v in (doc.get("filters") or {}).items()}
 
 
-def add_filter(chat_id: int, keyword: str, reply_text: str) -> None:
+def add_filter(chat_id: int, keyword: str, filter_data: dict) -> None:
     coll = _coll("filters")
     key = keyword.strip().lower()
     coll.update_one(
         {"_id": chat_id},
-        {
-            "$set": {f"filters.{key}": reply_text[:4000], "chat_id": chat_id},
-        },
+        {"$set": {f"filters.{key}": filter_data, "chat_id": chat_id}},
         upsert=True,
     )
 
@@ -1469,16 +1496,16 @@ def remove_filter(chat_id: int, keyword: str) -> bool:
     return result.modified_count > 0
 
 
-def find_filter_match(chat_id: int, text: str) -> tuple[str, str] | None:
-    """Case-insensitive substring match against saved keywords; returns (keyword, reply_text)
-    for the first match, or None."""
+def find_filter_match(chat_id: int, text: str) -> tuple[str, dict] | None:
+    """Case-insensitive substring match against saved keywords; returns (keyword,
+    filter_data) for the first match, or None."""
     filters_map = get_filters(chat_id)
     if not filters_map:
         return None
     lowered = text.lower()
-    for keyword, reply_text in filters_map.items():
+    for keyword, filter_data in filters_map.items():
         if keyword in lowered:
-            return keyword, reply_text
+            return keyword, filter_data
     return None
 
 

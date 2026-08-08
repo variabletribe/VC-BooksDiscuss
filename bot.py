@@ -59,7 +59,7 @@ from typing import Dict
 
 import httpx
 from dotenv import load_dotenv
-from telegram import ChatPermissions, InputFile, Update
+from telegram import ChatPermissions, InputFile, MessageEntity, Update
 from telegram.constants import ChatMemberStatus
 from telegram.error import Conflict, InvalidToken
 from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, MessageHandler, filters
@@ -462,21 +462,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>🔧 Utility</b>\n"
         "• /vcstatus — this group's chat id + whether tracking is active\n\n"
 
-        "<b>🛡️ Moderation</b>\n"
-        "• /warn — warn a user (reply, or give id/@username) [admin]\n"
-        "• /warns — check a user's warnings (anyone; defaults to yourself)\n"
-        "• /resetwarn — clear a user's warnings [admin]\n"
-        "• /warnlimit [n] — view/set warns before auto-punishment [admin to set]\n"
-        "• /warnmode [ban/mute/kick] — view/set what happens at the limit [admin to set]\n"
-        "• /ban, /kick, /mute — reply or give id/@username, optional reason [admin]\n"
-        "• /tban, /tmute — same, plus a time: 30m, 2h, 1d, 1w [admin]\n"
-        "• /unban, /unmute — lift a ban/mute early [admin]\n"
-        "• /blocklist — view blocklisted words (anyone)\n"
-        "• /addblocklist, /unblocklist — edit the word list [admin]\n"
-        "• /blocklistmode [delete/warn/mute/kick/ban] — view/set the action [admin to set]\n"
-        "• /filter <word> <reply> — bot auto-replies when the word appears [admin]\n"
-        "• /filters — list saved filter keywords (anyone)\n"
-        "• /stop <word> — remove a filter [admin]\n\n"
+        "<b>🛡️ Moderation (admin only)</b>\n"
+        "• /warn — warn a user (reply, or give id/@username)\n"
+        "• /warns — check a user's warnings (defaults to yourself)\n"
+        "• /resetwarn — clear a user's warnings\n"
+        "• /warnlimit [n] — view/set warns before auto-punishment (default 3)\n"
+        "• /warnmode [ban/mute/kick] — view/set what happens at the limit (default kick)\n"
+        "• /ban, /kick, /mute — reply or give id/@username, optional reason\n"
+        "• /tban, /tmute — same, plus a time: 30m, 2h, 1d, 1w\n"
+        "• /unban, /unmute — lift a ban/mute early\n"
+        "• /blocklist — view blocklisted words\n"
+        "• /addblocklist, /unblocklist — edit the word list\n"
+        "• /blocklistmode [delete/warn/mute/kick/ban] — view/set the action\n"
+        "• /filter &lt;word&gt; &lt;reply&gt; — bot auto-replies when the word appears, formatting preserved exactly\n"
+        "• /filter &lt;word&gt; (as a reply) — saves the replied message verbatim (photo/video/sticker/etc.)\n"
+        "• /filters — list saved filter keywords\n"
+        "• /stop &lt;word&gt; — remove a filter\n"
+        "• /lock links, /unlock links — auto-delete non-admin messages containing a link\n"
+        "• /locks — view locked content types\n\n"
+
+        "<b>🔔 Everyone</b>\n"
+        "• Writing <code>@admin</code> anywhere in a message pings all current admins\n\n"
 
         "<b>🛠️ Admin only</b>\n"
         "• /streakboard — everyone's current + best streak, ranked\n"
@@ -779,13 +785,15 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone can check warnings (their own, or — like Rose — any member's), matching
-    Rose's behavior of treating warn counts as visible group info, not a private admin log."""
+    """Admin-only: check a user's warnings (their own, or any member's)."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can check warnings.")
         return
 
     args = context.args or []
@@ -859,12 +867,12 @@ async def cmd_warnlimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view or change this.")
+        return
     settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
     if not context.args:
         await _reply_autodelete(update, context, f"Current warn limit: {settings['warn_limit']}")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can change this.")
         return
     try:
         limit = int(context.args[0])
@@ -885,15 +893,15 @@ async def cmd_warnmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view or change this.")
+        return
     settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
     if not context.args:
         await _reply_autodelete(
             update, context,
             f"Current warn mode: {settings['warn_mode']}\nOptions: {', '.join(WARN_MODES)}",
         )
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can change this.")
         return
     mode = context.args[0].lower()
     if mode not in WARN_MODES:
@@ -1149,12 +1157,15 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """View the current blocklisted words — open to any member, like Rose."""
+    """Admin-only: view the current blocklisted words."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view the blocklist.")
         return
     words, mode = await asyncio.to_thread(dbmod.get_blocklist, chat.id)
     if not words:
@@ -1220,15 +1231,15 @@ async def cmd_blocklistmode(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view or change this.")
+        return
     _words, mode = await asyncio.to_thread(dbmod.get_blocklist, chat.id)
     if not context.args:
         await _reply_autodelete(
             update, context,
             f"Current blocklist mode: {mode}\nOptions: {', '.join(BLOCKLIST_MODES)}",
         )
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can change this.")
         return
     new_mode = context.args[0].lower()
     if new_mode not in BLOCKLIST_MODES:
@@ -1294,7 +1305,11 @@ async def on_text_check_blocklist(update: Update, context: ContextTypes.DEFAULT_
         )
         safe = html.escape(target_label, quote=False)
         limit = settings["warn_limit"]
-        text = f"⚠️ {safe} warned for a blocklisted word ({count}/{limit})."
+        text = (
+            f"⚠️ {safe}, your message was deleted — it contained a blocklisted word.\n"
+            f"Please write it again avoiding blocklisted words.\n\n"
+            f"Warning: {count}/{limit}"
+        )
         if count >= limit:
             action_text = await _apply_punishment(update, context, target_id, target_label, settings["warn_mode"])
             await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
@@ -1309,16 +1324,127 @@ async def on_text_check_blocklist(update: Update, context: ContextTypes.DEFAULT_
 
     action_text = await _apply_punishment(update, context, target_id, target_label, mode)
     await context.bot.send_message(
-        chat.id, f"🚫 {action_text} for using a blocklisted word.", parse_mode="HTML"
+        chat.id,
+        f"🚫 Message deleted — it contained a blocklisted word. {action_text}.",
+        parse_mode="HTML",
     )
 
 
 # --- Filters: /filter, /filters, /stop --------------------------------------
+#
+# Filters store the exact MessageEntity list (bold/italic/spacing/etc.) instead of
+# plain joined text, and can save any message type (photo/video/sticker/document/
+# animation/voice/audio/video_note), not just text — matching Rose's real /filter,
+# which lets you reply to any message with /filter <keyword> to save it verbatim.
+
+
+def _entity_to_dict(e: MessageEntity) -> dict:
+    d: dict = {"type": e.type, "offset": e.offset, "length": e.length}
+    if e.url:
+        d["url"] = e.url
+    if e.language:
+        d["language"] = e.language
+    if e.custom_emoji_id:
+        d["custom_emoji_id"] = e.custom_emoji_id
+    # text_mention (entity.user) isn't fully reconstructable without re-fetching the
+    # user, so it's intentionally dropped here — the visible text is kept, only the
+    # clickable-mention behavior of that one entity type is lost.
+    return d
+
+
+def _dict_to_entity(d: dict) -> MessageEntity:
+    return MessageEntity(
+        type=d["type"],
+        offset=d["offset"],
+        length=d["length"],
+        url=d.get("url"),
+        language=d.get("language"),
+        custom_emoji_id=d.get("custom_emoji_id"),
+    )
+
+
+def _filter_data_from_message(msg) -> dict | None:
+    """Builds filter storage data from any message type. Caption/text entities are
+    kept as-is (already correctly offset for that message)."""
+    def _ents(entities) -> list[dict]:
+        return [_entity_to_dict(e) for e in (entities or [])]
+
+    if msg.photo:
+        return {"type": "photo", "file_id": msg.photo[-1].file_id, "text": msg.caption, "entities": _ents(msg.caption_entities)}
+    if msg.video:
+        return {"type": "video", "file_id": msg.video.file_id, "text": msg.caption, "entities": _ents(msg.caption_entities)}
+    if msg.animation:
+        return {"type": "animation", "file_id": msg.animation.file_id, "text": msg.caption, "entities": _ents(msg.caption_entities)}
+    if msg.document:
+        return {"type": "document", "file_id": msg.document.file_id, "text": msg.caption, "entities": _ents(msg.caption_entities)}
+    if msg.sticker:
+        return {"type": "sticker", "file_id": msg.sticker.file_id, "text": None, "entities": []}
+    if msg.voice:
+        return {"type": "voice", "file_id": msg.voice.file_id, "text": msg.caption, "entities": _ents(msg.caption_entities)}
+    if msg.audio:
+        return {"type": "audio", "file_id": msg.audio.file_id, "text": msg.caption, "entities": _ents(msg.caption_entities)}
+    if msg.video_note:
+        return {"type": "video_note", "file_id": msg.video_note.file_id, "text": None, "entities": []}
+    if msg.text:
+        return {"type": "text", "file_id": None, "text": msg.text, "entities": _ents(msg.entities)}
+    return None
+
+
+_FILTER_BODY_RE = re.compile(r"^(\S+)(\s+)(.*)$", re.DOTALL)
+
+
+def _extract_filter_command_body(msg) -> tuple[str, str, list] | None:
+    """(keyword, body_text, body_entities) parsed straight from the raw message text,
+    preserving exact whitespace/newlines and formatting in body_text — unlike
+    context.args, which collapses runs of whitespace and discards entity offsets
+    entirely (that's what made bold/spacing get lost on /filter before this fix).
+
+    Entity offsets are Telegram's own UTF-16 code-unit offsets into msg.text; slicing
+    at a purely-ASCII prefix ("/filter <keyword> ") keeps that offset arithmetic exact
+    (each ASCII char = 1 UTF-16 unit), which covers the normal case. A keyword itself
+    containing astral characters (rare — most emoji are fine, some are astral) could
+    shift things very slightly; not worth the extra complexity for that edge case."""
+    text = msg.text or ""
+    if not text.startswith("/"):
+        return None
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        return None
+    command_token_end = len(parts[0])
+    idx = command_token_end
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    rest = text[idx:]
+    rest_start = idx
+
+    m = _FILTER_BODY_RE.match(rest)
+    if not m:
+        return None
+    keyword = m.group(1)
+    body_start = rest_start + m.start(3)
+    body_text = text[body_start:]
+
+    body_entities = []
+    for e in (msg.entities or []):
+        if e.offset >= body_start:
+            body_entities.append(
+                MessageEntity(
+                    type=e.type,
+                    offset=e.offset - body_start,
+                    length=e.length,
+                    url=e.url,
+                    language=e.language,
+                    custom_emoji_id=e.custom_emoji_id,
+                )
+            )
+    return keyword, body_text, body_entities
 
 
 async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only: /filter <keyword> <reply text> — bot auto-replies with the given
-    text whenever <keyword> appears in a message (case-insensitive substring)."""
+    """Admin-only. Two forms:
+    - /filter <keyword> <reply text>  — saves formatted text exactly as typed.
+    - Reply to any message with /filter <keyword>  — saves that message verbatim
+      (photo, video, sticker, document, animation, voice, audio, video note, or text)."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -1328,26 +1454,49 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await _is_group_admin(update, context):
         await _reply_autodelete(update, context, "Only group admins can add filters.")
         return
-    if len(context.args or []) < 2:
-        await _reply_autodelete(
-            update, context,
-            "Usage: /filter <keyword> <reply text>\nExample: /filter rules Please read the pinned rules!",
-        )
-        return
-    keyword = context.args[0]
-    reply_text = " ".join(context.args[1:])
-    await asyncio.to_thread(dbmod.add_filter, chat.id, keyword, reply_text)
+
+    reply = update.message.reply_to_message
+    if reply is not None:
+        if not context.args:
+            await _reply_autodelete(update, context, "Usage (replying to a message): /filter <keyword>")
+            return
+        keyword = context.args[0]
+        filter_data = _filter_data_from_message(reply)
+        if filter_data is None:
+            await _reply_autodelete(update, context, "I can't save that message type as a filter.")
+            return
+    else:
+        parsed = _extract_filter_command_body(update.message)
+        if parsed is None:
+            await _reply_autodelete(
+                update, context,
+                "Usage: /filter <keyword> <reply text>\n"
+                "Or reply to any message (text, photo, video, sticker, document, ...) with /filter <keyword>",
+            )
+            return
+        keyword, body_text, body_entities = parsed
+        filter_data = {
+            "type": "text",
+            "file_id": None,
+            "text": body_text,
+            "entities": [_entity_to_dict(e) for e in body_entities],
+        }
+
+    await asyncio.to_thread(dbmod.add_filter, chat.id, keyword, filter_data)
     safe_kw = html.escape(keyword.lower(), quote=False)
     await _reply_autodelete(update, context, f"Filter saved for \"{safe_kw}\".", parse_mode="HTML")
 
 
 async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """View all saved filter keywords — open to any member, like Rose."""
+    """Admin-only: list saved filter keywords."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view filters.")
         return
     filters_map = await asyncio.to_thread(dbmod.get_filters, chat.id)
     if not filters_map:
@@ -1382,8 +1531,52 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply_autodelete(update, context, text, parse_mode="HTML")
 
 
+async def _send_filter_response(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, reply_to_message_id: int, filter_data: dict
+) -> None:
+    ftype = filter_data.get("type", "text")
+    text = filter_data.get("text")
+    entities = [_dict_to_entity(d) for d in (filter_data.get("entities") or [])] or None
+    file_id = filter_data.get("file_id")
+    try:
+        if ftype == "text":
+            await context.bot.send_message(
+                chat_id, text or "", entities=entities, reply_to_message_id=reply_to_message_id
+            )
+        elif ftype == "photo":
+            await context.bot.send_photo(
+                chat_id, photo=file_id, caption=text, caption_entities=entities, reply_to_message_id=reply_to_message_id
+            )
+        elif ftype == "video":
+            await context.bot.send_video(
+                chat_id, video=file_id, caption=text, caption_entities=entities, reply_to_message_id=reply_to_message_id
+            )
+        elif ftype == "animation":
+            await context.bot.send_animation(
+                chat_id, animation=file_id, caption=text, caption_entities=entities, reply_to_message_id=reply_to_message_id
+            )
+        elif ftype == "document":
+            await context.bot.send_document(
+                chat_id, document=file_id, caption=text, caption_entities=entities, reply_to_message_id=reply_to_message_id
+            )
+        elif ftype == "sticker":
+            await context.bot.send_sticker(chat_id, sticker=file_id, reply_to_message_id=reply_to_message_id)
+        elif ftype == "voice":
+            await context.bot.send_voice(
+                chat_id, voice=file_id, caption=text, caption_entities=entities, reply_to_message_id=reply_to_message_id
+            )
+        elif ftype == "audio":
+            await context.bot.send_audio(
+                chat_id, audio=file_id, caption=text, caption_entities=entities, reply_to_message_id=reply_to_message_id
+            )
+        elif ftype == "video_note":
+            await context.bot.send_video_note(chat_id, video_note=file_id, reply_to_message_id=reply_to_message_id)
+    except Exception:
+        logger.exception("Filter response failed chat_id=%s type=%s", chat_id, ftype)
+
+
 async def on_text_check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Runs on every plain-text group message; sends the saved reply if the text
+    """Runs on every plain-text group message; sends the saved response if the text
     contains a filter keyword. Registered in its own handler group (group=2) so it
     always runs independently of on_text_check_blocklist (group=1) and the default
     command dispatch (group=0)."""
@@ -1396,11 +1589,8 @@ async def on_text_check_filters(update: Update, context: ContextTypes.DEFAULT_TY
     match = await asyncio.to_thread(dbmod.find_filter_match, chat.id, msg.text)
     if not match:
         return
-    _keyword, reply_text = match
-    try:
-        await msg.reply_text(reply_text)
-    except Exception:
-        logger.debug("Filter reply failed chat_id=%s", chat.id)
+    _keyword, filter_data = match
+    await _send_filter_response(context, chat.id, msg.message_id, filter_data)
 
 
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1421,6 +1611,176 @@ async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg.from_user.username,
         _user_label(msg.from_user),
     )
+
+
+# --- @admin tagging ----------------------------------------------------------
+
+_ADMIN_TAG_RE = re.compile(r"(?<!\w)@admin(?!\w)", re.IGNORECASE)
+_ADMIN_TAG_COOLDOWN_SECONDS = 60
+_admin_tag_cooldown: dict[int, float] = {}  # chat_id -> monotonic time of last tag
+
+
+async def on_text_admin_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Whenever someone writes "@admin" in a group message, pings every current admin
+    with a clickable mention (tg://user link, so it works even for admins with no
+    @username). Rate-limited per chat so it can't be spammed. Registered in its own
+    handler group (group=4)."""
+    msg = update.message
+    if not msg or not msg.text or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    if not _ADMIN_TAG_RE.search(msg.text):
+        return
+
+    now = time.monotonic()
+    last = _admin_tag_cooldown.get(chat.id, 0.0)
+    if now - last < _ADMIN_TAG_COOLDOWN_SECONDS:
+        return
+    _admin_tag_cooldown[chat.id] = now
+
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+    except Exception:
+        logger.exception("Admin tag: get_chat_administrators failed chat_id=%s", chat.id)
+        return
+
+    mentions = []
+    for a in admins:
+        u = a.user
+        if u.is_bot:
+            continue
+        label = html.escape(u.first_name or "Admin", quote=False)
+        mentions.append(f'<a href="tg://user?id={u.id}">{label}</a>')
+    if not mentions:
+        return
+
+    try:
+        await msg.reply_text("🔔 " + " ".join(mentions) + " — attention needed here.", parse_mode="HTML")
+    except Exception:
+        logger.debug("Admin tag: reply failed chat_id=%s", chat.id)
+
+
+# --- Link lock: /lock, /unlock, /locks ---------------------------------------
+
+_LOCK_ALIASES = {"link": "links", "links": "links", "url": "links", "urls": "links"}
+_LOCK_TYPE_NAMES = sorted(set(_LOCK_ALIASES.values()))
+_URL_RE = re.compile(r"(https?://|www\.\w|t\.me/)", re.IGNORECASE)
+
+
+async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /lock links — non-admin messages containing a link get deleted from
+    then on. Only "links" is supported today; the alias table exists so more lock
+    types (photos, forwards, etc.) can be added later without changing the command."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can lock content types.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, f"Usage: /lock <type>\nSupported: {', '.join(_LOCK_TYPE_NAMES)}")
+        return
+    lock_name = _LOCK_ALIASES.get(context.args[0].lower())
+    if lock_name is None:
+        await _reply_autodelete(update, context, f"Unknown lock type. Supported: {', '.join(_LOCK_TYPE_NAMES)}")
+        return
+    await asyncio.to_thread(dbmod.lock_type, chat.id, lock_name)
+    await _reply_autodelete(
+        update, context,
+        f"🔒 Locked: {lock_name}. Non-admin messages containing a link will now be deleted automatically.",
+    )
+
+
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can unlock content types.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, f"Usage: /unlock <type>\nSupported: {', '.join(_LOCK_TYPE_NAMES)}")
+        return
+    lock_name = _LOCK_ALIASES.get(context.args[0].lower())
+    if lock_name is None:
+        await _reply_autodelete(update, context, f"Unknown lock type. Supported: {', '.join(_LOCK_TYPE_NAMES)}")
+        return
+    removed = await asyncio.to_thread(dbmod.unlock_type, chat.id, lock_name)
+    text = f"🔓 Unlocked: {lock_name}." if removed else f"{lock_name} wasn't locked."
+    await _reply_autodelete(update, context, text)
+
+
+async def cmd_locks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: view which content types are currently locked."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view locks.")
+        return
+    locked = await asyncio.to_thread(dbmod.get_locked_types, chat.id)
+    text = "🔒 Locked: " + ", ".join(locked) if locked else "No content types are locked."
+    await _reply_autodelete(update, context, text)
+
+
+async def on_text_check_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deletes messages containing a link if "links" is locked for this chat and the
+    sender isn't an admin. Checks both Telegram's own url/text_link entities (catches
+    formatted/masked links) and a plain-text regex fallback. Registered in its own
+    handler group (group=5)."""
+    msg = update.message
+    if not msg or not update.effective_chat or not msg.from_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    locked = await asyncio.to_thread(dbmod.get_locked_types, chat.id)
+    if "links" not in locked:
+        return
+
+    text = msg.text or msg.caption or ""
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    has_link = any(e.type in ("url", "text_link") for e in entities) or bool(_URL_RE.search(text))
+    if not has_link:
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, msg.from_user.id)
+        if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+            return
+    except Exception:
+        pass
+
+    try:
+        await msg.delete()
+    except Exception:
+        logger.debug("Link lock: couldn't delete message chat_id=%s (bot may lack delete rights)", chat.id)
+        return
+
+    try:
+        notice = await context.bot.send_message(chat.id, "🔗 Links aren't allowed here — message deleted.")
+        jq = context.job_queue
+        if jq is not None:
+            jq.run_once(
+                _delete_messages_later,
+                when=15,
+                data={"chat_id": chat.id, "message_ids": [notice.message_id]},
+                name=f"link-lock-notice-{chat.id}-{notice.message_id}",
+            )
+    except Exception:
+        logger.debug("Link lock: couldn't send notice chat_id=%s", chat.id)
 
 
 async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2664,7 +3024,10 @@ def main() -> None:
     app.add_handler(CommandHandler("filter", cmd_filter))
     app.add_handler(CommandHandler("filters", cmd_filters))
     app.add_handler(CommandHandler("stop", cmd_stop))
-    # Auto-enforcement on plain text messages — separate handler groups (1, 2) so both
+    app.add_handler(CommandHandler("lock", cmd_lock))
+    app.add_handler(CommandHandler("unlock", cmd_unlock))
+    app.add_handler(CommandHandler("locks", cmd_locks))
+    # Auto-enforcement on plain text messages — separate handler groups (1, 2, 5) so all
     # always run alongside command dispatch in the default group (0); PTB only runs the
     # first matching handler *within* a group, not across groups.
     app.add_handler(
@@ -2678,6 +3041,14 @@ def main() -> None:
     # Passive: remembers username -> id for every group message, regardless of type,
     # so moderation commands can resolve @username later. See on_track_known_user.
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_track_known_user), group=3)
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_text_admin_tag),
+        group=4,
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), on_text_check_links),
+        group=5,
+    )
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
