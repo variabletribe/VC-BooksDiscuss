@@ -193,6 +193,10 @@ def init_db() -> None:
     # relay_map: _id = the forwarded/info message id in the admin relay chat.
     # Auto-expires after 30 days so this collection doesn't grow forever.
     _db.relay_map.create_index("created_at", expireAfterSeconds=60 * 60 * 24 * 30)
+    # known_users: username -> user_id memory per chat, so /warn @username (and other
+    # moderation commands) can resolve a bare @username without Telegram's getChat, which
+    # only works for usernames the bot has already been introduced to some other way.
+    _db.known_users.create_index([("chat_id", ASCENDING), ("username", ASCENDING)])
 
 
 def _coll(name: str):
@@ -1301,12 +1305,12 @@ def has_any_data(chat_id: int, user_id: int) -> bool:
 
 
 def get_chat_mod_settings(chat_id: int) -> dict:
-    """warn_limit / warn_mode for this chat, defaulting to 3 warns -> ban."""
+    """warn_limit / warn_mode for this chat, defaulting to 3 warns -> kick."""
     coll = _coll("chat_settings")
     doc = coll.find_one({"_id": chat_id}) or {}
     return {
         "warn_limit": int(doc.get("warn_limit", 3)),
-        "warn_mode": str(doc.get("warn_mode", "ban")),
+        "warn_mode": str(doc.get("warn_mode", "kick")),
     }
 
 
@@ -1476,3 +1480,40 @@ def find_filter_match(chat_id: int, text: str) -> tuple[str, str] | None:
         if keyword in lowered:
             return keyword, reply_text
     return None
+
+
+# --- Known-user memory (enables /warn @username etc. without a reply) -------
+
+
+def record_known_user(chat_id: int, user_id: int, username: str | None, display_name: str) -> None:
+    """Remember this user's username -> id mapping for this chat. Called passively on every
+    message the bot sees in the group, so moderation commands can later resolve a bare
+    @username without Telegram's getChat — which only works for usernames the bot has
+    already been introduced to some other way, and normally fails for an arbitrary group
+    member who has never DMed the bot."""
+    coll = _coll("known_users")
+    coll.update_one(
+        {"_id": f"{chat_id}:{user_id}"},
+        {
+            "$set": {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "username": (username or "").strip().lstrip("@").lower() or None,
+                "display_name": display_name[:512],
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+        upsert=True,
+    )
+
+
+def resolve_username(chat_id: int, username: str) -> tuple[int, str] | None:
+    """Look up a bare @username (case-insensitive) against usernames seen for this chat."""
+    coll = _coll("known_users")
+    key = username.strip().lstrip("@").lower()
+    if not key:
+        return None
+    doc = coll.find_one({"chat_id": chat_id, "username": key})
+    if not doc:
+        return None
+    return int(doc["user_id"]), str(doc.get("display_name") or f"@{key}")

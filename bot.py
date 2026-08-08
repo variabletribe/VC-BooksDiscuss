@@ -571,6 +571,14 @@ async def _resolve_user_ref(
         except Exception:
             return int(ref), ref
     if ref.startswith("@"):
+        # Our own username -> id memory first — built passively from every message the
+        # bot has seen in this group (see on_track_known_user). Telegram's own getChat
+        # only resolves a user's @username if the bot has already been introduced to
+        # them some other way (e.g. they DMed the bot), which normally fails for an
+        # arbitrary group member, so it's only used as a last-resort fallback here.
+        known = await asyncio.to_thread(dbmod.resolve_username, chat_id, ref)
+        if known is not None:
+            return known
         try:
             chat = await context.bot.get_chat(ref)
             label = f"@{chat.username}" if chat.username else (chat.first_name or ref)
@@ -760,6 +768,12 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
         lines.append("")
         lines.append(f"🚫 Warn limit reached — {action_text}. Warnings reset.")
+    else:
+        mode_word = {"ban": "banned", "mute": "muted", "kick": "kicked"}.get(
+            settings["warn_mode"], settings["warn_mode"]
+        )
+        lines.append("")
+        lines.append(f"<i>Reaching {limit}/{limit} warnings will get you automatically {mode_word}.</i>")
 
     await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
@@ -1279,11 +1293,17 @@ async def on_text_check_blocklist(update: Update, context: ContextTypes.DEFAULT_
             "Blocklist",
         )
         safe = html.escape(target_label, quote=False)
-        text = f"⚠️ {safe} warned for a blocklisted word ({count}/{settings['warn_limit']})."
-        if count >= settings["warn_limit"]:
+        limit = settings["warn_limit"]
+        text = f"⚠️ {safe} warned for a blocklisted word ({count}/{limit})."
+        if count >= limit:
             action_text = await _apply_punishment(update, context, target_id, target_label, settings["warn_mode"])
             await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
             text += f"\n🚫 Warn limit reached — {action_text}."
+        else:
+            mode_word = {"ban": "banned", "mute": "muted", "kick": "kicked"}.get(
+                settings["warn_mode"], settings["warn_mode"]
+            )
+            text += f"\n<i>Reaching {limit}/{limit} warnings will get you automatically {mode_word}.</i>"
         await context.bot.send_message(chat.id, text, parse_mode="HTML")
         return
 
@@ -1381,6 +1401,26 @@ async def on_text_check_filters(update: Update, context: ContextTypes.DEFAULT_TY
         await msg.reply_text(reply_text)
     except Exception:
         logger.debug("Filter reply failed chat_id=%s", chat.id)
+
+
+async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Passive, silent: remembers username -> user_id for every message seen in a tracked
+    group (any message type, not just text/commands), so /warn, /ban, /mute etc. can later
+    resolve a bare @username. Registered in its own handler group (group=3) so it always
+    runs alongside command dispatch and the other text scanners, never competing for
+    "first match" with any of them."""
+    msg = update.message
+    if not msg or not msg.from_user or msg.from_user.is_bot or not update.effective_chat:
+        return
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    await asyncio.to_thread(
+        dbmod.record_known_user,
+        update.effective_chat.id,
+        msg.from_user.id,
+        msg.from_user.username,
+        _user_label(msg.from_user),
+    )
 
 
 async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2635,6 +2675,9 @@ def main() -> None:
         MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_text_check_filters),
         group=2,
     )
+    # Passive: remembers username -> id for every group message, regardless of type,
+    # so moderation commands can resolve @username later. See on_track_known_user.
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_track_known_user), group=3)
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),
