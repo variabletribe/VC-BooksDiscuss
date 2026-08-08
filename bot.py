@@ -462,6 +462,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>🔧 Utility</b>\n"
         "• /vcstatus — this group's chat id + whether tracking is active\n\n"
 
+        "<b>🛡️ Moderation</b>\n"
+        "• /warn — warn a user (reply, or give id/@username) [admin]\n"
+        "• /warns — check a user's warnings (anyone; defaults to yourself)\n"
+        "• /resetwarn — clear a user's warnings [admin]\n"
+        "• /warnlimit [n] — view/set warns before auto-punishment [admin to set]\n"
+        "• /warnmode [ban/mute/kick] — view/set what happens at the limit [admin to set]\n"
+        "• /ban, /kick, /mute — reply or give id/@username, optional reason [admin]\n"
+        "• /tban, /tmute — same, plus a time: 30m, 2h, 1d, 1w [admin]\n"
+        "• /unban, /unmute — lift a ban/mute early [admin]\n"
+        "• /blocklist — view blocklisted words (anyone)\n"
+        "• /addblocklist, /unblocklist — edit the word list [admin]\n"
+        "• /blocklistmode [delete/warn/mute/kick/ban] — view/set the action [admin to set]\n"
+        "• /filter <word> <reply> — bot auto-replies when the word appears [admin]\n"
+        "• /filters — list saved filter keywords (anyone)\n"
+        "• /stop <word> — remove a filter [admin]\n\n"
+
         "<b>🛠️ Admin only</b>\n"
         "• /streakboard — everyone's current + best streak, ranked\n"
         "• /reports on|off — toggle automatic monthly report (posted on the 1st, UTC)\n"
@@ -1275,6 +1291,96 @@ async def on_text_check_blocklist(update: Update, context: ContextTypes.DEFAULT_
     await context.bot.send_message(
         chat.id, f"🚫 {action_text} for using a blocklisted word.", parse_mode="HTML"
     )
+
+
+# --- Filters: /filter, /filters, /stop --------------------------------------
+
+
+async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /filter <keyword> <reply text> — bot auto-replies with the given
+    text whenever <keyword> appears in a message (case-insensitive substring)."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can add filters.")
+        return
+    if len(context.args or []) < 2:
+        await _reply_autodelete(
+            update, context,
+            "Usage: /filter <keyword> <reply text>\nExample: /filter rules Please read the pinned rules!",
+        )
+        return
+    keyword = context.args[0]
+    reply_text = " ".join(context.args[1:])
+    await asyncio.to_thread(dbmod.add_filter, chat.id, keyword, reply_text)
+    safe_kw = html.escape(keyword.lower(), quote=False)
+    await _reply_autodelete(update, context, f"Filter saved for \"{safe_kw}\".", parse_mode="HTML")
+
+
+async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View all saved filter keywords — open to any member, like Rose."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    filters_map = await asyncio.to_thread(dbmod.get_filters, chat.id)
+    if not filters_map:
+        await _reply_autodelete(update, context, "No filters saved yet.\n\nAdd one with /filter keyword reply text")
+        return
+    safe_words = "\n".join(f"• {html.escape(k, quote=False)}" for k in sorted(filters_map))
+    await _reply_autodelete(
+        update, context,
+        f"🔎 <b>Filters</b> ({len(filters_map)})\n\n{safe_words}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /stop <keyword> — removes a saved filter."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can remove filters.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, "Usage: /stop <keyword>")
+        return
+    keyword = context.args[0]
+    removed = await asyncio.to_thread(dbmod.remove_filter, chat.id, keyword)
+    safe_kw = html.escape(keyword.lower(), quote=False)
+    text = f"Filter \"{safe_kw}\" removed." if removed else f"No filter found for \"{safe_kw}\"."
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
+
+
+async def on_text_check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs on every plain-text group message; sends the saved reply if the text
+    contains a filter keyword. Registered in its own handler group (group=2) so it
+    always runs independently of on_text_check_blocklist (group=1) and the default
+    command dispatch (group=0)."""
+    msg = update.message
+    if not msg or not msg.text or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    match = await asyncio.to_thread(dbmod.find_filter_match, chat.id, msg.text)
+    if not match:
+        return
+    _keyword, reply_text = match
+    try:
+        await msg.reply_text(reply_text)
+    except Exception:
+        logger.debug("Filter reply failed chat_id=%s", chat.id)
 
 
 async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2497,6 +2603,38 @@ def main() -> None:
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("exportdata", cmd_exportdata))
     app.add_handler(CommandHandler("user", cmd_user))
+
+    # --- Moderation (Rose-style names) ---
+    app.add_handler(CommandHandler("warn", cmd_warn))
+    app.add_handler(CommandHandler("warns", cmd_warns))
+    app.add_handler(CommandHandler("resetwarn", cmd_resetwarn))
+    app.add_handler(CommandHandler("warnlimit", cmd_warnlimit))
+    app.add_handler(CommandHandler("warnmode", cmd_warnmode))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("tban", cmd_tban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("kick", cmd_kick))
+    app.add_handler(CommandHandler("mute", cmd_mute))
+    app.add_handler(CommandHandler("tmute", cmd_tmute))
+    app.add_handler(CommandHandler("unmute", cmd_unmute))
+    app.add_handler(CommandHandler("blocklist", cmd_blocklist))
+    app.add_handler(CommandHandler("addblocklist", cmd_addblocklist))
+    app.add_handler(CommandHandler("unblocklist", cmd_unblocklist))
+    app.add_handler(CommandHandler("blocklistmode", cmd_blocklistmode))
+    app.add_handler(CommandHandler("filter", cmd_filter))
+    app.add_handler(CommandHandler("filters", cmd_filters))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    # Auto-enforcement on plain text messages — separate handler groups (1, 2) so both
+    # always run alongside command dispatch in the default group (0); PTB only runs the
+    # first matching handler *within* a group, not across groups.
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_text_check_blocklist),
+        group=1,
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_text_check_filters),
+        group=2,
+    )
     app.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS & VideoChatServiceFilter(),

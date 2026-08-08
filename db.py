@@ -1292,3 +1292,187 @@ def has_any_data(chat_id: int, user_id: int) -> bool:
     if _coll("vc_sessions").find_one({"chat_id": chat_id, "participants.user_id": user_id}):
         return True
     return False
+
+
+# =============================================================================
+# Moderation: warnings, per-chat warn settings, blocklist, filters
+# (backing store for bot.py's Rose-style /warn, /ban, /mute, /blocklist, /filter)
+# =============================================================================
+
+
+def get_chat_mod_settings(chat_id: int) -> dict:
+    """warn_limit / warn_mode for this chat, defaulting to 3 warns -> ban."""
+    coll = _coll("chat_settings")
+    doc = coll.find_one({"_id": chat_id}) or {}
+    return {
+        "warn_limit": int(doc.get("warn_limit", 3)),
+        "warn_mode": str(doc.get("warn_mode", "ban")),
+    }
+
+
+def set_warn_limit(chat_id: int, limit: int) -> None:
+    coll = _coll("chat_settings")
+    coll.update_one(
+        {"_id": chat_id},
+        {"$set": {"warn_limit": limit}, "$setOnInsert": {"monthly_reports": True}},
+        upsert=True,
+    )
+
+
+def set_warn_mode(chat_id: int, mode: str) -> None:
+    coll = _coll("chat_settings")
+    coll.update_one(
+        {"_id": chat_id},
+        {"$set": {"warn_mode": mode}, "$setOnInsert": {"monthly_reports": True}},
+        upsert=True,
+    )
+
+
+def add_warning(
+    chat_id: int,
+    user_id: int,
+    display_name: str,
+    reason: str,
+    by_id: int,
+    by_name: str,
+) -> tuple[int, list[dict]]:
+    """Appends a warning and returns (new_count, all_entries)."""
+    coll = _coll("warnings")
+    doc_id = f"{chat_id}:{user_id}"
+    entry = {
+        "reason": (reason or "No reason given")[:512],
+        "at": datetime.now(timezone.utc),
+        "by_id": by_id,
+        "by_name": by_name[:512],
+    }
+    doc = coll.find_one_and_update(
+        {"_id": doc_id},
+        {
+            "$push": {"warns": entry},
+            "$set": {"chat_id": chat_id, "user_id": user_id, "display_name": display_name[:512]},
+        },
+        upsert=True,
+        return_document=True,
+    )
+    warns = doc.get("warns", [])
+    return len(warns), warns
+
+
+def get_warnings(chat_id: int, user_id: int) -> tuple[int, list[dict], str]:
+    """(count, entries, stored_display_name)."""
+    coll = _coll("warnings")
+    doc = coll.find_one({"_id": f"{chat_id}:{user_id}"})
+    if not doc:
+        return 0, [], ""
+    warns = doc.get("warns", [])
+    return len(warns), warns, str(doc.get("display_name", ""))
+
+
+def reset_warnings(chat_id: int, user_id: int) -> bool:
+    coll = _coll("warnings")
+    result = coll.delete_one({"_id": f"{chat_id}:{user_id}"})
+    return result.deleted_count > 0
+
+
+def get_blocklist(chat_id: int) -> tuple[list[str], str]:
+    """(sorted words, mode). mode defaults to 'delete' (message removed, sender untouched)."""
+    coll = _coll("blocklist")
+    doc = coll.find_one({"_id": chat_id})
+    if not doc:
+        return [], "delete"
+    return sorted(doc.get("words", [])), str(doc.get("mode", "delete"))
+
+
+def add_blocklist_words(chat_id: int, words: list[str]) -> list[str]:
+    """Adds lowercase, deduped words; returns the ones actually newly added."""
+    coll = _coll("blocklist")
+    existing, _mode = get_blocklist(chat_id)
+    existing_set = set(existing)
+    normalized = {w.strip().lower() for w in words if w.strip()}
+    new_words = sorted(normalized - existing_set)
+    if new_words:
+        coll.update_one(
+            {"_id": chat_id},
+            {
+                "$addToSet": {"words": {"$each": new_words}},
+                "$setOnInsert": {"chat_id": chat_id, "mode": "delete"},
+            },
+            upsert=True,
+        )
+    return new_words
+
+
+def remove_blocklist_words(chat_id: int, words: list[str]) -> list[str]:
+    coll = _coll("blocklist")
+    existing, _mode = get_blocklist(chat_id)
+    existing_set = set(existing)
+    normalized = {w.strip().lower() for w in words if w.strip()}
+    to_remove = sorted(normalized & existing_set)
+    if to_remove:
+        coll.update_one({"_id": chat_id}, {"$pull": {"words": {"$in": to_remove}}})
+    return to_remove
+
+
+def set_blocklist_mode(chat_id: int, mode: str) -> None:
+    coll = _coll("blocklist")
+    coll.update_one(
+        {"_id": chat_id},
+        {"$set": {"mode": mode}, "$setOnInsert": {"chat_id": chat_id, "words": []}},
+        upsert=True,
+    )
+
+
+def find_blocked_word(chat_id: int, text: str) -> str | None:
+    """Case-insensitive substring match; returns the first matching blocklisted word."""
+    words, _mode = get_blocklist(chat_id)
+    if not words:
+        return None
+    lowered = text.lower()
+    for w in words:
+        if w in lowered:
+            return w
+    return None
+
+
+# --- Filters (Rose's /filter: keyword -> canned auto-reply) -----------------
+
+
+def get_filters(chat_id: int) -> dict[str, str]:
+    """{keyword: reply_text}, keywords lowercase."""
+    coll = _coll("filters")
+    doc = coll.find_one({"_id": chat_id})
+    if not doc:
+        return {}
+    return {str(k): str(v) for k, v in (doc.get("filters") or {}).items()}
+
+
+def add_filter(chat_id: int, keyword: str, reply_text: str) -> None:
+    coll = _coll("filters")
+    key = keyword.strip().lower()
+    coll.update_one(
+        {"_id": chat_id},
+        {
+            "$set": {f"filters.{key}": reply_text[:4000], "chat_id": chat_id},
+        },
+        upsert=True,
+    )
+
+
+def remove_filter(chat_id: int, keyword: str) -> bool:
+    coll = _coll("filters")
+    key = keyword.strip().lower()
+    result = coll.update_one({"_id": chat_id}, {"$unset": {f"filters.{key}": ""}})
+    return result.modified_count > 0
+
+
+def find_filter_match(chat_id: int, text: str) -> tuple[str, str] | None:
+    """Case-insensitive substring match against saved keywords; returns (keyword, reply_text)
+    for the first match, or None."""
+    filters_map = get_filters(chat_id)
+    if not filters_map:
+        return None
+    lowered = text.lower()
+    for keyword, reply_text in filters_map.items():
+        if keyword in lowered:
+            return keyword, reply_text
+    return None
