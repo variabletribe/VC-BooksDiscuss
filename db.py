@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timezone
 from typing import Iterable, NamedTuple
 
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 
@@ -117,6 +117,14 @@ class ExportRow(NamedTuple):
     first_vc_at: datetime | None
 
 
+class TopicRow(NamedTuple):
+    """One VC topic. state is 'active' | 'done' | 'deleted'."""
+
+    serial: int
+    text: str
+    state: str
+
+
 # XP: 1 XP per minute in VC. Level thresholds are cumulative XP required.
 LEVEL_THRESHOLDS: list[tuple[int, int]] = [
     (1, 0),
@@ -197,6 +205,8 @@ def init_db() -> None:
     # moderation commands) can resolve a bare @username without Telegram's getChat, which
     # only works for usernames the bot has already been introduced to some other way.
     _db.known_users.create_index([("chat_id", ASCENDING), ("username", ASCENDING)])
+    # topics: VC topic suggestions, permanent serial numbers (see _next_topic_serial).
+    _db.topics.create_index([("chat_id", ASCENDING), ("state", ASCENDING), ("serial", ASCENDING)])
 
 
 def _coll(name: str):
@@ -1544,3 +1554,105 @@ def resolve_username(chat_id: int, username: str) -> tuple[int, str] | None:
     if not doc:
         return None
     return int(doc["user_id"]), str(doc.get("display_name") or f"@{key}")
+
+
+# =============================================================================
+# VC Topic Management (/addtopic, /topics, /deletetopic, /deletedtopics,
+# /topicdone, /alltopics)
+# =============================================================================
+
+
+def _next_topic_serial(chat_id: int) -> int:
+    """Atomically returns the next permanent serial number for this chat's topics.
+    Backed by a dedicated counter document (not "highest existing id + 1", which would
+    race under concurrent /addtopic calls and would also collide once every topic for a
+    chat has been deleted) — findOneAndUpdate with $inc is atomic at the database level,
+    so two people running /addtopic at the same instant can never get the same serial,
+    and a serial is never reused even after its topic is deleted."""
+    coll = _coll("topic_counters")
+    doc = coll.find_one_and_update(
+        {"_id": chat_id},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc["seq"])
+
+
+def add_topic(chat_id: int, text: str, added_by_id: int, added_by_name: str) -> int:
+    """Adds a new active topic with the next permanent serial number; returns that serial."""
+    serial = _next_topic_serial(chat_id)
+    coll = _coll("topics")
+    coll.insert_one(
+        {
+            "_id": f"{chat_id}:{serial}",
+            "chat_id": chat_id,
+            "serial": serial,
+            "text": text[:1000],
+            "state": "active",
+            "added_by_id": added_by_id,
+            "added_by_name": added_by_name[:512],
+            "added_at": datetime.now(timezone.utc),
+        }
+    )
+    return serial
+
+
+def get_topic(chat_id: int, serial: int) -> dict | None:
+    return _coll("topics").find_one({"_id": f"{chat_id}:{serial}"})
+
+
+def get_active_topics(chat_id: int) -> list[TopicRow]:
+    coll = _coll("topics")
+    cursor = coll.find({"chat_id": chat_id, "state": "active"}).sort("serial", ASCENDING)
+    return [TopicRow(int(d["serial"]), str(d["text"]), str(d["state"])) for d in cursor]
+
+
+def get_deleted_topics(chat_id: int) -> list[TopicRow]:
+    coll = _coll("topics")
+    cursor = coll.find({"chat_id": chat_id, "state": "deleted"}).sort("serial", ASCENDING)
+    return [TopicRow(int(d["serial"]), str(d["text"]), str(d["state"])) for d in cursor]
+
+
+def get_all_topics(chat_id: int) -> list[TopicRow]:
+    coll = _coll("topics")
+    cursor = coll.find({"chat_id": chat_id}).sort("serial", ASCENDING)
+    return [TopicRow(int(d["serial"]), str(d["text"]), str(d["state"])) for d in cursor]
+
+
+def mark_topic_done(chat_id: int, serial: int, by_id: int, by_name: str) -> bool:
+    """Only succeeds if the topic exists and is currently active (per spec: '/topicdone
+    marks an Active topic as Done') — returns False for an unknown serial or one that's
+    already done/deleted, so the caller can give an accurate error instead of a silent no-op."""
+    coll = _coll("topics")
+    result = coll.update_one(
+        {"_id": f"{chat_id}:{serial}", "state": "active"},
+        {
+            "$set": {
+                "state": "done",
+                "done_by_id": by_id,
+                "done_by_name": by_name[:512],
+                "done_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.modified_count > 0
+
+
+def delete_topic(chat_id: int, serial: int, by_id: int, by_name: str) -> bool:
+    """Moves a topic (active or done) to deleted. Idempotent-safe: returns False if it's
+    already deleted, rather than silently no-opping. The serial itself is never reused —
+    that's guaranteed by _next_topic_serial, not by anything here."""
+    coll = _coll("topics")
+    result = coll.update_one(
+        {"_id": f"{chat_id}:{serial}", "state": {"$ne": "deleted"}},
+        {
+            "$set": {
+                "state": "deleted",
+                "deleted_by_id": by_id,
+                "deleted_by_name": by_name[:512],
+                "deleted_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return result.modified_count > 0

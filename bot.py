@@ -481,6 +481,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /lock links, /unlock links — auto-delete non-admin messages containing a link\n"
         "• /locks — view locked content types\n\n"
 
+        "<b>🗂️ VC Topics</b>\n"
+        "• /addtopic &lt;topic&gt; — suggest a topic (anyone)\n"
+        "• /topics — active topics (anyone)\n"
+        "• /alltopics — every topic ever added, with status (anyone)\n"
+        "• /deletedtopics — deleted topics (anyone)\n"
+        "• /topicdone &lt;serial&gt; — mark a topic done [admin]\n"
+        "• /deletetopic &lt;serial&gt; — delete a topic [admin]\n\n"
+
         "<b>🔔 Everyone</b>\n"
         "• Writing <code>@admin</code> anywhere in a message pings all current admins\n\n"
 
@@ -1249,7 +1257,8 @@ async def cmd_blocklistmode(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _reply_autodelete(
         update, context,
         f"Blocklist mode set to {new_mode}.\n"
-        f"<i>'delete' just removes the message; the others also warn/mute/kick/ban the sender.</i>",
+        f"<i>'delete' just removes the message; 'warn' also posts a notice (auto-deleted after 30s, "
+        f"not a formal /warn); 'mute'/'kick'/'ban' further punish the sender.</i>",
         parse_mode="HTML",
     )
 
@@ -1293,33 +1302,24 @@ async def on_text_check_blocklist(update: Update, context: ContextTypes.DEFAULT_
     target_label = _user_label(msg.from_user)
 
     if mode == "warn":
-        settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
-        count, _entries = await asyncio.to_thread(
-            dbmod.add_warning,
-            chat.id,
-            target_id,
-            target_label,
-            f"Used a blocklisted word ({matched})",
-            context.bot.id,
-            "Blocklist",
-        )
+        # Just an informational notice — does NOT call dbmod.add_warning, so this never
+        # counts toward /warnlimit or triggers /warnmode's auto-punishment. The notice
+        # itself is cleaned up automatically after 30s so it doesn't clutter the chat.
         safe = html.escape(target_label, quote=False)
-        limit = settings["warn_limit"]
-        text = (
-            f"⚠️ {safe}, your message was deleted — it contained a blocklisted word.\n"
-            f"Please write it again avoiding blocklisted words.\n\n"
-            f"Warning: {count}/{limit}"
-        )
-        if count >= limit:
-            action_text = await _apply_punishment(update, context, target_id, target_label, settings["warn_mode"])
-            await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
-            text += f"\n🚫 Warn limit reached — {action_text}."
-        else:
-            mode_word = {"ban": "banned", "mute": "muted", "kick": "kicked"}.get(
-                settings["warn_mode"], settings["warn_mode"]
+        text = f"⚠️ {safe}, your message was deleted — it contained a blocklisted word."
+        try:
+            notice = await context.bot.send_message(chat.id, text, parse_mode="HTML")
+        except Exception:
+            logger.debug("Blocklist warn notice failed chat_id=%s", chat.id)
+            return
+        jq = context.job_queue
+        if jq is not None:
+            jq.run_once(
+                _delete_messages_later,
+                when=30,
+                data={"chat_id": chat.id, "message_ids": [notice.message_id]},
+                name=f"blocklist-warn-notice-{chat.id}-{notice.message_id}",
             )
-            text += f"\n<i>Reaching {limit}/{limit} warnings will get you automatically {mode_word}.</i>"
-        await context.bot.send_message(chat.id, text, parse_mode="HTML")
         return
 
     action_text = await _apply_punishment(update, context, target_id, target_label, mode)
@@ -1781,6 +1781,190 @@ async def on_text_check_links(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     except Exception:
         logger.debug("Link lock: couldn't send notice chat_id=%s", chat.id)
+
+
+# =============================================================================
+# VC Topic Management: /addtopic, /topics, /deletetopic, /deletedtopics,
+# /topicdone, /alltopics
+#
+# Access model per spec: anyone can add or view topics; only group admins can
+# mark done or delete.
+# =============================================================================
+
+_MAX_TOPIC_ROWS = 100  # safety cap so a chat with hundreds of topics can't blow past
+                        # Telegram's 4096-char message limit (see the /streakboard fix
+                        # earlier in this file for the exact failure mode this avoids)
+
+
+def _raw_command_arg_text(msg) -> str:
+    """Everything after the command token, preserving exact whitespace/newlines —
+    unlike ' '.join(context.args), which collapses runs of spaces and strips them."""
+    text = msg.text or ""
+    parts = text.split(None, 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+async def cmd_addtopic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: /addtopic <topic text> — assigns the next permanent serial number."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    topic_text = _raw_command_arg_text(update.message).strip()
+    if not topic_text:
+        await _reply_autodelete(update, context, "Usage: /addtopic <topic>")
+        return
+    serial = await asyncio.to_thread(
+        dbmod.add_topic, chat.id, topic_text, update.effective_user.id, _user_label(update.effective_user)
+    )
+    safe = html.escape(topic_text, quote=False)
+    await _reply_autodelete(update, context, f"✅ Topic #{serial} added: {safe}", parse_mode="HTML")
+
+
+async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: shows only Active topics."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    rows = await asyncio.to_thread(dbmod.get_active_topics, chat.id)
+    if not rows:
+        await _reply_autodelete(update, context, "No active topics yet.\n\nAdd one with /addtopic <topic>")
+        return
+    shown = rows[:_MAX_TOPIC_ROWS]
+    lines = ["📋 <b>Active Topics</b>", ""]
+    lines.extend(f"{r.serial}. {html.escape(r.text, quote=False)}" for r in shown)
+    if len(rows) > _MAX_TOPIC_ROWS:
+        lines.append("")
+        lines.append(f"<i>+ {len(rows) - _MAX_TOPIC_ROWS} more not shown.</i>")
+    lines.append("")
+    lines.append("<i>Use the number shown with /topicdone or /deletetopic.</i>")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_deletetopic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /deletetopic <serial_number> — moves a topic to Deleted. The serial
+    is never reused (see db._next_topic_serial)."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can delete topics.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, "Usage: /deletetopic <serial_number>")
+        return
+    try:
+        serial = int(context.args[0])
+    except ValueError:
+        await _reply_autodelete(update, context, "Serial number must be a number.")
+        return
+
+    topic = await asyncio.to_thread(dbmod.get_topic, chat.id, serial)
+    if topic is None:
+        await _reply_autodelete(update, context, f"No topic #{serial} found.")
+        return
+    ok = await asyncio.to_thread(
+        dbmod.delete_topic, chat.id, serial, update.effective_user.id, _user_label(update.effective_user)
+    )
+    if not ok:
+        await _reply_autodelete(update, context, f"Topic #{serial} is already deleted.")
+        return
+    safe = html.escape(str(topic.get("text", "")), quote=False)
+    await _reply_autodelete(update, context, f"🗑️ Topic #{serial} deleted: {safe}", parse_mode="HTML")
+
+
+async def cmd_deletedtopics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: shows all deleted topics with their original serial numbers."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    rows = await asyncio.to_thread(dbmod.get_deleted_topics, chat.id)
+    if not rows:
+        await _reply_autodelete(update, context, "No deleted topics.")
+        return
+    shown = rows[:_MAX_TOPIC_ROWS]
+    lines = ["🗑️ <b>Deleted Topics</b>", ""]
+    lines.extend(f"{r.serial}. {html.escape(r.text, quote=False)}" for r in shown)
+    if len(rows) > _MAX_TOPIC_ROWS:
+        lines.append("")
+        lines.append(f"<i>+ {len(rows) - _MAX_TOPIC_ROWS} more not shown.</i>")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_topicdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /topicdone <serial_number> — marks an Active topic Done. Fails
+    cleanly (no state change) if the topic isn't currently active."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can mark topics done.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, "Usage: /topicdone <serial_number>")
+        return
+    try:
+        serial = int(context.args[0])
+    except ValueError:
+        await _reply_autodelete(update, context, "Serial number must be a number.")
+        return
+
+    topic = await asyncio.to_thread(dbmod.get_topic, chat.id, serial)
+    if topic is None:
+        await _reply_autodelete(update, context, f"No topic #{serial} found.")
+        return
+    ok = await asyncio.to_thread(
+        dbmod.mark_topic_done, chat.id, serial, update.effective_user.id, _user_label(update.effective_user)
+    )
+    if not ok:
+        state = topic.get("state")
+        await _reply_autodelete(update, context, f"Topic #{serial} is already {state}, not active.")
+        return
+    safe = html.escape(str(topic.get("text", "")), quote=False)
+    await _reply_autodelete(update, context, f"✅ Topic #{serial} marked done: {safe}", parse_mode="HTML")
+
+
+async def cmd_alltopics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: every topic ever added, sorted by serial. Active = plain, Done = + ✅,
+    Deleted = struck through."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    rows = await asyncio.to_thread(dbmod.get_all_topics, chat.id)
+    if not rows:
+        await _reply_autodelete(update, context, "No topics yet.\n\nAdd one with /addtopic <topic>")
+        return
+    shown = rows[:_MAX_TOPIC_ROWS]
+    lines = ["📚 <b>All Topics</b>", ""]
+    for r in shown:
+        safe = html.escape(r.text, quote=False)
+        if r.state == "done":
+            lines.append(f"{r.serial}. {safe} ✅")
+        elif r.state == "deleted":
+            lines.append(f"<s>{r.serial}. {safe}</s>")
+        else:
+            lines.append(f"{r.serial}. {safe}")
+    if len(rows) > _MAX_TOPIC_ROWS:
+        lines.append("")
+        lines.append(f"<i>+ {len(rows) - _MAX_TOPIC_ROWS} more not shown.</i>")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3027,6 +3211,12 @@ def main() -> None:
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CommandHandler("locks", cmd_locks))
+    app.add_handler(CommandHandler("addtopic", cmd_addtopic))
+    app.add_handler(CommandHandler("topics", cmd_topics))
+    app.add_handler(CommandHandler("deletetopic", cmd_deletetopic))
+    app.add_handler(CommandHandler("deletedtopics", cmd_deletedtopics))
+    app.add_handler(CommandHandler("topicdone", cmd_topicdone))
+    app.add_handler(CommandHandler("alltopics", cmd_alltopics))
     # Auto-enforcement on plain text messages — separate handler groups (1, 2, 5) so all
     # always run alongside command dispatch in the default group (0); PTB only runs the
     # first matching handler *within* a group, not across groups.
