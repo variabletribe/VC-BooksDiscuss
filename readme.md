@@ -1,9 +1,10 @@
 # BooksDiscuss VC Tracker Bot
 
 A Telegram bot for the **@BooksDiscuss** group that tracks who actually shows up to voice/video
-chats, turns attendance into a light gamification layer (XP, levels, streaks, badges), and
-includes a full Rose-style moderation toolkit (warnings, bans, mutes, blocklist, filters) so the
-group doesn't need a second bot for moderation.
+chats, turns attendance into a light gamification layer (XP, levels, streaks, badges), manages
+VC topic suggestions with permanent serial numbers, and includes a full Rose-style moderation
+toolkit (warnings, bans, mutes, blocklist, filters, link-locking, admin paging) so the group
+doesn't need a second bot for moderation.
 
 ---
 
@@ -28,9 +29,11 @@ On top of that raw attendance data, the bot adds:
   as ×N).
 - **AI recaps** — a short, casual natural-language summary of each call via Groq/Llama 3.3.
 - **Reports** — all-time / monthly / weekly leaderboards, posted automatically or on demand.
-- **Moderation** — warnings, bans, mutes (permanent and temporary), a word blocklist, and
-  keyword auto-reply filters — modeled on Rose bot's command set so admins don't need to relearn
-  anything.
+- **VC Topic Management** — members suggest discussion topics; each gets a permanent, never-reused
+  serial number and moves through Active → Done/Deleted states.
+- **Moderation** — warnings, bans, mutes (permanent and temporary), a word blocklist, keyword
+  auto-reply filters (text or any media type), link-locking, and one-tap admin paging — modeled
+  on Rose bot's command set so admins don't need to relearn anything.
 - **Admin tooling** — CSV data export, per-user lookup, an admin DM relay/broadcast system.
 
 ---
@@ -40,9 +43,9 @@ On top of that raw attendance data, the bot adds:
 | Layer | Choice | Why |
 |---|---|---|
 | Language | Python 3.14 | |
-| Bot framework | [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) v21+ | Async, `Application`/`JobQueue` for scheduled reports, webhook *and* polling support |
+| Bot framework | [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) v21+ | Async, `Application`/`JobQueue` for scheduled reports and auto-deleting notices, webhook *and* polling support |
 | Live VC tracking | [Telethon](https://github.com/LonamiWebs/Telethon) (MTProto, user account) | Only a real user account can see a group call's live participant list — the Bot API can't |
-| Database | MongoDB Atlas via `pymongo` | Flexible schema for evolving stats/badges/mod data; aggregation pipelines for leaderboards |
+| Database | MongoDB Atlas via `pymongo` | Flexible schema for evolving stats/badges/mod/topic data; aggregation pipelines for leaderboards; atomic `findOneAndUpdate` counters for permanent topic serial numbers |
 | AI recap | [Groq](https://groq.com) API, `llama-3.3-70b-versatile` | Fast, free-tier-friendly inference for a short post-call summary |
 | HTTP | `httpx` | Async HTTP for Groq calls and a raw Bot API fallback path (works even if PTB's polling hits a `Conflict`) |
 | Hosting | [Render](https://render.com) (Web Service) | Webhook mode on the free/paid web tier; a small `http.server` stub keeps the port-scan happy in polling mode; a keep-alive thread fights free-tier idle spin-down |
@@ -52,15 +55,16 @@ On top of that raw attendance data, the bot adds:
 
 ```
 bot.py         Main process. Registers all /commands, handles Telegram webhook/polling,
-               posts VC-end summaries, schedules monthly/weekly reports, runs the
-               moderation + blocklist + filter logic.
+               posts VC-end summaries, schedules monthly/weekly reports, and runs the
+               moderation, blocklist, filter, link-lock, admin-tag, and topic logic.
 
 assistant.py   Background thread (Telethon). Polls each tracked group's live call state
                every ~2s, builds accurate per-user join/leave times, and calls into
                bot.py's posting/badge/AI-recap logic when a call ends.
 
 db.py          All MongoDB access: VC sessions, attendance/XP/streaks/badges, warnings,
-               blocklist, filters, admin-relay mappings, chat settings.
+               blocklist, filters, VC topics, known-user (username) memory, admin-relay
+               mappings, chat settings.
 
 state.py       In-memory state shared between bot.py and assistant.py within the same
                process: which groups are configured, live "hint" data from Bot API
@@ -111,69 +115,114 @@ python session_login.py        # one-time: generates TELEGRAM_SESSION_STRING
 python bot.py
 ```
 
+### Bot permissions
+
+For moderation, blocklist, link-locking, and filters to actually work, the bot must be a group
+**admin** with, at minimum: **Delete messages**, **Ban users**, and **Restrict members**. Without
+these, affected commands reply with an error explaining what to check rather than failing
+silently.
+
 ---
 
 ## Commands
 
-### Stats & reports
+Run `/start` in the group any time for this same command list, formatted for in-app reading.
 
-| Command | Purpose |
-|---|---|
-| `/vcreport` | All-time leaderboard: VCs joined + total hours, per user |
-| `/attendance` | Present-day leaderboard (people who crossed the attendance threshold) |
-| `/monthreport` | Previous calendar month's leaderboard |
-| `/weekly` | Last 7 days: top hours + streak leaders |
+Every command below (except `/exportdata` and `/user`) is used **inside the group**. "Anyone"
+means any group member; "Admin" means the group's own Telegram admin/owner status — the bot
+checks this live against Telegram, it's not a separate permission list. Anonymous admins
+("send as group") are recognized correctly too.
 
-### Personal progress
+### Stats & reports — anyone
 
-| Command | Purpose |
-|---|---|
-| `/mystats` | Your full profile — attendance, VCs, hours, join dates, streak, XP, level |
-| `/level` | Your XP and level |
-| `/xpleaderboard` | Top 10 XP earners in the group |
-| `/streak` | Your current and longest attendance streak |
-| `/badges` | Your earned badges |
+| Command | Usage | Purpose |
+|---|---|---|
+| `/vcreport` | `/vcreport` | All-time leaderboard: VCs joined + total hours, per user |
+| `/attendance` | `/attendance` | Present-day leaderboard (people who crossed the attendance threshold) |
+| `/monthreport` | `/monthreport` | Previous calendar month's leaderboard |
+| `/weekly` | `/weekly` | Last 7 days: top hours + streak leaders |
+| `/vcstatus` | `/vcstatus` | This group's chat id + whether the assistant is actively tracking it |
 
-### Utility
+### Personal progress — anyone
 
-| Command | Purpose |
-|---|---|
-| `/vcstatus` | This group's chat id + whether the assistant is actively tracking it |
+| Command | Usage | Purpose |
+|---|---|---|
+| `/mystats` | `/mystats` | Your full profile — attendance, VCs, hours, join dates, streak, XP, level |
+| `/level` | `/level` | Your XP and level |
+| `/xpleaderboard` | `/xpleaderboard` | Top 10 XP earners in the group |
+| `/streak` | `/streak` | Your current and longest attendance streak |
+| `/badges` | `/badges` | Your earned badges |
 
-### Moderation — everyone can use
+### VC Topic Management
+
+Every topic gets a permanent serial number, assigned atomically so it's never duplicated or
+reused — even after the topic is deleted.
+
+| Command | Usage | Access | Purpose |
+|---|---|---|---|
+| `/addtopic` | `/addtopic <topic text>` | Anyone | Suggests a topic; bot replies with its serial, e.g. `✅ Topic #7 added: ...` |
+| `/topics` | `/topics` | Anyone | Lists only **Active** topics, numbered by their real serial so you can act on them directly |
+| `/alltopics` | `/alltopics` | Anyone | Every topic ever added, sorted by serial — Active shown plain, Done shown with ✅, Deleted shown struck through |
+| `/deletedtopics` | `/deletedtopics` | Anyone | Lists deleted topics with their original serials |
+| `/topicdone` | `/topicdone <serial>` | **Admin** | Marks an Active topic Done; fails cleanly if it's not currently active |
+| `/deletetopic` | `/deletetopic <serial>` | **Admin** | Moves a topic to Deleted; the serial is never reused |
+
+### Moderation — view/check commands (admin only)
 
 | Command | Usage | Purpose |
 |---|---|---|
 | `/warns` | `/warns [reply / user_id / @username]` | Check a user's warnings; defaults to your own if no target given |
 | `/blocklist` | `/blocklist` | View the current blocklisted words and mode |
 | `/filters` | `/filters` | List saved filter keywords |
+| `/warnlimit` | `/warnlimit [n]` | View or set warns-before-punishment (default **3**) |
+| `/warnmode` | `/warnmode [ban / mute / kick]` | View or set what happens at the warn limit (default **kick**) |
+| `/blocklistmode` | `/blocklistmode [delete / warn / mute / kick / ban]` | View or set what happens when a blocklisted word is posted |
+| `/locks` | `/locks` | View which content types are currently locked |
 
-### Moderation — admins only
+### Moderation — actions (admin only)
+
+Targets can be given as a **reply** to their message, or as their **user id** / **@username**.
+`@username` resolution uses the bot's own memory (built passively from messages it's seen in the
+group — see *Known limitations*), falling back to Telegram's own lookup.
 
 | Command | Usage | Purpose |
 |---|---|---|
-| `/warn` | `/warn [reply / id / @user] [reason]` | Add a warning; auto-applies the configured punishment once the limit is hit, then resets the count |
-| `/resetwarn` | `/resetwarn [reply / id / @user]` | Clear a user's warnings |
-| `/warnlimit` | `/warnlimit [n]` | View or set warns-before-punishment (default 3). Viewing needs no admin rights; setting does |
-| `/warnmode` | `/warnmode [ban / mute / kick]` | View or set what happens at the warn limit (default `ban`) |
-| `/ban` | `/ban [reply / id / @user] [reason]` | Permanent ban |
-| `/tban` | `/tban [reply / id / @user] <time> [reason]` | Temporary ban — `<time>` is `30m`, `2h`, `1d`, `1w`. Enforced natively by Telegram (`until_date`), so it survives bot restarts |
-| `/unban` | `/unban [id / @user]` | Lift a ban early |
-| `/kick` | `/kick [reply / id / @user] [reason]` | Remove from the group (they can rejoin — this is ban+immediate-unban) |
-| `/mute` | `/mute [reply / id / @user] [reason]` | Restrict indefinitely |
-| `/tmute` | `/tmute [reply / id / @user] <time> [reason]` | Temporary mute, same `<time>` syntax as `/tban`, also enforced natively by Telegram |
-| `/unmute` | `/unmute [id / @user]` | Lift a mute early, restoring the group's normal permissions |
+| `/warn` | `/warn [target] [reason]` | Add a warning. At the limit (default 3), auto-applies the configured punishment (default **kick**) and resets the count. Every warning reply shows what happens if the limit is reached |
+| `/resetwarn` | `/resetwarn [target]` | Clear a user's warnings |
+| `/ban` | `/ban [target] [reason]` | Permanent ban |
+| `/tban` | `/tban [target] <time> [reason]` | Temporary ban — `<time>` is `30m`, `2h`, `1d`, `1w`. Enforced natively by Telegram (`until_date`), so it survives bot restarts |
+| `/unban` | `/unban [target]` | Lift a ban early |
+| `/kick` | `/kick [target] [reason]` | Remove from the group (they can rejoin — this is ban+immediate-unban) |
+| `/mute` | `/mute [target] [reason]` | Restrict indefinitely |
+| `/tmute` | `/tmute [target] <time> [reason]` | Temporary mute, same `<time>` syntax as `/tban`, also enforced natively by Telegram |
+| `/unmute` | `/unmute [target]` | Lift a mute early, restoring the group's normal permissions |
 | `/addblocklist` | `/addblocklist word1 word2 ...` | Add words to the blocklist |
 | `/unblocklist` | `/unblocklist word1 word2 ...` | Remove words from the blocklist |
-| `/blocklistmode` | `/blocklistmode [delete / warn / mute / kick / ban]` | What happens when a blocklisted word is posted — the message is always deleted; this sets what (if anything) also happens to the sender |
-| `/filter` | `/filter <keyword> <reply text>` | Save an auto-reply: whenever `<keyword>` appears in a message, the bot replies with the saved text |
+| `/filter` | `/filter <keyword> <reply text>` | Save an auto-reply — formatting (bold/italic/spacing/newlines) is preserved exactly as typed |
+| `/filter` | reply to any message + `/filter <keyword>` | Saves that message verbatim — works for photos, videos, stickers, documents, GIFs, voice notes, and audio, not just text |
 | `/stop` | `/stop <keyword>` | Remove a saved filter |
+| `/lock` | `/lock links` | Auto-delete any non-admin message containing a link, from then on |
+| `/unlock` | `/unlock links` | Turn that back off |
 
 All moderation actions refuse to target group owners/admins (including anonymous admins posting
 as the group), so a mis-set blocklist word or a mistaken command can never lock the mods out of
 their own group.
 
-### Admin only (VC-stats management)
+#### How `/blocklistmode` options behave
+
+- **`delete`** — message removed, nothing else happens.
+- **`warn`** — message removed, plus a plain notice ("... your message was deleted — it
+  contained a blocklisted word.") that auto-deletes itself after 30 seconds. This does **not**
+  count as a formal `/warn` — it doesn't touch the warning system or count toward `/warnlimit`.
+- **`mute` / `kick` / `ban`** — message removed and the sender is immediately punished.
+
+### Everyone — passive features
+
+| Trigger | Purpose |
+|---|---|
+| Writing `@admin` anywhere in a message | Pings every current group admin with a clickable mention (works even for admins without a public username). Rate-limited to once per 60 seconds per group. |
+
+### Admin only (VC-stats & bot management)
 
 | Command | Usage | Purpose |
 |---|---|---|
@@ -188,7 +237,19 @@ their own group.
 
 `/exportdata` and `/user` are restricted to a private chat with the bot and to user ids listed in
 `ADMIN_USER_IDS` — they're cross-group admin tools, not group-scoped commands, so they don't fit
-the per-group admin model the rest of the moderation commands use.
+the per-group admin model the rest of the moderation commands use. Being a group admin in
+Telegram does **not** unlock these two; being listed in `ADMIN_USER_IDS` does.
+
+---
+
+## Adding another admin
+
+- **For group moderation commands** (`/warn`, `/ban`, `/lock`, `/topicdone`, etc.): make them an
+  admin of the Telegram group itself (Group Info → Administrators → Add Admin). No bot config or
+  redeploy needed — it takes effect immediately.
+- **For `/message`, `/broadcast`, `/exportdata`, `/user`**: add their numeric Telegram user id to
+  `ADMIN_USER_IDS` on Render and redeploy. Being a Telegram group admin alone does not grant
+  these.
 
 ---
 
@@ -204,6 +265,8 @@ These are not triggered by a `/command` — they fire on their own:
   activity that week.
 - **DM relay** — any private message to the bot is copied into `ADMIN_RELAY_CHAT_ID`; an admin's
   reply to that copy is delivered back to the original sender.
+- **Blocklist / link-lock notices** — short warning/notice messages posted when enforcement
+  triggers; these self-delete after 15–30 seconds so they don't clutter the chat.
 
 ---
 
@@ -219,3 +282,10 @@ These are not triggered by a `/command` — they fire on their own:
   unavailable or misses a short call.
 - The AI recap depends on Groq's API being reachable; it's skipped silently (not an error) if the
   request fails or `GROQ_API_KEY` isn't set.
+- `@username` resolution for moderation commands relies on the bot having seen at least one
+  message from that person since this feature was deployed (Telegram doesn't let bots look up
+  arbitrary group members by username on demand). Until then, reply to their message instead of
+  typing `@username`.
+- List commands (`/streakboard`, `/topics`, `/alltopics`, `/deletedtopics`, etc.) cap out at a
+  bounded number of rows and show "+N more not shown" beyond that, to stay under Telegram's
+  4096-character message limit in very large or very active groups.
