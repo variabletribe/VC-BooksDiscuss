@@ -1946,116 +1946,6 @@ async def cmd_locks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply_autodelete(update, context, text)
 
 
-# --- Timer -------------------------------------------------------------------
-#
-# Simple one-shot reminder timer, one per chat at a time. In-memory only (like the
-# captcha/flood trackers above) — a 20-minute-max timer surviving a redeploy isn't
-# worth persisting for; worst case is a lost timer, not a stuck or duplicated one.
-
-_MAX_TIMER_MINUTES = 20
-_TIMER_ARG_RE = re.compile(r"^(\d+)m$", re.IGNORECASE)
-_active_timers: dict[int, dict] = {}  # chat_id -> {job_name, end_mono, by_label, started_at}
-
-
-async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: /timer <N>m — minutes only, max 20m, one timer per chat at a time. A
-    second /timer while one is already running is rejected (with the remaining time
-    shown) rather than silently replacing it."""
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-
-    existing = _active_timers.get(chat.id)
-    if existing is not None:
-        remaining = max(0, int(existing["end_mono"] - time.monotonic()))
-        rm, rs = divmod(remaining, 60)
-        await _reply_autodelete(
-            update, context,
-            f"A timer is already running — {rm}m {rs}s left (started by {existing['by_label']}). "
-            f"Use /canceltimer to stop it early.",
-        )
-        return
-
-    if not context.args:
-        await _reply_autodelete(
-            update, context, f"Usage: /timer <N>m — minutes only, max {_MAX_TIMER_MINUTES}m. Example: /timer 5m"
-        )
-        return
-    m = _TIMER_ARG_RE.match(context.args[0].strip())
-    if not m:
-        await _reply_autodelete(update, context, "Usage: /timer <N>m — minutes only, e.g. /timer 5m")
-        return
-    minutes = int(m.group(1))
-    if minutes < 1 or minutes > _MAX_TIMER_MINUTES:
-        await _reply_autodelete(update, context, f"Timer must be between 1m and {_MAX_TIMER_MINUTES}m.")
-        return
-
-    jq = context.job_queue
-    if jq is None:
-        await _reply_autodelete(update, context, "Timers aren't available right now.")
-        return
-
-    started_at = datetime.now(timezone.utc)
-    by_label = _user_label(update.effective_user)
-    job_name = f"timer-{chat.id}-{uuid.uuid4().hex[:8]}"
-    jq.run_once(
-        _timer_fire,
-        when=minutes * 60,
-        data={"chat_id": chat.id, "minutes": minutes, "started_at": started_at, "by_label": by_label},
-        name=job_name,
-    )
-    _active_timers[chat.id] = {
-        "job_name": job_name,
-        "end_mono": time.monotonic() + minutes * 60,
-        "by_label": by_label,
-        "started_at": started_at,
-    }
-    safe = html.escape(by_label, quote=False)
-    await _reply_autodelete(update, context, f"⏱️ Timer set for {minutes}m by {safe}.", parse_mode="HTML")
-
-
-async def _timer_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """job_queue callback: announces the timer is up and frees the chat's single-timer slot."""
-    data = context.job.data or {}
-    chat_id = data.get("chat_id")
-    minutes = data.get("minutes")
-    started_at = data.get("started_at")
-    _active_timers.pop(chat_id, None)
-    now = datetime.now(timezone.utc)
-    start_str = started_at.strftime("%H:%M UTC") if started_at else "?"
-    end_str = now.strftime("%H:%M UTC")
-    minute_word = "minute" if minutes == 1 else "minutes"
-    text = f"⏰ {minutes} {minute_word} are up! ({start_str} → {end_str})"
-    try:
-        await context.bot.send_message(chat_id, text)
-    except Exception:
-        logger.exception("Timer fire failed chat_id=%s", chat_id)
-
-
-async def cmd_canceltimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: /canceltimer — stops the running timer early. Not explicitly requested,
-    but added so a mistaken /timer doesn't block the single-timer slot for up to 20
-    minutes with no way out."""
-    if not update.message or not update.effective_chat:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    existing = _active_timers.pop(chat.id, None)
-    if existing is None:
-        await _reply_autodelete(update, context, "No timer is running.")
-        return
-    jq = context.job_queue
-    if jq is not None:
-        for job in jq.get_jobs_by_name(existing["job_name"]):
-            job.schedule_removal()
-    await _reply_autodelete(update, context, "Timer cancelled.")
-
-
 _MODLOG_ACTION_LABELS = {
     "ban": "🚫 Ban", "tban": "🚫 Temp ban", "unban": "✅ Unban",
     "kick": "👢 Kick", "mute": "🔇 Mute", "tmute": "🔇 Temp mute", "unmute": "🔊 Unmute",
@@ -4080,8 +3970,6 @@ def main() -> None:
     app.add_handler(CommandHandler("captcha", cmd_captcha))
     app.add_handler(CommandHandler("setflood", cmd_setflood))
     app.add_handler(CommandHandler("floodmode", cmd_floodmode))
-    app.add_handler(CommandHandler("timer", cmd_timer))
-    app.add_handler(CommandHandler("canceltimer", cmd_canceltimer))
     app.add_handler(CommandHandler("timer", cmd_timer))
     app.add_handler(CommandHandler("canceltimer", cmd_canceltimer))
     # Inline-button callbacks: generic confirm/cancel (ban, removeuser, broadcast) and

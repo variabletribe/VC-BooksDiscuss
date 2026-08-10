@@ -1857,20 +1857,28 @@ def find_active_topic_by_text(chat_id: int, text: str) -> TopicRow | None:
 
 def upvote_topic(chat_id: int, serial: int, voter_id: int) -> tuple[bool, int]:
     """Returns (was_new_vote, new_vote_count). Idempotent per voter — each user can only
-    upvote a given topic once; a repeat call just reports the current count unchanged."""
+    upvote a given topic once. This is a single atomic find_one_and_update (filter
+    requires voter_id NOT already in voter_ids) rather than a separate check-then-update
+    — a plain "read voter_ids, then update" would leave a race window where two
+    near-simultaneous calls from the same user (e.g. a rapid double-tap) could both pass
+    the check before either write lands: $addToSet would still only add the id once, but
+    $inc would fire twice, inflating the vote count for a single real vote."""
     coll = _coll("topics")
     doc_id = f"{chat_id}:{serial}"
+    updated = coll.find_one_and_update(
+        {"_id": doc_id, "state": "active", "voter_ids": {"$ne": voter_id}},
+        {"$push": {"voter_ids": voter_id}, "$inc": {"votes": 1}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is not None:
+        return True, int(updated.get("votes", 0))
+
+    # No document matched: either the topic doesn't exist/isn't active, or this voter
+    # already voted. Read-only lookup just to report an accurate current count.
     doc = coll.find_one({"_id": doc_id})
     if doc is None or doc.get("state") != "active":
         return False, 0
-    if voter_id in (doc.get("voter_ids") or []):
-        return False, int(doc.get("votes", 0))
-    updated = coll.find_one_and_update(
-        {"_id": doc_id},
-        {"$addToSet": {"voter_ids": voter_id}, "$inc": {"votes": 1}},
-        return_document=ReturnDocument.AFTER,
-    )
-    return True, int(updated.get("votes", 0))
+    return False, int(doc.get("votes", 0))
 
 
 def award_engagement_xp(chat_id: int, user_id: int, display_name: str, amount: int) -> None:
