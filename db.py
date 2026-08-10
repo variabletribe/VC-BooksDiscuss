@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 from datetime import datetime, timezone
 from typing import Iterable, NamedTuple
 
@@ -123,6 +124,7 @@ class TopicRow(NamedTuple):
     serial: int
     text: str
     state: str
+    votes: int = 0
 
 
 # XP: 1 XP per minute in VC. Level thresholds are cumulative XP required.
@@ -1010,6 +1012,38 @@ def format_level_message(info: LevelInfo) -> str:
     return f"🎖️ <b>{safe}</b> — Level {info.level}\n<i>{progress}</i>"
 
 
+def preview_remove_user(chat_id: int, user_id: int) -> RemoveUserResult:
+    """Read-only counterpart to remove_user_from_chat — same name lookup and same counts,
+    but deletes nothing. Used to show a confirmation preview before the real deletion."""
+    sessions_coll = _coll("vc_sessions")
+    attendance_coll = _coll("user_attendance")
+
+    name = None
+    latest = sessions_coll.find(
+        {"chat_id": chat_id, "participants.user_id": user_id},
+        {"participants.$": 1, "ended_at": 1},
+    ).sort("ended_at", DESCENDING).limit(1)
+    latest = list(latest)
+    if latest:
+        parts = latest[0].get("participants", [])
+        if parts:
+            name = parts[0].get("display_name")
+    if name is None:
+        att = attendance_coll.find_one({"_id": f"{chat_id}:{user_id}"})
+        if att is not None:
+            name = att.get("display_name")
+
+    vc_count = sessions_coll.count_documents({"chat_id": chat_id, "participants.user_id": user_id})
+    att_count = attendance_coll.count_documents({"_id": f"{chat_id}:{user_id}"})
+
+    return RemoveUserResult(
+        user_id=user_id,
+        display_name=str(name) if name else None,
+        vc_rows_deleted=int(vc_count),
+        attendance_rows_deleted=int(att_count),
+    )
+
+
 def remove_user_from_chat(chat_id: int, user_id: int) -> RemoveUserResult:
     """Delete all VC participant entries and attendance for one user in this group."""
     sessions_coll = _coll("vc_sessions")
@@ -1459,13 +1493,18 @@ def set_blocklist_mode(chat_id: int, mode: str) -> None:
 
 
 def find_blocked_word(chat_id: int, text: str) -> str | None:
-    """Case-insensitive substring match; returns the first matching blocklisted word."""
+    """Case-insensitive EXACT WORD match — a blocklisted word only matches when it
+    appears as a whole word (bounded by non-word characters or start/end of text), not
+    as a substring of a longer word. E.g. blocklisting "bc" must NOT match "bcz" or
+    "abcd". Uses explicit (?<!\\w)...(?!\\w) lookaround rather than \\b so multi-word
+    blocklist phrases (e.g. "bad word") still match correctly across their internal
+    space."""
     words, _mode = get_blocklist(chat_id)
     if not words:
         return None
     lowered = text.lower()
     for w in words:
-        if w in lowered:
+        if re.search(rf"(?<!\w){re.escape(w)}(?!\w)", lowered):
             return w
     return None
 
@@ -1593,6 +1632,8 @@ def add_topic(chat_id: int, text: str, added_by_id: int, added_by_name: str) -> 
             "added_by_id": added_by_id,
             "added_by_name": added_by_name[:512],
             "added_at": datetime.now(timezone.utc),
+            "votes": 0,
+            "voter_ids": [],
         }
     )
     return serial
@@ -1603,21 +1644,32 @@ def get_topic(chat_id: int, serial: int) -> dict | None:
 
 
 def get_active_topics(chat_id: int) -> list[TopicRow]:
+    """Sorted by votes (highest first), then serial ascending as a tiebreak — so the
+    topic the group most wants to discuss next surfaces at the top of /topics."""
     coll = _coll("topics")
-    cursor = coll.find({"chat_id": chat_id, "state": "active"}).sort("serial", ASCENDING)
-    return [TopicRow(int(d["serial"]), str(d["text"]), str(d["state"])) for d in cursor]
+    cursor = coll.find({"chat_id": chat_id, "state": "active"}).sort(
+        [("votes", DESCENDING), ("serial", ASCENDING)]
+    )
+    return [
+        TopicRow(int(d["serial"]), str(d["text"]), str(d["state"]), int(d.get("votes", 0))) for d in cursor
+    ]
 
 
 def get_deleted_topics(chat_id: int) -> list[TopicRow]:
     coll = _coll("topics")
     cursor = coll.find({"chat_id": chat_id, "state": "deleted"}).sort("serial", ASCENDING)
-    return [TopicRow(int(d["serial"]), str(d["text"]), str(d["state"])) for d in cursor]
+    return [
+        TopicRow(int(d["serial"]), str(d["text"]), str(d["state"]), int(d.get("votes", 0))) for d in cursor
+    ]
 
 
 def get_all_topics(chat_id: int) -> list[TopicRow]:
+    """Sorted by serial (chronological record), unlike get_active_topics which sorts by votes."""
     coll = _coll("topics")
     cursor = coll.find({"chat_id": chat_id}).sort("serial", ASCENDING)
-    return [TopicRow(int(d["serial"]), str(d["text"]), str(d["state"])) for d in cursor]
+    return [
+        TopicRow(int(d["serial"]), str(d["text"]), str(d["state"]), int(d.get("votes", 0))) for d in cursor
+    ]
 
 
 def mark_topic_done(chat_id: int, serial: int, by_id: int, by_name: str) -> bool:
@@ -1656,3 +1708,182 @@ def delete_topic(chat_id: int, serial: int, by_id: int, by_name: str) -> bool:
         },
     )
     return result.modified_count > 0
+
+
+# =============================================================================
+# Health check
+# =============================================================================
+
+
+def ping() -> bool:
+    """True if the MongoDB connection is alive and responding."""
+    if _client is None:
+        return False
+    try:
+        _client.admin.command("ping")
+        return True
+    except Exception:
+        return False
+
+
+# =============================================================================
+# Moderation audit log (/modlog)
+# =============================================================================
+
+
+class ModLogEntry(NamedTuple):
+    action: str
+    target_id: int
+    target_name: str
+    by_id: int
+    by_name: str
+    reason: str
+    at: datetime
+
+
+def log_mod_action(
+    chat_id: int,
+    action: str,
+    target_id: int,
+    target_name: str,
+    by_id: int,
+    by_name: str,
+    reason: str = "",
+) -> None:
+    """Records one moderation action (ban/tban/unban/kick/mute/tmute/unmute/warn/resetwarn/
+    auto-punishment) so /modlog can answer "who did what, to whom, when, why" — Telegram's
+    own admin log isn't easily searchable and isn't visible to the bot at all."""
+    coll = _coll("mod_log")
+    coll.insert_one(
+        {
+            "chat_id": chat_id,
+            "action": action,
+            "target_id": target_id,
+            "target_name": (target_name or "")[:512],
+            "by_id": by_id,
+            "by_name": (by_name or "")[:512],
+            "reason": (reason or "")[:512],
+            "at": datetime.now(timezone.utc),
+        }
+    )
+
+
+def fetch_mod_log(chat_id: int, limit: int = 20) -> list[ModLogEntry]:
+    coll = _coll("mod_log")
+    cursor = coll.find({"chat_id": chat_id}).sort("at", DESCENDING).limit(limit)
+    return [
+        ModLogEntry(
+            action=str(d["action"]),
+            target_id=int(d["target_id"]),
+            target_name=str(d.get("target_name", "")),
+            by_id=int(d["by_id"]),
+            by_name=str(d.get("by_name", "")),
+            reason=str(d.get("reason", "")),
+            at=d["at"],
+        )
+        for d in cursor
+    ]
+
+
+# =============================================================================
+# Anti-spam settings: captcha (new-member verification) + flood control
+# =============================================================================
+
+
+def get_antispam_settings(chat_id: int) -> dict:
+    """captcha_enabled / flood_limit / flood_window_seconds / flood_mode for this chat.
+    flood_limit=0 means flood control is off (the default — opt-in, since it can be
+    disruptive if set too aggressively for a chatty group)."""
+    coll = _coll("chat_settings")
+    doc = coll.find_one({"_id": chat_id}) or {}
+    return {
+        "captcha_enabled": bool(doc.get("captcha_enabled", False)),
+        "flood_limit": int(doc.get("flood_limit", 0)),
+        "flood_window_seconds": int(doc.get("flood_window_seconds", 10)),
+        "flood_mode": str(doc.get("flood_mode", "mute")),
+    }
+
+
+def set_captcha_enabled(chat_id: int, enabled: bool) -> None:
+    coll = _coll("chat_settings")
+    coll.update_one(
+        {"_id": chat_id},
+        {"$set": {"captcha_enabled": enabled}, "$setOnInsert": {"monthly_reports": True}},
+        upsert=True,
+    )
+
+
+def set_flood_limit(chat_id: int, limit: int, window_seconds: int) -> None:
+    coll = _coll("chat_settings")
+    coll.update_one(
+        {"_id": chat_id},
+        {
+            "$set": {"flood_limit": limit, "flood_window_seconds": window_seconds},
+            "$setOnInsert": {"monthly_reports": True},
+        },
+        upsert=True,
+    )
+
+
+def set_flood_mode(chat_id: int, mode: str) -> None:
+    coll = _coll("chat_settings")
+    coll.update_one(
+        {"_id": chat_id},
+        {"$set": {"flood_mode": mode}, "$setOnInsert": {"monthly_reports": True}},
+        upsert=True,
+    )
+
+
+# =============================================================================
+# Topic duplicate detection + upvoting
+# =============================================================================
+
+
+def find_active_topic_by_text(chat_id: int, text: str) -> TopicRow | None:
+    """Case-insensitive, whitespace-normalized exact match against ACTIVE topics only —
+    used to block duplicate /addtopic submissions. Deliberately simple exact matching
+    rather than fuzzy/similarity matching, which would be fragile and surprising
+    (e.g. rejecting genuinely different topics that merely share a few words)."""
+    normalized = " ".join(text.strip().lower().split())
+    if not normalized:
+        return None
+    coll = _coll("topics")
+    for d in coll.find({"chat_id": chat_id, "state": "active"}):
+        existing_norm = " ".join(str(d["text"]).strip().lower().split())
+        if existing_norm == normalized:
+            return TopicRow(int(d["serial"]), str(d["text"]), str(d["state"]), int(d.get("votes", 0)))
+    return None
+
+
+def upvote_topic(chat_id: int, serial: int, voter_id: int) -> tuple[bool, int]:
+    """Returns (was_new_vote, new_vote_count). Idempotent per voter — each user can only
+    upvote a given topic once; a repeat call just reports the current count unchanged."""
+    coll = _coll("topics")
+    doc_id = f"{chat_id}:{serial}"
+    doc = coll.find_one({"_id": doc_id})
+    if doc is None or doc.get("state") != "active":
+        return False, 0
+    if voter_id in (doc.get("voter_ids") or []):
+        return False, int(doc.get("votes", 0))
+    updated = coll.find_one_and_update(
+        {"_id": doc_id},
+        {"$addToSet": {"voter_ids": voter_id}, "$inc": {"votes": 1}},
+        return_document=ReturnDocument.AFTER,
+    )
+    return True, int(updated.get("votes", 0))
+
+
+def award_engagement_xp(chat_id: int, user_id: int, display_name: str, amount: int) -> None:
+    """Small XP grant for non-VC engagement (e.g. upvoting a topic). Feeds into the same
+    user_attendance.xp field VC time does, so it shows up in /level, /mystats, and
+    /xpleaderboard without a separate XP system."""
+    coll = _coll("user_attendance")
+    coll.update_one(
+        {"_id": f"{chat_id}:{user_id}"},
+        {
+            "$inc": {"xp": amount},
+            "$set": {"chat_id": chat_id, "user_id": user_id, "display_name": display_name[:512]},
+            "$setOnInsert": {"present_days": 0, "current_streak": 0, "longest_streak": 0, "badges": {}},
+        },
+        upsert=True,
+    )
