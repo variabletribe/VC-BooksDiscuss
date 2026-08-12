@@ -438,82 +438,210 @@ async def _reply_autodelete(
     return sent
 
 
+# =============================================================================
+# Interactive /start menu: category buttons -> command buttons -> per-command detail.
+# Replaces one giant wall of text with a tappable menu, since the old /start had grown
+# to 50+ commands worth of text in a single message.
+#
+# HELP_COMMANDS[key] = (category_key, usage, description, access_note)
+# Kept as the single source of truth — the README's command tables are generated
+# from (a copy of) this same data, so the two can't drift apart silently.
+# =============================================================================
+
+HELP_CATEGORIES: dict[str, str] = {
+    "stats": "📊 Stats & Progress",
+    "topics": "🗂️ VC Topics",
+    "mod": "🛡️ Moderation",
+    "everyone": "🔔 Everyone",
+    "groupadmin": "🛠️ Group Admin Tools",
+    "botadmin": "👑 Bot Owner Tools",
+}
+
+HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
+    # --- Stats & Progress (anyone) ---
+    "vcreport": ("stats", "/vcreport", "All-time leaderboard: VCs joined and total hours, per user.", "Anyone"),
+    "attendance": ("stats", "/attendance", "Present-day leaderboard — people who crossed the attendance threshold.", "Anyone"),
+    "monthreport": ("stats", "/monthreport", "Previous calendar month's leaderboard.", "Anyone"),
+    "weekly": ("stats", "/weekly", "Last 7 days: top hours and streak leaders.", "Anyone"),
+    "vcstatus": ("stats", "/vcstatus", "This group's chat id, and whether the Telethon assistant is actively tracking it.", "Anyone"),
+    "mystats": ("stats", "/mystats", "Your full profile: attendance, VCs, hours, join dates, streak, XP, level.", "Anyone"),
+    "level": ("stats", "/level", "Your XP and level.", "Anyone"),
+    "xpleaderboard": ("stats", "/xpleaderboard", "Top 10 XP earners in the group.", "Anyone"),
+    "streak": ("stats", "/streak", "Your current and longest attendance streak.", "Anyone"),
+    "badges": ("stats", "/badges", "Your earned badges.", "Anyone"),
+
+    # --- VC Topics ---
+    "addtopic": ("topics", "/addtopic <topic text>", "Suggest a discussion topic. Gets a permanent serial number that's never reused, even after deletion.", "Anyone"),
+    "topics": ("topics", "/topics", "Active topics only, ranked by votes (see /upvote) so the group's real priority shows.", "Anyone"),
+    "alltopics": ("topics", "/alltopics", "Every topic ever added, sorted by serial. Done shows ✅, deleted shows struck through.", "Anyone"),
+    "deletedtopics": ("topics", "/deletedtopics", "Deleted topics, with their original serial numbers.", "Anyone"),
+    "upvote": ("topics", "/upvote <serial>", "Support an active topic so it ranks higher in /topics. One vote per person per topic; +2 XP the first time.", "Anyone"),
+    "topicdone": ("topics", "/topicdone <serial>", "Mark an active topic as Done.", "Group admin"),
+    "deletetopic": ("topics", "/deletetopic <serial>", "Delete a topic. The serial number is never reused for a future topic.", "Group admin"),
+
+    # --- Moderation ---
+    "warn": ("mod", "/warn [reply / id / @user] [reason]", "Warn a user. At the warn limit (default 3), auto-applies the configured punishment (default: kick) and resets the count.", "Group admin"),
+    "warns": ("mod", "/warns [reply / id / @user]", "Check a user's warnings — defaults to your own if no target is given.", "Group admin"),
+    "resetwarn": ("mod", "/resetwarn [reply / id / @user]", "Clear a user's warnings back to zero.", "Group admin"),
+    "warnlimit": ("mod", "/warnlimit [n]", "View, or set, how many warnings trigger auto-punishment (default 3).", "Group admin"),
+    "warnmode": ("mod", "/warnmode [ban/mute/kick]", "View, or set, what happens at the warn limit (default kick).", "Group admin"),
+    "ban": ("mod", "/ban [reply / id / @user] [reason]", "Permanently ban a user. Shows a confirm/cancel button first — nothing happens until you tap Confirm.", "Group admin"),
+    "tban": ("mod", "/tban [reply / id / @user] <time> [reason]", "Temporary ban — time as 30m, 2h, 1d, or 1w. Telegram itself lifts it automatically, even across a bot restart.", "Group admin"),
+    "unban": ("mod", "/unban [id / @user]", "Lift a ban early.", "Group admin"),
+    "kick": ("mod", "/kick [reply / id / @user] [reason]", "Remove someone from the group — they CAN rejoin (this is a ban immediately followed by an unban).", "Group admin"),
+    "mute": ("mod", "/mute [reply / id / @user] [reason]", "Restrict a user from sending anything, indefinitely.", "Group admin"),
+    "tmute": ("mod", "/tmute [reply / id / @user] <time> [reason]", "Temporary mute — same time syntax as /tban, also enforced natively by Telegram.", "Group admin"),
+    "unmute": ("mod", "/unmute [reply / id / @user]", "Lift a mute early, restoring the group's normal permissions.", "Group admin"),
+    "blocklist": ("mod", "/blocklist", "View the current blocklisted words and the action mode.", "Group admin"),
+    "addblocklist": ("mod", "/addblocklist word1 word2 ...", "Add one or more words to the blocklist.", "Group admin"),
+    "unblocklist": ("mod", "/unblocklist word1 word2 ...", "Remove words from the blocklist.", "Group admin"),
+    "blocklistmode": ("mod", "/blocklistmode [delete/warn/mute/kick/ban]", "View, or set, what happens when someone posts a blocklisted word. The message is always deleted; this controls what (if anything) also happens to the sender.", "Group admin"),
+    "filter": ("mod", "/filter <keyword> <reply text>  —  or reply to any message with /filter <keyword>", "Save an auto-reply for a keyword. Typed text keeps its exact formatting; replying to a message saves it verbatim (photo, video, sticker, document, etc.).", "Group admin"),
+    "filters": ("mod", "/filters", "List every saved filter keyword.", "Group admin"),
+    "stop": ("mod", "/stop <keyword>", "Remove a saved filter.", "Group admin"),
+    "lock": ("mod", "/lock links", "From now on, delete any non-admin message containing a link.", "Group admin"),
+    "unlock": ("mod", "/unlock links", "Turn link-locking back off.", "Group admin"),
+    "locks": ("mod", "/locks", "View which content types are currently locked.", "Group admin"),
+    "captcha": ("mod", "/captcha on|off", "New-member verification: joiners are muted and must tap a button within 5 minutes, or they're auto-kicked (and can rejoin to retry).", "Anyone can view; group admin to change"),
+    "setflood": ("mod", "/setflood <count> [window_seconds]  or  /setflood off", "Auto-punish anyone posting too many messages too fast. Off by default.", "Anyone can view; group admin to change"),
+    "floodmode": ("mod", "/floodmode [mute/kick/ban]", "What happens when flood control triggers.", "Anyone can view; group admin to change"),
+    "modlog": ("mod", "/modlog [count]", "The last moderation actions in this group: who did what, to whom, when, and why.", "Group admin"),
+
+    # --- Everyone (no admin needed at all) ---
+    "timer": ("everyone", "/timer <N>m", "One-shot reminder timer — minutes only, max 20m, one running per group at a time.", "Anyone"),
+    "canceltimer": ("everyone", "/canceltimer", "Cancel the currently running timer early.", "Anyone"),
+
+    # --- Group Admin Tools (Telegram group admin/owner status) ---
+    "streakboard": ("groupadmin", "/streakboard", "Every member's current and best attendance streak, ranked.", "Group admin"),
+    "reports": ("groupadmin", "/reports on|off", "Toggle the automatic monthly report for this group.", "Group admin"),
+    "removeuser": ("groupadmin", "/removeuser USER_ID", "Wipe a user's VC stats and attendance. Shows a preview and asks for confirmation first.", "Group admin"),
+    "finduser": ("groupadmin", "/finduser NAME", "Look up a user's numeric id by name or an old @username.", "Group admin"),
+
+    # --- Bot Owner Tools (ADMIN_USER_IDS — cross-group, not tied to any one group) ---
+    "message": ("botadmin", "/message ID [ID2 ID3 ...] text  —  or reply to any message with /message ID [ID2 ...]", "DM one or more users directly by numeric id. Reply to any message (text, photo, audio, video, etc.) to copy it verbatim instead of typing text.", "Bot admin"),
+    "broadcast": ("botadmin", "/broadcast text  (or reply to a message with /broadcast)", "Message everyone who has ever joined a tracked VC. Shows the audience size and asks for confirmation before sending.", "Bot admin"),
+    "exportdata": ("botadmin", "/exportdata [chat_id]", "CSV of every user who's joined a VC — hours, present days, streaks, XP, level, join dates. Works only in a DM with the bot.", "Bot admin, DM only"),
+    "user": ("botadmin", "/user USER_ID [chat_id]", "Full stats for any one user by id, without needing them to run /mystats themselves. DM only.", "Bot admin, DM only"),
+    "health": ("botadmin", "/health", "Checks MongoDB, the Telegram Bot API, the Telethon assistant, and Groq — catches a silent failure before it's noticed the hard way. DM only.", "Bot admin, DM only"),
+}
+
+
+def _help_main_menu_text() -> str:
+    return (
+        "🎙️ <b>BooksDiscuss VC Tracker Bot</b>\n\n"
+        "Tracks VC attendance, XP &amp; levels, VC topic suggestions, and full "
+        "group moderation — all in one bot.\n\n"
+        "Tap a category below, then tap any command to see exactly what it does "
+        "and how to use it."
+    )
+
+
+def _help_main_menu_keyboard() -> InlineKeyboardMarkup:
+    items = list(HELP_CATEGORIES.items())
+    rows = [
+        [InlineKeyboardButton(items[i][1], callback_data=f"menu:cat:{items[i][0]}")]
+        + ([InlineKeyboardButton(items[i + 1][1], callback_data=f"menu:cat:{items[i + 1][0]}")] if i + 1 < len(items) else [])
+        for i in range(0, len(items), 2)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _help_category_text(cat_key: str) -> str:
+    label = HELP_CATEGORIES.get(cat_key, cat_key)
+    return f"{label}\n\nTap a command to see what it does and how to use it."
+
+
+def _help_category_keyboard(cat_key: str) -> InlineKeyboardMarkup:
+    cmd_keys = [k for k, v in HELP_COMMANDS.items() if v[0] == cat_key]
+    rows = []
+    for i in range(0, len(cmd_keys), 2):
+        row = [InlineKeyboardButton(f"/{cmd_keys[i]}", callback_data=f"menu:cmd:{cmd_keys[i]}")]
+        if i + 1 < len(cmd_keys):
+            row.append(InlineKeyboardButton(f"/{cmd_keys[i + 1]}", callback_data=f"menu:cmd:{cmd_keys[i + 1]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 Back to categories", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _help_command_text(cmd_key: str) -> str | None:
+    entry = HELP_COMMANDS.get(cmd_key)
+    if entry is None:
+        return None
+    _cat_key, usage, desc, access = entry
+    return (
+        f"<b>/{cmd_key}</b>\n\n"
+        f"{html.escape(desc, quote=False)}\n\n"
+        f"<b>Usage:</b> <code>{html.escape(usage, quote=False)}</code>\n"
+        f"<b>Who can use it:</b> {html.escape(access, quote=False)}"
+    )
+
+
+def _help_command_keyboard(cmd_key: str) -> InlineKeyboardMarkup:
+    cat_key = HELP_COMMANDS[cmd_key][0]
+    cat_label = HELP_CATEGORIES.get(cat_key, cat_key)
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"🔙 Back to {cat_label}", callback_data=f"menu:cat:{cat_key}")],
+            [InlineKeyboardButton("🏠 Main menu", callback_data="menu:main")],
+        ]
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows the tappable category menu. Deliberately NOT sent through
+    _reply_autodelete — this is meant to be browsed, not auto-cleaned after 30s
+    like a normal command response."""
     if not update.message:
         return
-    await _reply_autodelete(
-        update,
-        context,
-        "🎙️ <b>BooksDiscuss VC Tracker Bot</b>\n"
-
-        "📊 <b>What I track</b>\n"
-        "VCs joined, total hours in calls, and present attendance "
-        "(20+ min in a call = +1 present day).\n"
-        "After every VC ends, I post the call summary, present attendance, "
-        "and an AI recap, automatically.\n\n"
-
-        "📅 <b>Tracking started: 3 August 2026</b>\n"
-        "<i>All stats below are counted from this date onward.</i>\n\n"
-
-        "<b>📈 Stats &amp; Reports</b>\n"
-        "• /vcreport — all-time stats: VCs joined and total hours\n"
-        "• /attendance — present-day leaderboard for this group\n"
-        "• /monthreport — previous month's participant stats\n"
-        "• /weekly — this week's digest (top hours + streaks)\n\n"
-
-        "<b>🎮 Your Progress</b>\n"
-        "• /mystats — your full profile: attendance, VCs, hours, join dates, streak, XP, level\n"
-        "• /level — your XP and level\n"
-        "• /xpleaderboard — top XP earners in this group\n"
-        "• /streak — your current and longest VC streak\n"
-        "• /badges — your earned badges\n\n"
-
-        "<b>🔧 Utility</b>\n"
-        "• /vcstatus — this group's chat id + whether tracking is active\n\n"
-
-        "<b>🛡️ Moderation (admin only)</b>\n"
-        "• /warn — warn a user (reply, or give id/@username)\n"
-        "• /warns — check a user's warnings (defaults to yourself)\n"
-        "• /resetwarn — clear a user's warnings\n"
-        "• /warnlimit [n] — view/set warns before auto-punishment (default 3)\n"
-        "• /warnmode [ban/mute/kick] — view/set what happens at the limit (default kick)\n"
-        "• /ban, /kick, /mute — reply or give id/@username, optional reason\n"
-        "• /tban, /tmute — same, plus a time: 30m, 2h, 1d, 1w\n"
-        "• /unban, /unmute — lift a ban/mute early\n"
-        "• /blocklist — view blocklisted words\n"
-        "• /addblocklist, /unblocklist — edit the word list\n"
-        "• /blocklistmode [delete/warn/mute/kick/ban] — view/set the action\n"
-        "• /filter &lt;word&gt; &lt;reply&gt; — bot auto-replies when the word appears, formatting preserved exactly\n"
-        "• /filter &lt;word&gt; (as a reply) — saves the replied message verbatim (photo/video/sticker/etc.)\n"
-        "• /filters — list saved filter keywords\n"
-        "• /stop &lt;word&gt; — remove a filter\n"
-        "• /lock links, /unlock links — auto-delete non-admin messages containing a link\n"
-        "• /locks — view locked content types\n\n"
-
-        "<b>🗂️ VC Topics</b>\n"
-        "• /addtopic &lt;topic&gt; — suggest a topic (anyone)\n"
-        "• /topics — active topics (anyone)\n"
-        "• /alltopics — every topic ever added, with status (anyone)\n"
-        "• /deletedtopics — deleted topics (anyone)\n"
-        "• /topicdone &lt;serial&gt; — mark a topic done [admin]\n"
-        "• /deletetopic &lt;serial&gt; — delete a topic [admin]\n\n"
-
-        "<b>🔔 Everyone</b>\n"
-        "• Writing <code>@admin</code> anywhere in a message pings all current admins\n\n"
-
-        "<b>🛠️ Admin only</b>\n"
-        "• /streakboard — everyone's current + best streak, ranked\n"
-        "• /reports on|off — toggle automatic monthly report (posted on the 1st, UTC)\n"
-        "• /removeuser USER_ID — remove a user from VC stats and attendance\n"
-        "• /finduser NAME — find a user's id by name or old @username\n"
-        "• /message USER_ID text — DM any known user directly\n"
-        "• /broadcast text — message everyone who has joined a VC\n"
-        "• /exportdata [chat_id] — CSV of every VC participant (DM only)\n"
-        "• /user USER_ID [chat_id] — full stats for one user (DM only)\n\n"
-
-        "<i>This bot belongd to→ @BooksDiscuss </i>",
-        parse_mode="HTML",
+    await update.message.reply_text(
+        _help_main_menu_text(), parse_mode="HTML", reply_markup=_help_main_menu_keyboard()
     )
+
+
+async def on_help_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles every menu:... callback from the /start button tree."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    _prefix, _, rest = query.data.partition(":")
+    action, _, key = rest.partition(":")
+
+    if action == "main":
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                _help_main_menu_text(), parse_mode="HTML", reply_markup=_help_main_menu_keyboard()
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "cat" and key in HELP_CATEGORIES:
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                _help_category_text(key), parse_mode="HTML", reply_markup=_help_category_keyboard(key)
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "cmd":
+        text = _help_command_text(key)
+        if text is None:
+            await query.answer("That command's details couldn't be found.", show_alert=True)
+            return
+        await query.answer()
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=_help_command_keyboard(key))
+        except Exception:
+            pass
+        return
+
+    await query.answer()
+
+
+
 
 
 async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -2998,30 +3126,84 @@ async def on_admin_relay_reply(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cmd_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only: /message USER_ID text — DM anyone by Telegram user id directly."""
-    if not update.message or not update.effective_user:
+    """Admin-only. Two forms, both supporting multiple recipient ids:
+    - /message ID [ID2 ID3 ...] text here  — sends the given text to each id.
+    - Reply to any message (text, photo, audio, video, sticker, document, etc.) with
+      /message ID [ID2 ID3 ...]  — copies that message verbatim to each id.
+
+    Recipient ids are parsed as consecutive numeric tokens at the start of the args:
+    in the reply form every arg must be a numeric id; in the text form, leading numeric
+    tokens are ids and everything after the first non-numeric token is the message text.
+    This means a text message that is itself entirely digits can't be sent this way —
+    use the reply form instead for that edge case."""
+    if not update.message or not update.effective_user or not update.effective_chat:
         return
     if not _is_admin_user(update.effective_user.id):
         await _reply_autodelete(update, context, "Admins only.")
         return
-    if not context.args or len(context.args) < 2:
-        await _reply_autodelete(update, context, "Usage: /message USER_ID your text here")
-        return
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await _reply_autodelete(update, context, "USER_ID must be a number.")
-        return
 
-    text = " ".join(context.args[1:])
-    try:
-        await context.bot.send_message(target_id, text)
-        await _reply_autodelete(update, context, "✅ Sent.")
-    except Exception:
-        logger.exception("cmd_message failed target=%s", target_id)
-        await _reply_autodelete(
-            update, context, "❌ Failed to send — user may have blocked the bot or never messaged it before."
+    args = context.args or []
+    reply = update.message.reply_to_message
+
+    if reply is not None:
+        if not args:
+            await _reply_autodelete(
+                update, context, "Usage (replying to a message): /message ID [ID2 ID3 ...]"
+            )
+            return
+        ids_raw = args
+        text = None
+    else:
+        i = 0
+        while i < len(args) and args[i].lstrip("-").isdigit():
+            i += 1
+        if i == 0 or i >= len(args):
+            await _reply_autodelete(
+                update, context,
+                "Usage: /message ID [ID2 ID3 ...] your text here\n"
+                "Or reply to any message (text, photo, audio, video, etc.) with "
+                "/message ID [ID2 ID3 ...]",
+            )
+            return
+        ids_raw = args[:i]
+        text = " ".join(args[i:])
+
+    target_ids: list[int] = []
+    for raw in ids_raw:
+        try:
+            target_ids.append(int(raw))
+        except ValueError:
+            await _reply_autodelete(update, context, f"Invalid user id: {html.escape(raw, quote=False)}")
+            return
+
+    sent, failed = 0, 0
+    for target_id in target_ids:
+        try:
+            if reply is not None:
+                await context.bot.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=update.effective_chat.id,
+                    message_id=reply.message_id,
+                )
+            else:
+                await context.bot.send_message(target_id, text)
+            sent += 1
+        except Exception:
+            logger.exception("cmd_message failed target=%s", target_id)
+            failed += 1
+
+    if len(target_ids) == 1:
+        text_result = (
+            "✅ Sent."
+            if failed == 0
+            else "❌ Failed to send — user may have blocked the bot or never messaged it before."
         )
+        await _reply_autodelete(update, context, text_result)
+    else:
+        summary = f"📨 Sent to {sent}/{len(target_ids)} user(s)."
+        if failed:
+            summary += f" {failed} failed (blocked the bot, or never messaged it before)."
+        await _reply_autodelete(update, context, summary)
 
 
 def _broadcast_target_chat_id() -> int | None:
@@ -3976,6 +4158,7 @@ def main() -> None:
     # new-member captcha verification. Matched by callback_data prefix via `pattern`.
     app.add_handler(CallbackQueryHandler(on_confirmation_callback, pattern=r"^(confirm|cancel):"))
     app.add_handler(CallbackQueryHandler(on_captcha_callback, pattern=r"^captcha:"))
+    app.add_handler(CallbackQueryHandler(on_help_menu_callback, pattern=r"^menu:"))
     # Auto-enforcement on plain text messages — separate handler groups (1, 2, 4, 5, 6) so
     # all always run alongside command dispatch in the default group (0); PTB only runs
     # the first matching handler *within* a group, not across groups.
