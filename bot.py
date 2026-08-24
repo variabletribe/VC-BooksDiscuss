@@ -264,7 +264,7 @@ def _start_http_on_port_for_render() -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(b"ok")
+            self.write(b"ok")
 
     def _run():
         HTTPServer(("0.0.0.0", port), _Handler).serve_forever()
@@ -510,6 +510,7 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     # --- Everyone (no admin needed at all) ---
     "timer": ("everyone", "/timer <N>m", "One-shot reminder timer — minutes only, max 20m, one running per group at a time.", "Anyone"),
     "canceltimer": ("everyone", "/canceltimer", "Cancel the currently running timer early.", "Anyone"),
+    "mywarns": ("everyone", "/mywarns", "See your own full warning history — active and cleared, with dates and reasons.", "Anyone"),
 
     # --- Group Admin Tools (Telegram group admin/owner status) ---
     "streakboard": ("groupadmin", "/streakboard", "Every member's current and best attendance streak, ranked.", "Group admin"),
@@ -641,9 +642,6 @@ async def on_help_menu_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
 
-
-
-
 async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_chat:
         return False
@@ -665,6 +663,30 @@ async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         return False
     return m.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+
+
+async def _message_sender_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True if the actual sender of update.message is a real group owner/admin — covers
+    both a normal admin's own account AND an admin posting anonymously ("send as group",
+    where update.effective_user/msg.from_user is Telegram's GroupAnonymousBot placeholder,
+    not the real admin). Passive message-scanner handlers (link-lock today; blocklist/flood
+    can adopt this too) must use this instead of a raw get_chat_member lookup on
+    msg.from_user.id — that placeholder id is not itself a member with admin rights, so a
+    naive lookup treats a real admin's anonymous post as an ordinary member's and lets
+    enforcement fire on it."""
+    msg = update.message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return False
+    if msg.sender_chat and msg.sender_chat.id == chat.id:
+        return True
+    if not msg.from_user:
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, msg.from_user.id)
+    except Exception:
+        return False
+    return member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 
 
 # =============================================================================
@@ -1989,7 +2011,11 @@ async def on_text_admin_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     mentions = []
     for a in admins:
         u = a.user
-        if u.is_bot:
+        # Skip real bots AND the GroupAnonymousBot placeholder explicitly (belt-and-braces
+        # alongside is_bot — this placeholder represents "an admin posting anonymously",
+        # not a person, so it must never be pinged even if a client library ever reports
+        # its is_bot flag inconsistently).
+        if u.is_bot or u.id == app_state.GROUP_ANONYMOUS_BOT_ID:
             continue
         label = html.escape(u.first_name or "Admin", quote=False)
         mentions.append(f'<a href="tg://user?id={u.id}">{label}</a>')
@@ -2144,12 +2170,8 @@ async def on_text_check_links(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not has_link:
         return
 
-    try:
-        member = await context.bot.get_chat_member(chat.id, msg.from_user.id)
-        if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
-            return
-    except Exception:
-        pass
+    if await _message_sender_is_admin(update, context):
+        return
 
     try:
         await msg.delete()
@@ -3362,11 +3384,42 @@ async def cmd_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     stats = await asyncio.to_thread(dbmod.get_my_stats, chat_id, user_id)
+    history, stored_name = await asyncio.to_thread(dbmod.get_warning_history, chat_id, user_id)
+    label = stored_name or stats.display_name or str(user_id)
+
     text = (
         dbmod.format_my_stats_message(stats)
         + f"\n\n<code>user_id: {user_id}</code>\n<code>chat_id: {chat_id}</code>"
     )
+    if history:
+        text += "\n\n" + dbmod.format_warning_history_html(label, history)
+
     await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def cmd_mywarns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: /mywarns — your own full warning history in this group, including warnings
+    cleared by a past /resetwarn (shown, but marked "Cleared" rather than counted). Unlike
+    /warns (admin-only, active count toward the warn limit), this is always scoped to the
+    caller's own record and always shows the complete history, active and cleared alike."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+
+    user = update.effective_user
+    history, stored_name = await asyncio.to_thread(dbmod.get_warning_history, chat.id, user.id)
+    label = stored_name or _user_label(user)
+
+    note = ""
+    if len(history) > 30:
+        history = history[-30:]
+        note = f"\n<i>Showing the 30 most recent.</i>"
+
+    text = dbmod.format_warning_history_html(label, history) + note
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4116,6 +4169,7 @@ def main() -> None:
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("exportdata", cmd_exportdata))
     app.add_handler(CommandHandler("user", cmd_user))
+    app.add_handler(CommandHandler("mywarns", cmd_mywarns))
 
     # --- Moderation (Rose-style names) ---
     app.add_handler(CommandHandler("warn", cmd_warn))
