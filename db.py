@@ -1428,21 +1428,86 @@ def add_warning(
     return len(warns), warns
 
 
+# -------------------- Warning history with watermark -------------------------
+
 def get_warnings(chat_id: int, user_id: int) -> tuple[int, list[dict], str]:
-    """(count, entries, stored_display_name)."""
+    """(active_count, active_entries, stored_display_name). "Active" means issued after
+    the last /resetwarn watermark (see reset_warnings) — this is what /warnlimit and
+    /warns compare against, unchanged from before."""
     coll = _coll("warnings")
     doc = coll.find_one({"_id": f"{chat_id}:{user_id}"})
     if not doc:
         return 0, [], ""
+    cleared_before = doc.get("cleared_before")
     warns = doc.get("warns", [])
-    return len(warns), warns, str(doc.get("display_name", ""))
+    active = [w for w in warns if not cleared_before or w["at"] > cleared_before]
+    return len(active), active, str(doc.get("display_name", ""))
 
 
 def reset_warnings(chat_id: int, user_id: int) -> bool:
-    coll = _coll("warnings")
-    result = coll.delete_one({"_id": f"{chat_id}:{user_id}"})
-    return result.deleted_count > 0
+    """Clears a user's ACTIVE warning count back to zero WITHOUT deleting their warning
+    history. Every warning ever issued (reason, date, who by) stays queryable forever via
+    get_warning_history, for /mywarns and the bot-owner /user lookup.
 
+    Implemented by advancing a 'cleared_before' watermark on the document rather than
+    deleting the warns array: a warning counts as active only if it was issued after the
+    watermark. Nothing is ever removed from `warns`, so /resetwarn is now purely a
+    "start a fresh count" action, not a destructive one.
+
+    Returns True if there was at least one active warning to clear (matches the old
+    delete-based return semantics: False means "nothing to do")."""
+    coll = _coll("warnings")
+    doc_id = f"{chat_id}:{user_id}"
+    doc = coll.find_one({"_id": doc_id})
+    if not doc:
+        return False
+    cleared_before = doc.get("cleared_before")
+    warns = doc.get("warns", [])
+    active = [w for w in warns if not cleared_before or w["at"] > cleared_before]
+    if not active:
+        return False
+    coll.update_one({"_id": doc_id}, {"$set": {"cleared_before": datetime.now(timezone.utc)}})
+    return True
+
+
+def get_warning_history(chat_id: int, user_id: int) -> tuple[list[dict], str]:
+    """Every warning ever issued to this user in this chat — including ones cleared by a
+    past /resetwarn — each annotated with an 'active' bool. Oldest first. Backs /mywarns
+    and the bot-owner /user lookup; unlike get_warnings, this never hides cleared warnings."""
+    coll = _coll("warnings")
+    doc = coll.find_one({"_id": f"{chat_id}:{user_id}"})
+    if not doc:
+        return [], ""
+    cleared_before = doc.get("cleared_before")
+    warns = doc.get("warns", [])
+    out = [{**w, "active": (not cleared_before or w["at"] > cleared_before)} for w in warns]
+    return out, str(doc.get("display_name", ""))
+
+
+def format_warning_history_html(label: str, history: list[dict]) -> str:
+    """Shared renderer for /mywarns and /user: full warning history with date, reason,
+    and whether each entry is still active or was cleared by a later /resetwarn."""
+    safe_label = html.escape(label, quote=False)
+    if not history:
+        return f"✅ {safe_label} has no warning history."
+    active_count = sum(1 for w in history if w.get("active"))
+    lines = [
+        f"⚠️ <b>Warning history — {safe_label}</b>",
+        f"<i>{active_count} active / {len(history)} total</i>",
+        "",
+    ]
+    for i, w in enumerate(history, start=1):
+        at = w.get("at")
+        when = at.strftime("%d %b %Y %H:%M UTC") if isinstance(at, datetime) else "?"
+        reason = html.escape(w.get("reason") or "No reason given", quote=False)
+        by = html.escape(w.get("by_name") or "", quote=False)
+        status = "🟡 Active" if w.get("active") else "⚪ Cleared"
+        lines.append(f"{i}. {status} — {when}")
+        lines.append(f"   Reason: {reason}" + (f" (by {by})" if by else ""))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 
 def get_blocklist(chat_id: int) -> tuple[list[str], str]:
     """(sorted words, mode). mode defaults to 'delete' (message removed, sender untouched)."""
