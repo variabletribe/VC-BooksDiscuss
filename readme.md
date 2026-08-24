@@ -35,8 +35,8 @@ On top of that raw attendance data, the bot adds:
 - **Moderation** — warnings, bans, mutes (permanent and temporary), a word blocklist, keyword
   auto-reply filters (text or any media type), link-locking, new-member captcha verification,
   flood control, a searchable moderation log, and one-tap admin paging.
-- **Admin tooling** — CSV data export, per-user lookup, a live health check, and an admin DM
-  relay/broadcast system.
+- **Admin tooling** — CSV data export, per-user lookup with full warning history, a live health check, and an admin DM relay/broadcast system.
+- **Warning History** — **permanent, never-deleted** warning records. `/resetwarn` only clears the *active* count; old warnings remain viewable via `/mywarns` (users) and `/user` (bot admins).
 
 ---
 
@@ -125,8 +125,7 @@ Telegram does **not** unlock these; being listed in `ADMIN_USER_IDS` does.
 
 ### 3. Anyone (no admin status needed)
 
-Stats, personal progress, VC topic browsing/adding/voting, and the timer are open to every group
-member — see the tables below for exactly which.
+Stats, personal progress, VC topic browsing/adding/voting, and the timer are open to every group member. Users can also see their **own full warning history** with `/mywarns` — active and cleared warnings, with dates, reasons, and who issued them.
 
 ---
 
@@ -233,8 +232,9 @@ group, since Telegram doesn't let bots look up arbitrary members by username on 
 | Command | Usage | Description | Who can use it |
 |---|---|---|---|
 | `/warn` | `/warn [reply / id / @user] [reason]` | Warn a user. At the warn limit (default 3), auto-applies the configured punishment (default: kick) and resets the count. | Group admin |
-| `/warns` | `/warns [reply / id / @user]` | Check a user's warnings — defaults to your own if no target is given. | Group admin |
-| `/resetwarn` | `/resetwarn [reply / id / @user]` | Clear a user's warnings back to zero. | Group admin |
+| `/warns` | `/warns [reply / id / @user]` | Check a user's **active** warnings (counts toward the limit). Defaults to your own if no target is given. | Group admin |
+| `/resetwarn` | `/resetwarn [reply / id / @user]` | Clear a user's **active** warnings back to zero. **Warning history is never deleted** – cleared warnings are marked as "Cleared" and remain visible via `/mywarns` and `/user`. | Group admin |
+| `/mywarns` | `/mywarns` | See your **own full warning history** – active and cleared, with dates, reasons, and who issued them. | Anyone |
 | `/warnlimit` | `/warnlimit [n]` | View, or set, how many warnings trigger auto-punishment (default 3). | Group admin |
 | `/warnmode` | `/warnmode [ban/mute/kick]` | View, or set, what happens at the warn limit (default kick). | Group admin |
 | `/ban` | `/ban [reply / id / @user] [reason]` | Permanently ban a user. Shows a confirm/cancel button first — nothing happens until you tap Confirm. | Group admin |
@@ -251,8 +251,7 @@ group, since Telegram doesn't let bots look up arbitrary members by username on 
 | `/filter` | `/filter <keyword> <reply text>` — or reply to any message with `/filter <keyword>` | Save an auto-reply for a keyword. Typed text keeps its exact formatting; replying to a message saves it verbatim (photo, video, sticker, document, etc.). | Group admin |
 | `/filters` | `/filters` | List every saved filter keyword. | Group admin |
 | `/stop` | `/stop <keyword>` | Remove a saved filter. | Group admin |
-| `/lock` | `/lock links` | From now on, delete any non-admin message containing a link. | Group admin |
-| `/unlock` | `/unlock links` | Turn link-locking back off. | Group admin |
+| `/lock` | `/lock links` | From now on, delete any non-admin message containing a link. **Now correctly detects anonymous admins.** | Group admin || `/unlock` | `/unlock links` | Turn link-locking back off. | Group admin |
 | `/locks` | `/locks` | View which content types are currently locked. | Group admin |
 | `/captcha` | `/captcha on\|off` | New-member verification: joiners are muted and must tap a button within 5 minutes, or they're auto-kicked (and can rejoin to retry). | Anyone can view; group admin to change |
 | `/setflood` | `/setflood <count> [window_seconds]` or `/setflood off` | Auto-punish anyone posting too many messages too fast. Off by default. | Anyone can view; group admin to change |
@@ -271,10 +270,9 @@ Blocklist mode behavior specifically:
 |---|---|---|---|
 | `/timer` | `/timer <N>m` | One-shot reminder timer — minutes only, max 20m, one running per group at a time. | Anyone |
 | `/canceltimer` | `/canceltimer` | Cancel the currently running timer early. | Anyone |
+| `/mywarns` | `/mywarns` | See your own full warning history – active and cleared, with dates and reasons. | Anyone |
 
-Also: writing **`@admin`** anywhere in a group message pings every current admin with a
-clickable mention (works even for admins without a public username). Rate-limited to once per
-60 seconds per group.
+Also: writing **`@admin`** anywhere in a group message pings every current admin with a clickable mention (works even for admins without a public username). The anonymous admin placeholder is never pinged. Rate-limited to once per 60 seconds per group.
 
 ### 🛠️ Group Admin Tools
 
@@ -295,7 +293,7 @@ These are the only commands gated by `ADMIN_USER_IDS` rather than group admin st
 | `/message` | `/message USER_ID text` | DM any known user directly, by their numeric id. | Bot admin |
 | `/broadcast` | `/broadcast text` (or reply to a message with `/broadcast`) | Message everyone who has ever joined a tracked VC. Shows the audience size and asks for confirmation before sending. | Bot admin |
 | `/exportdata` | `/exportdata [chat_id]` | CSV of every user who's joined a VC — hours, present days, streaks, XP, level, join dates. | Bot admin, DM only |
-| `/user` | `/user USER_ID [chat_id]` | Full stats for any one user by id, without needing them to run `/mystats` themselves. | Bot admin, DM only |
+| `/user` | `/user USER_ID [chat_id]` | Full stats for any one user by id, **including full warning history** (active + cleared). DM only. | Bot admin, DM only |
 | `/health` | `/health` | Checks MongoDB, the Telegram Bot API, the Telethon assistant, and Groq — catches a silent failure before it's noticed the hard way. | Bot admin, DM only |
 
 ---
@@ -340,3 +338,19 @@ These are not triggered by a `/command` — they fire on their own:
   in memory, not the database — they expire after a short window (2 minutes for confirmations)
   or reset on a bot restart. This is an intentional tradeoff: these are short-lived by nature, so
   persisting them isn't worth the overhead.
+
+  ## Recent changes
+
+### 🔐 Permanent Warning History
+- Warnings are **never deleted** – `/resetwarn` now only marks warnings as "Cleared" instead of deleting them.
+- Every warning ever issued (reason, date, who by) stays queryable forever.
+- Users can see their **full history** (active + cleared) with `/mywarns`.
+- Bot owners can see any user's full history via `/user`.
+
+### 🛡️ Anonymous Admin Detection
+- Link-lock and `@admin` tagging now correctly detect admins posting anonymously ("Send as group").
+- Anonymous admin messages are **not** deleted by link-lock.
+- The `GroupAnonymousBot` placeholder is never pinged in `@admin` tags.
+
+### 🐛 Bug Fixes
+- **`/resetwarn` truly resets** – after a reset, warnings accumulate from zero again, and the user won't be prematurely banned.
