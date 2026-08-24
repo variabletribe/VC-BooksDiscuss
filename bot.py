@@ -1084,7 +1084,9 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     settings = await asyncio.to_thread(dbmod.get_chat_mod_settings, chat.id)
-    count, _entries = await asyncio.to_thread(
+
+    # Always add the warning first (this increments the total history)
+    await asyncio.to_thread(
         dbmod.add_warning,
         chat.id,
         target_id,
@@ -1094,30 +1096,44 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _user_label(update.effective_user),
     )
 
+    # Now get the ACTIVE warning count (after the watermark)
+    active_count, active_entries, stored_name = await asyncio.to_thread(
+        dbmod.get_warnings, chat.id, target_id
+    )
+    # Use active_count for the limit check
+    limit = settings["warn_limit"]
+
     safe_target = html.escape(target_label, quote=False)
     safe_reason = html.escape(reason, quote=False) if reason else "No reason given"
-    limit = settings["warn_limit"]
-    lines = [f"⚠️ Warned {safe_target} ({count}/{limit})", f"Reason: {safe_reason}"]
 
-    if count >= limit:
+    if active_count >= limit:
         action_text = await _apply_punishment(
             update, context, target_id, target_label, settings["warn_mode"],
             by_id=update.effective_user.id,
             by_name=_user_label(update.effective_user),
             reason="warn limit reached",
         )
+        # Reset the active warnings (sets the watermark to now)
         await asyncio.to_thread(dbmod.reset_warnings, chat.id, target_id)
-        lines.append("")
-        lines.append(f"🚫 Warn limit reached — {action_text}. Warnings reset.")
+        lines = [
+            f"⚠️ Warned {safe_target} ({active_count}/{limit})",
+            f"Reason: {safe_reason}",
+            "",
+            f"🚫 Warn limit reached — {action_text}. Warnings reset."
+        ]
     else:
         mode_word = {"ban": "banned", "mute": "muted", "kick": "kicked"}.get(
             settings["warn_mode"], settings["warn_mode"]
         )
-        lines.append("")
-        lines.append(f"<i>Reaching {limit}/{limit} warnings will get you automatically {mode_word}.</i>")
+        lines = [
+            f"⚠️ Warned {safe_target} ({active_count}/{limit})",
+            f"Reason: {safe_reason}",
+            "",
+            f"<i>Reaching {limit}/{limit} warnings will get you automatically {mode_word}.</i>"
+        ]
 
-    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
-
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML") 
+    
 
 async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin-only: check a user's warnings (their own, or any member's)."""
