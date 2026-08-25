@@ -2605,8 +2605,8 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.exception("vcreport failed for chat_id=%s", chat.id)
         await _reply_autodelete(update, context, f"⚠️ Error generating report: {html.escape(str(e), quote=False)}")
-
- async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+ 
+async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -3519,8 +3519,6 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-
-
 async def cmd_allowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Add a user to the link allowlist."""
     if not update.message or not update.effective_chat or not update.effective_user:
@@ -3553,6 +3551,7 @@ async def cmd_allowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reply_autodelete(update, context, f"✅ {safe} can now send links even when link lock is on.", parse_mode="HTML")
     else:
         await _reply_autodelete(update, context, "That user is already on the allowlist.")
+
 
 async def cmd_disallowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Remove a user from the link allowlist."""
@@ -3587,6 +3586,7 @@ async def cmd_disallowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         await _reply_autodelete(update, context, "That user is not on the allowlist.")
 
+
 async def cmd_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the list of users allowed to send links."""
     if not update.message or not update.effective_chat:
@@ -3613,9 +3613,6 @@ async def cmd_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             label = str(uid)
         lines.append(f"• {html.escape(label, quote=False)} (<code>{uid}</code>)")
     await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
-
-
-
 
 
 async def _http_bot_send_message(chat_id: int, text: str) -> bool:
