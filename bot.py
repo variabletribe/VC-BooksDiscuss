@@ -2588,14 +2588,25 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not rows:
             await _reply_autodelete(update, context, "No recorded VC data in this group yet.")
             return
+
+        # Cap the number of rows to avoid Telegram's 4096-character limit
+        MAX_ROWS = 50
+        truncated = len(rows) > MAX_ROWS
+        if truncated:
+            rows = rows[:MAX_ROWS]
+
         subtitle = f"{_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
         text = _format_vc_stats_html("All-time VC report", subtitle, rows)
+
+        if truncated:
+            text += f"\n\n<i>+ {len(rows) - MAX_ROWS} more users not shown.</i>"
+
         await _reply_autodelete(update, context, text, parse_mode="HTML")
     except Exception as e:
         logger.exception("vcreport failed for chat_id=%s", chat.id)
         await _reply_autodelete(update, context, f"⚠️ Error generating report: {html.escape(str(e), quote=False)}")
- 
-async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+ async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
