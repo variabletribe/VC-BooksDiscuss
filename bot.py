@@ -3508,6 +3508,105 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+
+
+async def cmd_allowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a user to the link allowlist."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can manage link permissions.")
+        return
+
+    args = context.args or []
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        target_id, target_label = u.id, _user_label(u)
+    elif args:
+        resolved = await _resolve_user_ref(context, chat.id, args[0])
+        if resolved is None:
+            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
+            return
+        target_id, target_label = resolved
+    else:
+        await _reply_autodelete(update, context, "Reply to a user, or give their user id / @username.")
+        return
+
+    added = await asyncio.to_thread(dbmod.add_link_allow, chat.id, target_id)
+    if added:
+        safe = html.escape(target_label, quote=False)
+        await _reply_autodelete(update, context, f"✅ {safe} can now send links even when link lock is on.", parse_mode="HTML")
+    else:
+        await _reply_autodelete(update, context, "That user is already on the allowlist.")
+
+async def cmd_disallowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a user from the link allowlist."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can manage link permissions.")
+        return
+
+    args = context.args or []
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        u = update.message.reply_to_message.from_user
+        target_id, target_label = u.id, _user_label(u)
+    elif args:
+        resolved = await _resolve_user_ref(context, chat.id, args[0])
+        if resolved is None:
+            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
+            return
+        target_id, target_label = resolved
+    else:
+        await _reply_autodelete(update, context, "Reply to a user, or give their user id / @username.")
+        return
+
+    removed = await asyncio.to_thread(dbmod.remove_link_allow, chat.id, target_id)
+    if removed:
+        safe = html.escape(target_label, quote=False)
+        await _reply_autodelete(update, context, f"✅ {safe} removed from link allowlist.", parse_mode="HTML")
+    else:
+        await _reply_autodelete(update, context, "That user is not on the allowlist.")
+
+async def cmd_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the list of users allowed to send links."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view the link allowlist.")
+        return
+
+    allowlist = await asyncio.to_thread(dbmod.get_link_allowlist, chat.id)
+    if not allowlist:
+        await _reply_autodelete(update, context, "No users are on the link allowlist.")
+        return
+
+    lines = ["🔗 <b>Link Allowlist</b>", ""]
+    for uid in allowlist:
+        try:
+            member = await context.bot.get_chat_member(chat.id, uid)
+            label = _user_label(member.user)
+        except Exception:
+            label = str(uid)
+        lines.append(f"• {html.escape(label, quote=False)} (<code>{uid}</code>)")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+
+
+
 async def _http_bot_send_message(chat_id: int, text: str) -> bool:
     """Direct Bot API HTTP (works even when python-telegram-bot polling hits Conflict)."""
     token = (os.environ.get("BOT_TOKEN") or "").strip()
@@ -4356,98 +4455,6 @@ def main() -> None:
         )
         raise SystemExit(1) from None
 
-async def cmd_allowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a user to the link allowlist."""
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can manage link permissions.")
-        return
-
-    args = context.args or []
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        u = update.message.reply_to_message.from_user
-        target_id, target_label = u.id, _user_label(u)
-    elif args:
-        resolved = await _resolve_user_ref(context, chat.id, args[0])
-        if resolved is None:
-            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
-            return
-        target_id, target_label = resolved
-    else:
-        await _reply_autodelete(update, context, "Reply to a user, or give their user id / @username.")
-        return
-
-    added = await asyncio.to_thread(dbmod.add_link_allow, chat.id, target_id)
-    if added:
-        safe = html.escape(target_label, quote=False)
-        await _reply_autodelete(update, context, f"✅ {safe} can now send links even when link lock is on.", parse_mode="HTML")
-    else:
-        await _reply_autodelete(update, context, "That user is already on the allowlist.")
-
-async def cmd_disallowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove a user from the link allowlist."""
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can manage link permissions.")
-        return
-
-    args = context.args or []
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        u = update.message.reply_to_message.from_user
-        target_id, target_label = u.id, _user_label(u)
-    elif args:
-        resolved = await _resolve_user_ref(context, chat.id, args[0])
-        if resolved is None:
-            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.")
-            return
-        target_id, target_label = resolved
-    else:
-        await _reply_autodelete(update, context, "Reply to a user, or give their user id / @username.")
-        return
-
-    removed = await asyncio.to_thread(dbmod.remove_link_allow, chat.id, target_id)
-    if removed:
-        safe = html.escape(target_label, quote=False)
-        await _reply_autodelete(update, context, f"✅ {safe} removed from link allowlist.", parse_mode="HTML")
-    else:
-        await _reply_autodelete(update, context, "That user is not on the allowlist.")
-
-async def cmd_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the list of users allowed to send links."""
-    if not update.message or not update.effective_chat:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can view the link allowlist.")
-        return
-
-    allowlist = await asyncio.to_thread(dbmod.get_link_allowlist, chat.id)
-    if not allowlist:
-        await _reply_autodelete(update, context, "No users are on the link allowlist.")
-        return
-
-    lines = ["🔗 <b>Link Allowlist</b>", ""]
-    for uid in allowlist:
-        try:
-            member = await context.bot.get_chat_member(chat.id, uid)
-            label = _user_label(member.user)
-        except Exception:
-            label = str(uid)
-        lines.append(f"• {html.escape(label, quote=False)} (<code>{uid}</code>)")
-    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 if __name__ == "__main__":
     main()
