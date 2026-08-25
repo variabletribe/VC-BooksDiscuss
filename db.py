@@ -1397,6 +1397,40 @@ def unlock_type(chat_id: int, lock_type_name: str) -> bool:
     result = coll.update_one({"_id": chat_id}, {"$pull": {"locked_types": lock_type_name}})
     return result.modified_count > 0
 
+# Add these functions anywhere after the existing helper functions,
+# but before the final health-check / moderation-log / anti-spam sections.
+# Place them near the other chat_settings functions.
+
+def get_link_allowlist(chat_id: int) -> list[int]:
+    """Return the list of user IDs allowed to send links in this chat."""
+    coll = _coll("chat_settings")
+    doc = coll.find_one({"_id": chat_id})
+    if not doc:
+        return []
+    return doc.get("link_allowlist", [])
+
+def add_link_allow(chat_id: int, user_id: int) -> bool:
+    """Add a user to the link allowlist. Returns True if added (wasn't already)."""
+    coll = _coll("chat_settings")
+    result = coll.update_one(
+        {"_id": chat_id},
+        {"$addToSet": {"link_allowlist": user_id}, "$setOnInsert": {"monthly_reports": True}},
+        upsert=True,
+    )
+    return result.modified_count > 0
+
+def remove_link_allow(chat_id: int, user_id: int) -> bool:
+    """Remove a user from the link allowlist. Returns True if removed."""
+    coll = _coll("chat_settings")
+    result = coll.update_one(
+        {"_id": chat_id},
+        {"$pull": {"link_allowlist": user_id}},
+    )
+    return result.modified_count > 0
+
+def is_link_allowed(chat_id: int, user_id: int) -> bool:
+    """Check if a user is on the link allowlist."""
+    return user_id in get_link_allowlist(chat_id)
 
 def add_warning(
     chat_id: int,
