@@ -10,6 +10,21 @@ Requires:
 The assistant must be a normal USER account (phone login via session_login.py).
 Do NOT use a bot token / BotFather session — Telegram returns BotMethodInvalidError for
 GetGroupCall and GetGroupParticipants on bot accounts.
+
+Optional: ASSISTANT_JOIN_VC=1 makes the assistant actually join the group call itself
+(as a silent, muted-audio listener) whenever a tracked VC starts, and leave when it ends.
+This is entirely separate from the text-chat "welcome" message sent to new VC joiners
+(see _post_vc_join_welcome) — that always works with no extra setup; actually joining the
+call needs two more things:
+  1. The `py-tgcalls` package with the `telethon` extra (see requirements.txt).
+  2. The `ffmpeg` binary present on PATH (used to transcode the silence file for the call).
+     On Render's native Python runtime this is NOT installed by default — either add
+     `apt-get install -y ffmpeg` to the build command (works on some Render environments,
+     not guaranteed), or switch this service to `runtime: docker` with the included
+     Dockerfile, which installs ffmpeg explicitly.
+If either piece is missing or fails, ASSISTANT_JOIN_VC is silently disabled (logged once)
+and everything else — VC tracking, the text welcome message, all bot commands — keeps
+working exactly as before. This feature never crashes or blocks the tracker.
 """
 
 from __future__ import annotations
@@ -18,7 +33,9 @@ import asyncio
 import html
 import logging
 import os
+import tempfile
 import time
+import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Set
@@ -41,6 +58,104 @@ class AssistantConfigError(Exception):
     background retry loop in start_assistant_background() logs these once and
     stops — unlike transient errors (network blips, AuthKeyDuplicatedError),
     which it retries with backoff."""
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# --- Optional: actually joining the VC's audio (ASSISTANT_JOIN_VC=1) --------
+#
+# Imported lazily/guarded so a missing `py-tgcalls` install (or a platform where its
+# native `ntgcalls` binding has no prebuilt wheel) never breaks the rest of the bot —
+# it only disables this one optional feature.
+try:
+    from pytgcalls import PyTgCalls
+    from pytgcalls import filters as pytgcalls_filters
+    from pytgcalls.types import GroupCallConfig, MediaStream, StreamEnded
+    from pytgcalls.types.stream import AudioQuality
+
+    _PYTGCALLS_IMPORT_ERROR: Exception | None = None
+except Exception as _exc:  # pragma: no cover - depends on optional install
+    PyTgCalls = None  # type: ignore[assignment]
+    pytgcalls_filters = None  # type: ignore[assignment]
+    GroupCallConfig = MediaStream = StreamEnded = AudioQuality = None  # type: ignore
+    _PYTGCALLS_IMPORT_ERROR = _exc
+
+# Set once run_assistant() has started PyTgCalls; None means the feature is off/unavailable.
+_pytgcalls_app: "PyTgCalls | None" = None
+
+_SILENCE_SECONDS = 5
+_SILENCE_SAMPLE_RATE = 48000
+
+
+def _silence_file_path() -> str:
+    """Path to a short local silence WAV, generated once with the stdlib `wave` module
+    (no ffmpeg needed to create it — ffmpeg is only used later, by pytgcalls, to
+    transcode it for the call). Looped indefinitely via the on-stream-end handler
+    registered in run_assistant(), so its length doesn't matter beyond "not tiny"."""
+    path = os.path.join(tempfile.gettempdir(), "vcbot_silence.wav")
+    if not os.path.exists(path) or os.path.getsize(path) < 1000:
+        n_bytes_per_sec = _SILENCE_SAMPLE_RATE * 2  # 16-bit mono
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(_SILENCE_SAMPLE_RATE)
+            silence_chunk = b"\x00\x00" * _SILENCE_SAMPLE_RATE
+            for _ in range(_SILENCE_SECONDS):
+                w.writeframes(silence_chunk)
+        logger.info("Assistant: generated silence file at %s", path)
+    return path
+
+
+def _silence_stream() -> "MediaStream":
+    return MediaStream(
+        _silence_file_path(),
+        audio_parameters=AudioQuality.HIGH,
+        video_flags=MediaStream.Flags.IGNORE,
+    )
+
+
+async def _on_vc_audio_stream_end(client: "PyTgCalls", update: "StreamEnded") -> None:
+    """Our silence file is short; when it finishes playing, immediately replay it so
+    the assistant stays audible-silent for as long as it remains joined to the call."""
+    try:
+        await client.play(update.chat_id, _silence_stream())
+    except Exception:
+        logger.debug(
+            "Assistant: VC silence loop restart failed (likely already left) chat_id=%s",
+            update.chat_id,
+        )
+
+
+async def _join_vc_audio(chat_id: int, st: "_CallState") -> None:
+    """Best-effort: have the assistant actually join chat_id's live call as a silent
+    audio participant. Never raises — any failure just leaves st.joined_call_audio
+    False so a later poll iteration can retry."""
+    if _pytgcalls_app is None or st.joined_call_audio:
+        return
+    st.joined_call_audio = True
+    try:
+        await _pytgcalls_app.play(
+            chat_id,
+            _silence_stream(),
+            config=GroupCallConfig(auto_start=False),
+        )
+        logger.info("Assistant: joined VC audio chat_id=%s", chat_id)
+    except Exception:
+        logger.exception("Assistant: failed to join VC audio chat_id=%s", chat_id)
+        st.joined_call_audio = False
+
+
+async def _leave_vc_audio(chat_id: int, st: "_CallState") -> None:
+    if _pytgcalls_app is None or not st.joined_call_audio:
+        return
+    st.joined_call_audio = False
+    try:
+        await _pytgcalls_app.leave_call(chat_id)
+        logger.info("Assistant: left VC audio chat_id=%s", chat_id)
+    except Exception:
+        logger.debug("Assistant: leave_call failed/already left chat_id=%s", chat_id)
 
 
 def _format_duration(seconds: int) -> str:
@@ -80,6 +195,7 @@ class _CallState:
     user_cache: Dict[int, User] = field(default_factory=dict)
     hint_labels: Dict[int, str] = field(default_factory=dict)
     vc_title: str | None = None
+    joined_call_audio: bool = False  # True once the assistant itself joined this call's audio
 
 
 async def _send_bot_message(chat_id: int, text: str) -> bool:
@@ -257,6 +373,20 @@ def _apply_bot_hints(st: _CallState, chat_id: int, now: datetime) -> None:
             st.hint_labels.setdefault(uid, label)
 
 
+async def _post_vc_join_welcome(client: TelegramClient, chat_id: int, st: "_CallState", uid: int) -> None:
+    """Posts a one-line welcome into the group's TEXT chat (not the call's audio) the
+    moment someone is seen joining the live voice/video chat. Fire-and-forget: any
+    failure here must never break the poll loop, so callers wrap this in create_task
+    and this function itself never raises."""
+    try:
+        label = _label_from_state(st, uid)
+        safe = html.escape(label, quote=False)
+        text = f"👋 Welcome {safe}, grab a seat, listen to the talk, and unmute whenever you want to share."
+        await _post_vc_summary(client, chat_id, text)
+    except Exception:
+        logger.exception("VC join welcome failed chat_id=%s uid=%s", chat_id, uid)
+
+
 def _label_from_state(st: _CallState, uid: int) -> str:
     if uid in st.hint_labels:
         return st.hint_labels[uid]
@@ -298,6 +428,10 @@ async def _finalize_call(
     st: _CallState,
     ended_at: datetime,
 ) -> None:
+    # Leaving the call's audio is local to this process (not a DB write), so it runs
+    # regardless of which path below wins the finalize claim.
+    await _leave_vc_audio(chat_id, st)
+
     # Claim ownership of this VC-end event BEFORE any slow work (DB writes, resolving
     # users, HTTP calls). bot.py's fallback report (_assistant_vc_fallback_report) also
     # tries to claim before it writes; whichever path gets here first wins, and the
@@ -447,6 +581,11 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                     states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
 
+                if _pytgcalls_app is not None and not st.joined_call_audio:
+                    asyncio.create_task(
+                        _join_vc_audio(chat_id, st), name=f"vc-join-audio-{chat_id}"
+                    )
+
                 _apply_bot_hints(st, chat_id, now)
 
                 current_ids, user_map, call_title = await _fetch_participants(client, call)
@@ -460,6 +599,11 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 for uid in joined:
                     st.seen_ids.add(uid)
                     st.join_at[uid] = now
+                    if _is_trackable_user(uid):
+                        asyncio.create_task(
+                            _post_vc_join_welcome(client, chat_id, st, uid),
+                            name=f"vc-join-welcome-{chat_id}-{uid}",
+                        )
                 for uid in left:
                     ja = st.join_at.pop(uid, None)
                     if ja is not None:
@@ -525,10 +669,41 @@ async def run_assistant() -> None:
             len(chat_ids),
             sorted(chat_ids),
         )
+
+        global _pytgcalls_app
+        _pytgcalls_app = None
+        if _env_truthy("ASSISTANT_JOIN_VC"):
+            if _PYTGCALLS_IMPORT_ERROR is not None:
+                logger.warning(
+                    "ASSISTANT_JOIN_VC=1 but py-tgcalls isn't installed/importable (%s); "
+                    "the assistant will keep tracking VCs normally, just without joining "
+                    "the call itself. Add py-tgcalls[telethon] to requirements.txt to enable it.",
+                    _PYTGCALLS_IMPORT_ERROR,
+                )
+            else:
+                try:
+                    pytgcalls_app = PyTgCalls(client)
+                    await pytgcalls_app.start()
+                    pytgcalls_app.on_update(
+                        pytgcalls_filters.stream_end(StreamEnded.Type.AUDIO)
+                    )(_on_vc_audio_stream_end)
+                    _pytgcalls_app = pytgcalls_app
+                    logger.info(
+                        "Assistant: ASSISTANT_JOIN_VC=1 — will join tracked calls as a "
+                        "silent audio participant."
+                    )
+                except Exception:
+                    logger.exception(
+                        "Assistant: PyTgCalls failed to start (often a missing ffmpeg "
+                        "binary on the host) — continuing without VC audio-join."
+                    )
+                    _pytgcalls_app = None
+
         await _poll_loop(client, chat_ids)
     finally:
         app_state.assistant_running = False
         app_state.assistant_chat_ids.clear()
+        _pytgcalls_app = None
         if client.is_connected():
             await client.disconnect()
 
