@@ -84,6 +84,8 @@ except Exception as _exc:  # pragma: no cover - depends on optional install
 
 # Set once run_assistant() has started PyTgCalls; None means the feature is off/unavailable.
 _pytgcalls_app: "PyTgCalls | None" = None
+# The assistant's own Telegram user id, set once run_assistant() calls get_me().
+_assistant_self_id: int | None = None
 
 _SILENCE_SECONDS = 5
 _SILENCE_SAMPLE_RATE = 48000
@@ -246,6 +248,12 @@ def _is_live_group_call(call) -> bool:
 
 
 def _is_trackable_user(uid: int, user: User | None = None) -> bool:
+    # Exclude the assistant's own account: once ASSISTANT_JOIN_VC=1 makes it actually
+    # join the call, it starts showing up in Telegram's own participant list like any
+    # other user. Without this it would count itself toward VC stats/attendance/XP and
+    # the call would never look "empty" even after every real person has left.
+    if _assistant_self_id is not None and uid == _assistant_self_id:
+        return False
     username = user.username if user else None
     return app_state.is_vc_participant(uid, username)
 
@@ -581,11 +589,6 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                     states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
 
-                if _pytgcalls_app is not None and not st.joined_call_audio:
-                    asyncio.create_task(
-                        _join_vc_audio(chat_id, st), name=f"vc-join-audio-{chat_id}"
-                    )
-
                 _apply_bot_hints(st, chat_id, now)
 
                 current_ids, user_map, call_title = await _fetch_participants(client, call)
@@ -593,6 +596,20 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 st.seen_ids.update(current_ids)
                 if call_title:
                     st.vc_title = call_title
+
+                # Join the call's audio the moment a real person is in it, and leave the
+                # moment none are — current_ids never includes the assistant's own
+                # account (see _is_trackable_user), so this reflects real occupancy even
+                # while the assistant itself is sitting in the call.
+                if _pytgcalls_app is not None:
+                    if current_ids and not st.joined_call_audio:
+                        asyncio.create_task(
+                            _join_vc_audio(chat_id, st), name=f"vc-join-audio-{chat_id}"
+                        )
+                    elif not current_ids and st.joined_call_audio:
+                        asyncio.create_task(
+                            _leave_vc_audio(chat_id, st), name=f"vc-leave-audio-{chat_id}"
+                        )
 
                 joined = current_ids - st.last_ids
                 left = st.last_ids - current_ids
@@ -670,6 +687,9 @@ async def run_assistant() -> None:
             sorted(chat_ids),
         )
 
+        global _assistant_self_id
+        _assistant_self_id = me.id
+
         global _pytgcalls_app
         _pytgcalls_app = None
         if _env_truthy("ASSISTANT_JOIN_VC"):
@@ -704,6 +724,7 @@ async def run_assistant() -> None:
         app_state.assistant_running = False
         app_state.assistant_chat_ids.clear()
         _pytgcalls_app = None
+        _assistant_self_id = None
         if client.is_connected():
             await client.disconnect()
 
