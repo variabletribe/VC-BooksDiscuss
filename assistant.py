@@ -169,15 +169,24 @@ async def _join_vc_audio(chat_id: int, st: "_CallState") -> None:
     if _pytgcalls_app is None or st.joined_call_audio:
         return
     st.joined_call_audio = True
+    start = time.monotonic()
     try:
         await _pytgcalls_app.play(
             chat_id,
             _silence_stream(),
             config=GroupCallConfig(auto_start=False),
         )
-        logger.info("Assistant: joined VC audio chat_id=%s", chat_id)
+        logger.info(
+            "Assistant: joined VC audio chat_id=%s (took %.1fs)",
+            chat_id,
+            time.monotonic() - start,
+        )
     except Exception:
-        logger.exception("Assistant: failed to join VC audio chat_id=%s", chat_id)
+        logger.exception(
+            "Assistant: failed to join VC audio chat_id=%s (after %.1fs)",
+            chat_id,
+            time.monotonic() - start,
+        )
         st.joined_call_audio = False
 
 
@@ -735,6 +744,10 @@ async def run_assistant() -> None:
                 )
             else:
                 try:
+                    # Generate the silence file now, off the critical path, instead of
+                    # lazily on the first join — shaves a little off how long the very
+                    # first VC join of this process takes.
+                    await asyncio.to_thread(_silence_file_path)
                     pytgcalls_app = PyTgCalls(client)
                     await pytgcalls_app.start()
                     pytgcalls_app.on_update(
