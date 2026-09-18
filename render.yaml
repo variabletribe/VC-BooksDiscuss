@@ -10,13 +10,21 @@
 # Optional: KEEP_ALIVE_INTERVAL_SECONDS (default 300), KEEP_ALIVE_DISABLE=1 to turn off self-ping.
 # If /start is dead on free Web tier (webhook 521): add FORCE_POLLING=1 — only when ONE service uses BOT_TOKEN.
 # Use exactly ONE service with this repo per BOT_TOKEN. Suspend any old Worker that still polls.
+#
+# ASSISTANT_JOIN_VC=1 (optional): the assistant joins tracked voice chats itself as a
+# silent audio participant. It needs the `ffmpeg` binary on PATH. `apt-get` in buildCommand
+# below is best-effort — Render's native Python runtime does not guarantee apt access.
+# If the build log shows apt-get failing, switch this service's runtime to `docker` and
+# use the included Dockerfile instead, which installs ffmpeg explicitly and is guaranteed
+# to work. Leave ASSISTANT_JOIN_VC unset if you don't want the audio-join feature at all —
+# everything else in this bot works with no ffmpeg dependency either way.
 services:
   - type: web
     name: vc-bot
     runtime: python
     plan: free
     numInstances: 1
-    buildCommand: pip install -r requirements.txt
+    buildCommand: (apt-get update && apt-get install -y --no-install-recommends ffmpeg || true) && pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
