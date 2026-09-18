@@ -376,6 +376,41 @@ def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
 
 
 COMMAND_AUTODELETE_SECONDS = 30
+WELCOME_AUTODELETE_SECONDS = 180  # 3 minutes
+
+
+def _welcome_rules_text(name: str) -> str:
+    """Rules-of-conduct message posted (and auto-deleted after WELCOME_AUTODELETE_SECONDS)
+    whenever someone new joins the group."""
+    safe = html.escape(name, quote=False)
+    return (
+        f"{safe}, Welcome to Books Discuss Group\n"
+        "Here are the rules of conduct for this space. Please familiarise yourself with them\n\n"
+        "📜 <b>GROUP RULES</b>\n"
+        "<i>ᴠɪᴏʟᴀᴛɪᴏɴ ᴏғ ᴛʜᴇsᴇ ʀᴜʟᴇs ᴍᴀʏ ʟᴇᴀᴅ ᴛᴏ ʏᴏᴜʀ ʀᴇᴍᴏᴠᴀʟ.</i>\n\n"
+        "<b>Article 1 — Don't Steal Members</b>\n"
+        "Do not invite or add members from this group to another group or to your personal group.\n\n"
+        "<b>Article 2 — Speak English</b>\n"
+        "Please use English in the group so everyone can understand and feel included.\n\n"
+        "<b>Article 3 — Be Respectful</b>\n"
+        "Be humble and respectful.\n"
+        "Do not behave arrogantly, rudely, or disrespectfully.\n\n"
+        "<b>Article 4 — Respect Religions, Genders &amp; Cultures</b>\n"
+        "Respect all religions, cultures, and beliefs. Hate speech, insults, or mockery will not be tolerated.\n\n"
+        "<b>Article 5 — Respect Privacy</b>\n"
+        "Do not ask for personal information that others may feel uncomfortable sharing.\n\n"
+        "<b>Article 6 — Keep the Group Safe</b>\n"
+        "No abusive language, bullying, harassment, or harmful behavior.\n"
+        "Help make this group a safe and welcoming place for everyone.\n\n"
+        "<b>Article 7 — Stay on Topic in VC</b>\n"
+        "Voice chats are meant for wise conversations and constructive discussions.\n"
+        "Avoid spam and unnecessary off-topic discussions.\n\n"
+        "<b>Article 8 — Voice Chat Recording</b>\n"
+        "All voice chat sessions are recorded and may be shared on our social media platforms.\n"
+        "If you do not want your voice to be shared, please do not speak during the session, or "
+        "inform an admin before speaking so your part is not included.\n"
+        "Once a recording has been published, requests to edit or remove it may not be accepted."
+    )
 
 
 async def _delete_messages_later(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -514,6 +549,7 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "timer": ("everyone", "/timer <N>m", "One-shot reminder timer — minutes only, max 20m, one running per group at a time.", "Anyone"),
     "canceltimer": ("everyone", "/canceltimer", "Cancel the currently running timer early.", "Anyone"),
     "mywarns": ("everyone", "/mywarns", "See your own full warning history — active and cleared, with dates and reasons.", "Anyone"),
+    "report": ("everyone", "/report  —  or reply to a message with /report", "Tags every group admin. Reply to a message first to point admins straight at it.", "Anyone"),
 
     # --- Group Admin Tools (Telegram group admin/owner status) ---
     "streakboard": ("groupadmin", "/streakboard", "Every member's current and best attendance streak, ranked.", "Group admin"),
@@ -1994,6 +2030,71 @@ async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+# --- /report ------------------------------------------------------------------
+
+_REPORT_COOLDOWN_SECONDS = 30
+_report_cooldown: dict[int, float] = {}  # chat_id -> monotonic time of last /report
+
+
+def _admin_mentions(admins) -> list[str]:
+    """Clickable tg://user mentions for every real admin, skipping bots and the
+    GroupAnonymousBot placeholder — shared by /report and @admin tagging."""
+    mentions = []
+    for a in admins:
+        u = a.user
+        if u.is_bot or u.id == app_state.GROUP_ANONYMOUS_BOT_ID:
+            continue
+        label = html.escape(u.first_name or "Admin", quote=False)
+        mentions.append(f'<a href="tg://user?id={u.id}">{label}</a>')
+    return mentions
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: /report — tags every current group admin. If used as a reply, the
+    reported message is linked (as a native Telegram reply) so admins land on it
+    directly. Rate-limited per chat so it can't be used to spam-ping admins."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+
+    now = time.monotonic()
+    last = _report_cooldown.get(chat.id, 0.0)
+    if now - last < _REPORT_COOLDOWN_SECONDS:
+        await _reply_autodelete(
+            update, context, "A report was just sent — please wait a bit before reporting again."
+        )
+        return
+
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+    except Exception:
+        logger.exception("Report: get_chat_administrators failed chat_id=%s", chat.id)
+        await _reply_autodelete(update, context, "Couldn't reach admins right now — please try again.")
+        return
+
+    mentions = _admin_mentions(admins)
+    if not mentions:
+        await _reply_autodelete(update, context, "No admins found to notify.")
+        return
+
+    _report_cooldown[chat.id] = now
+    reporter = _user_label(update.effective_user) if update.effective_user else "Someone"
+    safe_reporter = html.escape(reporter, quote=False)
+    text = f"🚨 {' '.join(mentions)} — {safe_reporter} reported this. Please take a look."
+
+    reply_to = update.message.reply_to_message
+    reply_to_id = reply_to.message_id if reply_to else None
+    try:
+        await context.bot.send_message(
+            chat.id, text, parse_mode="HTML", reply_to_message_id=reply_to_id
+        )
+    except Exception:
+        logger.exception("Report: send failed chat_id=%s", chat.id)
+
+
 # --- @admin tagging ----------------------------------------------------------
 
 _ADMIN_TAG_RE = re.compile(r"(?<!\w)@admin(?!\w)", re.IGNORECASE)
@@ -2027,17 +2128,7 @@ async def on_text_admin_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.exception("Admin tag: get_chat_administrators failed chat_id=%s", chat.id)
         return
 
-    mentions = []
-    for a in admins:
-        u = a.user
-        # Skip real bots AND the GroupAnonymousBot placeholder explicitly (belt-and-braces
-        # alongside is_bot — this placeholder represents "an admin posting anonymously",
-        # not a person, so it must never be pinged even if a client library ever reports
-        # its is_bot flag inconsistently).
-        if u.is_bot or u.id == app_state.GROUP_ANONYMOUS_BOT_ID:
-            continue
-        label = html.escape(u.first_name or "Admin", quote=False)
-        mentions.append(f'<a href="tg://user?id={u.id}">{label}</a>')
+    mentions = _admin_mentions(admins)
     if not mentions:
         return
 
@@ -2866,6 +2957,25 @@ async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE
             continue
         label = _user_label(user)
         await asyncio.to_thread(dbmod.record_group_join, chat.id, user.id, label, when)
+
+        # Rules-of-conduct welcome — sent for every new member regardless of captcha,
+        # auto-deleted after WELCOME_AUTODELETE_SECONDS so it doesn't clutter the chat.
+        try:
+            welcome_msg = await context.bot.send_message(
+                chat.id,
+                _welcome_rules_text(user.first_name or label),
+                parse_mode="HTML",
+            )
+            jq_welcome = context.job_queue
+            if jq_welcome is not None:
+                jq_welcome.run_once(
+                    _delete_messages_later,
+                    when=WELCOME_AUTODELETE_SECONDS,
+                    data={"chat_id": chat.id, "message_ids": [welcome_msg.message_id]},
+                    name=f"welcome-autodelete-{chat.id}-{welcome_msg.message_id}",
+                )
+        except Exception:
+            logger.exception("Welcome message failed chat_id=%s user_id=%s", chat.id, user.id)
 
         if not captcha_on:
             continue
@@ -4345,6 +4455,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setflood", cmd_setflood))
     app.add_handler(CommandHandler("floodmode", cmd_floodmode))
     app.add_handler(CommandHandler("timer", cmd_timer))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("canceltimer", cmd_canceltimer))
     # Inline-button callbacks: generic confirm/cancel (ban, removeuser, broadcast) and
     # new-member captcha verification. Matched by callback_data prefix via `pattern`.
