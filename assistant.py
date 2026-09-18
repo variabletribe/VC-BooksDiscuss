@@ -66,21 +66,53 @@ def _env_truthy(name: str) -> bool:
 
 # --- Optional: actually joining the VC's audio (ASSISTANT_JOIN_VC=1) --------
 #
-# Imported lazily/guarded so a missing `py-tgcalls` install (or a platform where its
-# native `ntgcalls` binding has no prebuilt wheel) never breaks the rest of the bot —
-# it only disables this one optional feature.
-try:
-    from pytgcalls import PyTgCalls
-    from pytgcalls import filters as pytgcalls_filters
-    from pytgcalls.types import GroupCallConfig, MediaStream, StreamEnded
-    from pytgcalls.types.stream import AudioQuality
+# CRITICAL: py-tgcalls's compatibility layer (pytgcalls/sync.py) captures "the current
+# asyncio event loop" the FIRST time the `pytgcalls` package is imported anywhere in the
+# process, and silently reroutes every later PyTgCalls call onto that captured loop. If
+# that import happened at module load time (i.e. as soon as bot.py does
+# `from assistant import start_assistant_background` on the MAIN thread, before this
+# module's own background thread/event loop even exists), every pytgcalls call gets
+# routed onto the wrong loop and Telethon raises "asyncio event loop must not change
+# after connection" the moment PyTgCalls touches the client. So the import is deferred
+# until _load_pytgcalls() is called from inside run_assistant() itself, which only
+# happens once the assistant's OWN event loop is the one actually running — see
+# start_assistant_background(), which also reuses one persistent loop across retries so
+# this stays correct even after a reconnect, not just on the very first attempt.
+PyTgCalls = None  # type: ignore[assignment]
+pytgcalls_filters = None  # type: ignore[assignment]
+GroupCallConfig = MediaStream = StreamEnded = AudioQuality = None  # type: ignore
+_PYTGCALLS_IMPORT_ERROR: Exception | None = None
+_pytgcalls_load_attempted = False
 
-    _PYTGCALLS_IMPORT_ERROR: Exception | None = None
-except Exception as _exc:  # pragma: no cover - depends on optional install
-    PyTgCalls = None  # type: ignore[assignment]
-    pytgcalls_filters = None  # type: ignore[assignment]
-    GroupCallConfig = MediaStream = StreamEnded = AudioQuality = None  # type: ignore
-    _PYTGCALLS_IMPORT_ERROR = _exc
+
+def _load_pytgcalls() -> None:
+    """Imports py-tgcalls the first time it's actually needed. Must only be called from
+    code already running inside the assistant's own event loop (i.e. from within
+    run_assistant()) — see the module-level comment above for why. Safe to call more
+    than once; only does the import once."""
+    global PyTgCalls, pytgcalls_filters, GroupCallConfig, MediaStream, StreamEnded
+    global AudioQuality, _PYTGCALLS_IMPORT_ERROR, _pytgcalls_load_attempted
+    if _pytgcalls_load_attempted:
+        return
+    _pytgcalls_load_attempted = True
+    try:
+        from pytgcalls import PyTgCalls as _PyTgCalls
+        from pytgcalls import filters as _pytgcalls_filters
+        from pytgcalls.types import GroupCallConfig as _GroupCallConfig
+        from pytgcalls.types import MediaStream as _MediaStream
+        from pytgcalls.types import StreamEnded as _StreamEnded
+        from pytgcalls.types.stream import AudioQuality as _AudioQuality
+
+        PyTgCalls = _PyTgCalls
+        pytgcalls_filters = _pytgcalls_filters
+        GroupCallConfig = _GroupCallConfig
+        MediaStream = _MediaStream
+        StreamEnded = _StreamEnded
+        AudioQuality = _AudioQuality
+        _PYTGCALLS_IMPORT_ERROR = None
+    except Exception as exc:  # pragma: no cover - depends on optional install
+        _PYTGCALLS_IMPORT_ERROR = exc
+
 
 # Set once run_assistant() has started PyTgCalls; None means the feature is off/unavailable.
 _pytgcalls_app: "PyTgCalls | None" = None
@@ -693,6 +725,7 @@ async def run_assistant() -> None:
         global _pytgcalls_app
         _pytgcalls_app = None
         if _env_truthy("ASSISTANT_JOIN_VC"):
+            _load_pytgcalls()
             if _PYTGCALLS_IMPORT_ERROR is not None:
                 logger.warning(
                     "ASSISTANT_JOIN_VC=1 but py-tgcalls isn't installed/importable (%s); "
@@ -748,10 +781,20 @@ def start_assistant_background() -> None:
         base_delay = 5.0
         max_delay = 300.0
         delay = base_delay
+
+        # One event loop for this thread's entire lifetime, reused across every retry
+        # attempt below (rather than asyncio.run() making a fresh loop each time). This
+        # matters specifically for _load_pytgcalls(): py-tgcalls pins its internal
+        # sync-compat wrapper to whichever loop is running the first time it's imported,
+        # and a new loop per retry would silently re-break VC audio-join on every
+        # reconnect even though the very first run worked.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         while True:
             started = time.monotonic()
             try:
-                asyncio.run(run_assistant())
+                loop.run_until_complete(run_assistant())
                 logger.warning(
                     "Assistant: run_assistant() returned without error (unexpected); not retrying."
                 )
