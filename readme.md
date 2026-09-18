@@ -302,6 +302,10 @@ These are the only commands gated by `ADMIN_USER_IDS` rather than group admin st
 
 These are not triggered by a `/command` — they fire on their own:
 
+- **New member join** — a rules-of-conduct welcome, sent to every new member (regardless of
+  whether captcha is on), auto-deleted after 3 minutes.
+- **VC join** — when the Telethon assistant sees someone join the live call, it posts a short
+  "grab a seat, unmute whenever you want to share" welcome in the group's text chat.
 - **VC ended** (up to 4 messages, in order): call summary → present attendance → new badges
   (if any) → AI recap (if `GROQ_API_KEY` is set).
 - **Monthly report** — 1st of the month, `MONTHLY_REPORT_HOUR_UTC`, to every group with
@@ -313,6 +317,25 @@ These are not triggered by a `/command` — they fire on their own:
 - **Blocklist / link-lock / captcha notices** — short messages posted when enforcement
   triggers; most self-delete after 15–30 seconds so they don't clutter the chat.
 - **Timer expiry** — the `/timer` announcement when its duration elapses.
+- **`/report`** — anyone can run this (optionally as a reply to the offending message) to tag
+  every current group admin; rate-limited to once per 30s per group.
+
+### Optional: the assistant actually joining the VC (`ASSISTANT_JOIN_VC=1`)
+
+By default the bot only *tracks* the VC and posts the text welcome above — it never joins the
+call's audio. Setting `ASSISTANT_JOIN_VC=1` makes the Telethon assistant itself join each
+tracked call as a silent participant (it streams silence, never speaks) for as long as the call
+runs, and leaves when it ends. This needs two extra things:
+
+1. `py-tgcalls[telethon]` installed (already in `requirements.txt`).
+2. The `ffmpeg` binary on `PATH` at runtime. Render's native Python `buildCommand` in
+   `render.yaml` *attempts* `apt-get install ffmpeg`, but apt access isn't guaranteed there —
+   if the build log shows it failing, switch the service's runtime to Docker and use the
+   included `Dockerfile`, which installs ffmpeg explicitly and always works.
+
+If either piece is missing, `ASSISTANT_JOIN_VC` is disabled automatically (logged once, no
+crash) — the rest of the bot, including VC tracking and the text welcome, is completely
+unaffected either way.
 
 ---
 
