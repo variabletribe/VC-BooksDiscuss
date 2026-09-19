@@ -10,21 +10,6 @@ Requires:
 The assistant must be a normal USER account (phone login via session_login.py).
 Do NOT use a bot token / BotFather session — Telegram returns BotMethodInvalidError for
 GetGroupCall and GetGroupParticipants on bot accounts.
-
-Optional: ASSISTANT_JOIN_VC=1 makes the assistant actually join the group call itself
-(as a silent, muted-audio listener) whenever a tracked VC starts, and leave when it ends.
-This is entirely separate from the text-chat "welcome" message sent to new VC joiners
-(see _post_vc_join_welcome) — that always works with no extra setup; actually joining the
-call needs two more things:
-  1. The `py-tgcalls` package with the `telethon` extra (see requirements.txt).
-  2. The `ffmpeg` binary present on PATH (used to transcode the silence file for the call).
-     On Render's native Python runtime this is NOT installed by default — either add
-     `apt-get install -y ffmpeg` to the build command (works on some Render environments,
-     not guaranteed), or switch this service to `runtime: docker` with the included
-     Dockerfile, which installs ffmpeg explicitly.
-If either piece is missing or fails, ASSISTANT_JOIN_VC is silently disabled (logged once)
-and everything else — VC tracking, the text welcome message, all bot commands — keeps
-working exactly as before. This feature never crashes or blocks the tracker.
 """
 
 from __future__ import annotations
@@ -33,9 +18,7 @@ import asyncio
 import html
 import logging
 import os
-import tempfile
 import time
-import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Set
@@ -58,147 +41,6 @@ class AssistantConfigError(Exception):
     background retry loop in start_assistant_background() logs these once and
     stops — unlike transient errors (network blips, AuthKeyDuplicatedError),
     which it retries with backoff."""
-
-
-def _env_truthy(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-# --- Optional: actually joining the VC's audio (ASSISTANT_JOIN_VC=1) --------
-#
-# CRITICAL: py-tgcalls's compatibility layer (pytgcalls/sync.py) captures "the current
-# asyncio event loop" the FIRST time the `pytgcalls` package is imported anywhere in the
-# process, and silently reroutes every later PyTgCalls call onto that captured loop. If
-# that import happened at module load time (i.e. as soon as bot.py does
-# `from assistant import start_assistant_background` on the MAIN thread, before this
-# module's own background thread/event loop even exists), every pytgcalls call gets
-# routed onto the wrong loop and Telethon raises "asyncio event loop must not change
-# after connection" the moment PyTgCalls touches the client. So the import is deferred
-# until _load_pytgcalls() is called from inside run_assistant() itself, which only
-# happens once the assistant's OWN event loop is the one actually running — see
-# start_assistant_background(), which also reuses one persistent loop across retries so
-# this stays correct even after a reconnect, not just on the very first attempt.
-PyTgCalls = None  # type: ignore[assignment]
-pytgcalls_filters = None  # type: ignore[assignment]
-GroupCallConfig = MediaStream = StreamEnded = AudioQuality = None  # type: ignore
-_PYTGCALLS_IMPORT_ERROR: Exception | None = None
-_pytgcalls_load_attempted = False
-
-
-def _load_pytgcalls() -> None:
-    """Imports py-tgcalls the first time it's actually needed. Must only be called from
-    code already running inside the assistant's own event loop (i.e. from within
-    run_assistant()) — see the module-level comment above for why. Safe to call more
-    than once; only does the import once."""
-    global PyTgCalls, pytgcalls_filters, GroupCallConfig, MediaStream, StreamEnded
-    global AudioQuality, _PYTGCALLS_IMPORT_ERROR, _pytgcalls_load_attempted
-    if _pytgcalls_load_attempted:
-        return
-    _pytgcalls_load_attempted = True
-    try:
-        from pytgcalls import PyTgCalls as _PyTgCalls
-        from pytgcalls import filters as _pytgcalls_filters
-        from pytgcalls.types import GroupCallConfig as _GroupCallConfig
-        from pytgcalls.types import MediaStream as _MediaStream
-        from pytgcalls.types import StreamEnded as _StreamEnded
-        from pytgcalls.types.stream import AudioQuality as _AudioQuality
-
-        PyTgCalls = _PyTgCalls
-        pytgcalls_filters = _pytgcalls_filters
-        GroupCallConfig = _GroupCallConfig
-        MediaStream = _MediaStream
-        StreamEnded = _StreamEnded
-        AudioQuality = _AudioQuality
-        _PYTGCALLS_IMPORT_ERROR = None
-    except Exception as exc:  # pragma: no cover - depends on optional install
-        _PYTGCALLS_IMPORT_ERROR = exc
-
-
-# Set once run_assistant() has started PyTgCalls; None means the feature is off/unavailable.
-_pytgcalls_app: "PyTgCalls | None" = None
-# The assistant's own Telegram user id, set once run_assistant() calls get_me().
-_assistant_self_id: int | None = None
-
-_SILENCE_SECONDS = 5
-_SILENCE_SAMPLE_RATE = 48000
-
-
-def _silence_file_path() -> str:
-    """Path to a short local silence WAV, generated once with the stdlib `wave` module
-    (no ffmpeg needed to create it — ffmpeg is only used later, by pytgcalls, to
-    transcode it for the call). Looped indefinitely via the on-stream-end handler
-    registered in run_assistant(), so its length doesn't matter beyond "not tiny"."""
-    path = os.path.join(tempfile.gettempdir(), "vcbot_silence.wav")
-    if not os.path.exists(path) or os.path.getsize(path) < 1000:
-        n_bytes_per_sec = _SILENCE_SAMPLE_RATE * 2  # 16-bit mono
-        with wave.open(path, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(_SILENCE_SAMPLE_RATE)
-            silence_chunk = b"\x00\x00" * _SILENCE_SAMPLE_RATE
-            for _ in range(_SILENCE_SECONDS):
-                w.writeframes(silence_chunk)
-        logger.info("Assistant: generated silence file at %s", path)
-    return path
-
-
-def _silence_stream() -> "MediaStream":
-    return MediaStream(
-        _silence_file_path(),
-        audio_parameters=AudioQuality.HIGH,
-        video_flags=MediaStream.Flags.IGNORE,
-    )
-
-
-async def _on_vc_audio_stream_end(client: "PyTgCalls", update: "StreamEnded") -> None:
-    """Our silence file is short; when it finishes playing, immediately replay it so
-    the assistant stays audible-silent for as long as it remains joined to the call."""
-    try:
-        await client.play(update.chat_id, _silence_stream())
-    except Exception:
-        logger.debug(
-            "Assistant: VC silence loop restart failed (likely already left) chat_id=%s",
-            update.chat_id,
-        )
-
-
-async def _join_vc_audio(chat_id: int, st: "_CallState") -> None:
-    """Best-effort: have the assistant actually join chat_id's live call as a silent
-    audio participant. Never raises — any failure just leaves st.joined_call_audio
-    False so a later poll iteration can retry."""
-    if _pytgcalls_app is None or st.joined_call_audio:
-        return
-    st.joined_call_audio = True
-    start = time.monotonic()
-    try:
-        await _pytgcalls_app.play(
-            chat_id,
-            _silence_stream(),
-            config=GroupCallConfig(auto_start=False),
-        )
-        logger.info(
-            "Assistant: joined VC audio chat_id=%s (took %.1fs)",
-            chat_id,
-            time.monotonic() - start,
-        )
-    except Exception:
-        logger.exception(
-            "Assistant: failed to join VC audio chat_id=%s (after %.1fs)",
-            chat_id,
-            time.monotonic() - start,
-        )
-        st.joined_call_audio = False
-
-
-async def _leave_vc_audio(chat_id: int, st: "_CallState") -> None:
-    if _pytgcalls_app is None or not st.joined_call_audio:
-        return
-    st.joined_call_audio = False
-    try:
-        await _pytgcalls_app.leave_call(chat_id)
-        logger.info("Assistant: left VC audio chat_id=%s", chat_id)
-    except Exception:
-        logger.debug("Assistant: leave_call failed/already left chat_id=%s", chat_id)
 
 
 def _format_duration(seconds: int) -> str:
@@ -238,7 +80,6 @@ class _CallState:
     user_cache: Dict[int, User] = field(default_factory=dict)
     hint_labels: Dict[int, str] = field(default_factory=dict)
     vc_title: str | None = None
-    joined_call_audio: bool = False  # True once the assistant itself joined this call's audio
 
 
 async def _send_bot_message(chat_id: int, text: str) -> bool:
@@ -289,61 +130,29 @@ def _is_live_group_call(call) -> bool:
 
 
 def _is_trackable_user(uid: int, user: User | None = None) -> bool:
-    # Exclude the assistant's own account: once ASSISTANT_JOIN_VC=1 makes it actually
-    # join the call, it starts showing up in Telegram's own participant list like any
-    # other user. Without this it would count itself toward VC stats/attendance/XP and
-    # the call would never look "empty" even after every real person has left.
-    if _assistant_self_id is not None and uid == _assistant_self_id:
-        return False
     username = user.username if user else None
     return app_state.is_vc_participant(uid, username)
 
 
 async def _fetch_participants(
-    client: TelegramClient, call, chat_id: int
-) -> tuple[Set[int], Dict[int, User], str | None, Dict[int, str]]:
+    client: TelegramClient, call
+) -> tuple[Set[int], Dict[int, User], str | None]:
     """Merge GetGroupCall + GetGroupParticipants for the fullest participant list.
 
     Also returns the group call's title (the VC "topic"/name, if the call was
     started or renamed with one) — only available via phone.GetGroupCallRequest,
     not from the lightweight InputGroupCall handed to us by GetFullChannelRequest.
-
-    A participant doesn't always show up as a PeerUser: someone using "join as
-    [the group]" (common for anonymous admins — the same identity Telegram uses for
-    their anonymous text messages) appears as a PeerChat/PeerChannel peer instead.
-    Previously these were silently dropped — the admin who started the call would
-    join, never show up in ids at all, and never get counted anywhere. We can't
-    attribute that to their specific personal account (Telegram genuinely doesn't
-    tell us who's behind the anonymous identity), but we can at least track SOME
-    presence for it instead of losing it entirely, using a synthetic negative id
-    (never collides with a real positive Telegram user id) with an explicit label.
-    Returned as a 4th dict (extra_labels) so the caller can seed st.hint_labels.
     """
-    from telethon.tl.types import InputGroupCall, PeerChannel, PeerChat
+    from telethon.tl.types import InputGroupCall
 
     pair = _call_input(call)
     if not pair:
-        return set(), {}, None, {}
+        return set(), {}, None
     cid, ah = pair
     inp = InputGroupCall(id=cid, access_hash=ah)
     ids: Set[int] = set()
     users: Dict[int, User] = {}
-    extra_labels: Dict[int, str] = {}
     title: str | None = None
-
-    def _handle_peer(peer) -> None:
-        if isinstance(peer, PeerUser):
-            if _is_trackable_user(peer.user_id):
-                ids.add(peer.user_id)
-            return
-        if isinstance(peer, (PeerChat, PeerChannel)):
-            raw_id = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
-            pseudo_id = -abs(raw_id) if raw_id else -abs(chat_id)
-            ids.add(pseudo_id)
-            extra_labels.setdefault(pseudo_id, "Anonymous Admin (joined as the group)")
-            return
-        if os.getenv("ASSISTANT_DEBUG"):
-            logger.info("Assistant: unhandled VC participant peer type %r", type(peer).__name__)
 
     try:
         res = await client(functions.phone.GetGroupCallRequest(call=inp, limit=500))
@@ -351,7 +160,9 @@ async def _fetch_participants(
         if raw_title and raw_title.strip():
             title = raw_title.strip()
         for p in res.participants:
-            _handle_peer(p.peer)
+            peer = p.peer
+            if isinstance(peer, PeerUser) and _is_trackable_user(peer.user_id):
+                ids.add(peer.user_id)
         for u in res.users:
             if isinstance(u, User) and _is_trackable_user(u.id, u):
                 users[u.id] = u
@@ -380,7 +191,9 @@ async def _fetch_participants(
             logger.exception("Assistant GetGroupParticipants failed")
             break
         for p in res.participants:
-            _handle_peer(p.peer)
+            peer = p.peer
+            if isinstance(peer, PeerUser) and _is_trackable_user(peer.user_id):
+                ids.add(peer.user_id)
         for u in res.users:
             if isinstance(u, User) and _is_trackable_user(u.id, u):
                 users[u.id] = u
@@ -389,7 +202,7 @@ async def _fetch_participants(
             break
     if os.getenv("ASSISTANT_DEBUG"):
         logger.info("Assistant merged participant ids: %s", len(ids))
-    return ids, users, title, extra_labels
+    return ids, users, title
 
 
 async def _resolve_users(client: TelegramClient, st: _CallState, uids: Set[int]) -> None:
@@ -444,20 +257,6 @@ def _apply_bot_hints(st: _CallState, chat_id: int, now: datetime) -> None:
             st.hint_labels.setdefault(uid, label)
 
 
-async def _post_vc_join_welcome(client: TelegramClient, chat_id: int, st: "_CallState", uid: int) -> None:
-    """Posts a one-line welcome into the group's TEXT chat (not the call's audio) the
-    moment someone is seen joining the live voice/video chat. Fire-and-forget: any
-    failure here must never break the poll loop, so callers wrap this in create_task
-    and this function itself never raises."""
-    try:
-        label = _label_from_state(st, uid)
-        safe = html.escape(label, quote=False)
-        text = f"👋 Welcome {safe}, grab a seat, listen to the talk, and unmute whenever you want to share."
-        await _post_vc_summary(client, chat_id, text)
-    except Exception:
-        logger.exception("VC join welcome failed chat_id=%s uid=%s", chat_id, uid)
-
-
 def _label_from_state(st: _CallState, uid: int) -> str:
     if uid in st.hint_labels:
         return st.hint_labels[uid]
@@ -499,10 +298,6 @@ async def _finalize_call(
     st: _CallState,
     ended_at: datetime,
 ) -> None:
-    # Leaving the call's audio is local to this process (not a DB write), so it runs
-    # regardless of which path below wins the finalize claim.
-    await _leave_vc_audio(chat_id, st)
-
     # Claim ownership of this VC-end event BEFORE any slow work (DB writes, resolving
     # users, HTTP calls). bot.py's fallback report (_assistant_vc_fallback_report) also
     # tries to claim before it writes; whichever path gets here first wins, and the
@@ -648,27 +443,15 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 if st is not None and st.call_id != call_id:
                     await _finalize_call(client, chat_id, st, now)
                     st = None
-                is_new_call = st is None
                 if st is None:
                     states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
 
-                # Join the moment the voice chat starts — don't wait on a participant
-                # fetch first (that's a whole extra network round-trip, and was making
-                # the join noticeably slower than the call itself in quick tests).
-                if is_new_call and _pytgcalls_app is not None and not st.joined_call_audio:
-                    asyncio.create_task(
-                        _join_vc_audio(chat_id, st), name=f"vc-join-audio-{chat_id}"
-                    )
-
                 _apply_bot_hints(st, chat_id, now)
 
-                current_ids, user_map, call_title, extra_labels = await _fetch_participants(
-                    client, call, chat_id
-                )
+                current_ids, user_map, call_title = await _fetch_participants(client, call)
                 st.user_cache.update(user_map)
                 st.seen_ids.update(current_ids)
-                st.hint_labels.update(extra_labels)
                 if call_title:
                     st.vc_title = call_title
 
@@ -677,11 +460,6 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 for uid in joined:
                     st.seen_ids.add(uid)
                     st.join_at[uid] = now
-                    if uid > 0 and _is_trackable_user(uid):
-                        asyncio.create_task(
-                            _post_vc_join_welcome(client, chat_id, st, uid),
-                            name=f"vc-join-welcome-{chat_id}-{uid}",
-                        )
                 for uid in left:
                     ja = st.join_at.pop(uid, None)
                     if ja is not None:
@@ -747,50 +525,10 @@ async def run_assistant() -> None:
             len(chat_ids),
             sorted(chat_ids),
         )
-
-        global _assistant_self_id
-        _assistant_self_id = me.id
-
-        global _pytgcalls_app
-        _pytgcalls_app = None
-        if _env_truthy("ASSISTANT_JOIN_VC"):
-            _load_pytgcalls()
-            if _PYTGCALLS_IMPORT_ERROR is not None:
-                logger.warning(
-                    "ASSISTANT_JOIN_VC=1 but py-tgcalls isn't installed/importable (%s); "
-                    "the assistant will keep tracking VCs normally, just without joining "
-                    "the call itself. Add py-tgcalls[telethon] to requirements.txt to enable it.",
-                    _PYTGCALLS_IMPORT_ERROR,
-                )
-            else:
-                try:
-                    # Generate the silence file now, off the critical path, instead of
-                    # lazily on the first join — shaves a little off how long the very
-                    # first VC join of this process takes.
-                    await asyncio.to_thread(_silence_file_path)
-                    pytgcalls_app = PyTgCalls(client)
-                    await pytgcalls_app.start()
-                    pytgcalls_app.on_update(
-                        pytgcalls_filters.stream_end(StreamEnded.Type.AUDIO)
-                    )(_on_vc_audio_stream_end)
-                    _pytgcalls_app = pytgcalls_app
-                    logger.info(
-                        "Assistant: ASSISTANT_JOIN_VC=1 — will join tracked calls as a "
-                        "silent audio participant."
-                    )
-                except Exception:
-                    logger.exception(
-                        "Assistant: PyTgCalls failed to start (often a missing ffmpeg "
-                        "binary on the host) — continuing without VC audio-join."
-                    )
-                    _pytgcalls_app = None
-
         await _poll_loop(client, chat_ids)
     finally:
         app_state.assistant_running = False
         app_state.assistant_chat_ids.clear()
-        _pytgcalls_app = None
-        _assistant_self_id = None
         if client.is_connected():
             await client.disconnect()
 
@@ -814,20 +552,10 @@ def start_assistant_background() -> None:
         base_delay = 5.0
         max_delay = 300.0
         delay = base_delay
-
-        # One event loop for this thread's entire lifetime, reused across every retry
-        # attempt below (rather than asyncio.run() making a fresh loop each time). This
-        # matters specifically for _load_pytgcalls(): py-tgcalls pins its internal
-        # sync-compat wrapper to whichever loop is running the first time it's imported,
-        # and a new loop per retry would silently re-break VC audio-join on every
-        # reconnect even though the very first run worked.
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
         while True:
             started = time.monotonic()
             try:
-                loop.run_until_complete(run_assistant())
+                asyncio.run(run_assistant())
                 logger.warning(
                     "Assistant: run_assistant() returned without error (unexpected); not retrying."
                 )
