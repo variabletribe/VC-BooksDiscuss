@@ -3,9 +3,3 @@ python-dotenv>=1.0.0
 pymongo>=4.7
 telethon>=1.36.0
 httpx>=0.27.0
-
-# Optional: only needed for ASSISTANT_JOIN_VC=1 (assistant joins the call itself as a
-# silent audio participant). Also needs the `ffmpeg` binary on PATH at runtime — see
-# the Dockerfile and render.yaml comments. Safe to leave installed even if
-# ASSISTANT_JOIN_VC is unset/off; the bot detects that and simply doesn't use it.
-py-tgcalls[telethon]>=2.3.3
