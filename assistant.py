@@ -300,24 +300,50 @@ def _is_trackable_user(uid: int, user: User | None = None) -> bool:
 
 
 async def _fetch_participants(
-    client: TelegramClient, call
-) -> tuple[Set[int], Dict[int, User], str | None]:
+    client: TelegramClient, call, chat_id: int
+) -> tuple[Set[int], Dict[int, User], str | None, Dict[int, str]]:
     """Merge GetGroupCall + GetGroupParticipants for the fullest participant list.
 
     Also returns the group call's title (the VC "topic"/name, if the call was
     started or renamed with one) — only available via phone.GetGroupCallRequest,
     not from the lightweight InputGroupCall handed to us by GetFullChannelRequest.
+
+    A participant doesn't always show up as a PeerUser: someone using "join as
+    [the group]" (common for anonymous admins — the same identity Telegram uses for
+    their anonymous text messages) appears as a PeerChat/PeerChannel peer instead.
+    Previously these were silently dropped — the admin who started the call would
+    join, never show up in ids at all, and never get counted anywhere. We can't
+    attribute that to their specific personal account (Telegram genuinely doesn't
+    tell us who's behind the anonymous identity), but we can at least track SOME
+    presence for it instead of losing it entirely, using a synthetic negative id
+    (never collides with a real positive Telegram user id) with an explicit label.
+    Returned as a 4th dict (extra_labels) so the caller can seed st.hint_labels.
     """
-    from telethon.tl.types import InputGroupCall
+    from telethon.tl.types import InputGroupCall, PeerChannel, PeerChat
 
     pair = _call_input(call)
     if not pair:
-        return set(), {}, None
+        return set(), {}, None, {}
     cid, ah = pair
     inp = InputGroupCall(id=cid, access_hash=ah)
     ids: Set[int] = set()
     users: Dict[int, User] = {}
+    extra_labels: Dict[int, str] = {}
     title: str | None = None
+
+    def _handle_peer(peer) -> None:
+        if isinstance(peer, PeerUser):
+            if _is_trackable_user(peer.user_id):
+                ids.add(peer.user_id)
+            return
+        if isinstance(peer, (PeerChat, PeerChannel)):
+            raw_id = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
+            pseudo_id = -abs(raw_id) if raw_id else -abs(chat_id)
+            ids.add(pseudo_id)
+            extra_labels.setdefault(pseudo_id, "Anonymous Admin (joined as the group)")
+            return
+        if os.getenv("ASSISTANT_DEBUG"):
+            logger.info("Assistant: unhandled VC participant peer type %r", type(peer).__name__)
 
     try:
         res = await client(functions.phone.GetGroupCallRequest(call=inp, limit=500))
@@ -325,9 +351,7 @@ async def _fetch_participants(
         if raw_title and raw_title.strip():
             title = raw_title.strip()
         for p in res.participants:
-            peer = p.peer
-            if isinstance(peer, PeerUser) and _is_trackable_user(peer.user_id):
-                ids.add(peer.user_id)
+            _handle_peer(p.peer)
         for u in res.users:
             if isinstance(u, User) and _is_trackable_user(u.id, u):
                 users[u.id] = u
@@ -356,9 +380,7 @@ async def _fetch_participants(
             logger.exception("Assistant GetGroupParticipants failed")
             break
         for p in res.participants:
-            peer = p.peer
-            if isinstance(peer, PeerUser) and _is_trackable_user(peer.user_id):
-                ids.add(peer.user_id)
+            _handle_peer(p.peer)
         for u in res.users:
             if isinstance(u, User) and _is_trackable_user(u.id, u):
                 users[u.id] = u
@@ -367,7 +389,7 @@ async def _fetch_participants(
             break
     if os.getenv("ASSISTANT_DEBUG"):
         logger.info("Assistant merged participant ids: %s", len(ids))
-    return ids, users, title
+    return ids, users, title, extra_labels
 
 
 async def _resolve_users(client: TelegramClient, st: _CallState, uids: Set[int]) -> None:
@@ -626,38 +648,36 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 if st is not None and st.call_id != call_id:
                     await _finalize_call(client, chat_id, st, now)
                     st = None
+                is_new_call = st is None
                 if st is None:
                     states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
 
+                # Join the moment the voice chat starts — don't wait on a participant
+                # fetch first (that's a whole extra network round-trip, and was making
+                # the join noticeably slower than the call itself in quick tests).
+                if is_new_call and _pytgcalls_app is not None and not st.joined_call_audio:
+                    asyncio.create_task(
+                        _join_vc_audio(chat_id, st), name=f"vc-join-audio-{chat_id}"
+                    )
+
                 _apply_bot_hints(st, chat_id, now)
 
-                current_ids, user_map, call_title = await _fetch_participants(client, call)
+                current_ids, user_map, call_title, extra_labels = await _fetch_participants(
+                    client, call, chat_id
+                )
                 st.user_cache.update(user_map)
                 st.seen_ids.update(current_ids)
+                st.hint_labels.update(extra_labels)
                 if call_title:
                     st.vc_title = call_title
-
-                # Join the call's audio the moment a real person is in it, and leave the
-                # moment none are — current_ids never includes the assistant's own
-                # account (see _is_trackable_user), so this reflects real occupancy even
-                # while the assistant itself is sitting in the call.
-                if _pytgcalls_app is not None:
-                    if current_ids and not st.joined_call_audio:
-                        asyncio.create_task(
-                            _join_vc_audio(chat_id, st), name=f"vc-join-audio-{chat_id}"
-                        )
-                    elif not current_ids and st.joined_call_audio:
-                        asyncio.create_task(
-                            _leave_vc_audio(chat_id, st), name=f"vc-leave-audio-{chat_id}"
-                        )
 
                 joined = current_ids - st.last_ids
                 left = st.last_ids - current_ids
                 for uid in joined:
                     st.seen_ids.add(uid)
                     st.join_at[uid] = now
-                    if _is_trackable_user(uid):
+                    if uid > 0 and _is_trackable_user(uid):
                         asyncio.create_task(
                             _post_vc_join_welcome(client, chat_id, st, uid),
                             name=f"vc-join-welcome-{chat_id}-{uid}",
