@@ -8,6 +8,8 @@
 # marked sync: false below, so Render will prompt you to fill them in manually.
 # Optional: TELEGRAM_WEBHOOK_SECRET (Telegram sends X-Telegram-Bot-Api-Secret-Token).
 # Optional: KEEP_ALIVE_INTERVAL_SECONDS (default 300), KEEP_ALIVE_DISABLE=1 to turn off self-ping.
+# Optional: VC_AUTOJOIN_DISABLE=1 to stop the assistant account from auto-joining group calls
+# (see vc_autojoin.py) — VC time-tracking and everything else is unaffected either way.
 # If /start is dead on free Web tier (webhook 521): add FORCE_POLLING=1 — only when ONE service uses BOT_TOKEN.
 # Use exactly ONE service with this repo per BOT_TOKEN. Suspend any old Worker that still polls.
 services:
@@ -16,7 +18,23 @@ services:
     runtime: python
     plan: free
     numInstances: 1
-    buildCommand: pip install -r requirements.txt
+    # The ffmpeg download below is only for the optional VC auto-join feature
+    # (vc_autojoin.py). Render's native Python runtime has no apt-get/root
+    # access, so this fetches a prebuilt static ffmpeg binary instead and
+    # drops it at ./bin/ffmpeg, which vc_autojoin.py puts on PATH at runtime.
+    # If this step ever breaks (e.g. the URL moves), auto-join just logs a
+    # warning and no-ops — it will NOT break the bot or VC time-tracking.
+    # Set VC_AUTOJOIN_DISABLE=1 to skip needing ffmpeg entirely.
+    buildCommand: |
+      pip install -r requirements.txt
+      mkdir -p bin
+      if [ ! -x bin/ffmpeg ]; then
+        curl -fL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz \
+          && tar -xf /tmp/ffmpeg.tar.xz -C /tmp \
+          && cp /tmp/ffmpeg-*-amd64-static/ffmpeg bin/ffmpeg \
+          && chmod +x bin/ffmpeg \
+          || echo "ffmpeg download failed — VC auto-join will be disabled at runtime, everything else is unaffected"
+      fi
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
