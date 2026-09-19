@@ -31,6 +31,7 @@ from telethon.tl.types import GroupCallDiscarded, PeerUser, User
 
 import db as dbmod
 import state as app_state
+import vc_autojoin
 
 logger = logging.getLogger(__name__)
 
@@ -432,6 +433,7 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
 
                 active = _is_live_group_call(call)
                 if not active:
+                    await vc_autojoin.on_call_ended(chat_id)
                     if st is not None:
                         await _finalize_call(client, chat_id, st, now)
                         del states[chat_id]
@@ -446,6 +448,7 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                 if st is None:
                     states[chat_id] = _CallState(call_id=int(call_id), started_at=now)
                     st = states[chat_id]
+                    await vc_autojoin.on_call_started(chat_id)
 
                 _apply_bot_hints(st, chat_id, now)
 
@@ -465,6 +468,8 @@ async def _poll_loop(client: TelegramClient, chat_ids: set[int]) -> None:
                     if ja is not None:
                         st.accumulated[uid] = st.accumulated.get(uid, 0) + (now - ja).total_seconds()
                 st.last_ids = current_ids
+
+                await vc_autojoin.refresh_if_needed(chat_id)
 
             except Exception:
                 logger.exception("Assistant poll error chat_id=%s", chat_id)
@@ -525,6 +530,7 @@ async def run_assistant() -> None:
             len(chat_ids),
             sorted(chat_ids),
         )
+        await vc_autojoin.init(client)
         await _poll_loop(client, chat_ids)
     finally:
         app_state.assistant_running = False
