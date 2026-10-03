@@ -2013,10 +2013,14 @@ async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     key = (update.effective_chat.id, msg.from_user.id)
     if key not in _tg_code_seen:
-        await asyncio.to_thread(
-            dbmod.get_or_assign_tg_code, key[0], key[1], _user_label(msg.from_user)
-        )
+        try:
+            await asyncio.to_thread(
+                dbmod.get_or_assign_tg_code, key[0], key[1], _user_label(msg.from_user)
+            )
+        except Exception:
+            logger.exception("Telegram code assignment failed chat_id=%s", key[0])
         _tg_code_seen.add(key)
+
 
 
 # --- @admin tagging ----------------------------------------------------------
