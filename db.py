@@ -255,6 +255,12 @@ def record_vc_session(
     duration_sec: int,
     started_at: datetime | None,
     participants: Iterable[tuple[int, str, int]],
+    for _uid, _name, _est in participants:
+        if _uid > 0:
+            try:
+                get_or_assign_tg_code(chat_id, _uid, _name)
+            except Exception:
+                pass
     
 ) -> None:
     """participants: (user_id, display_name, estimated_seconds)."""
