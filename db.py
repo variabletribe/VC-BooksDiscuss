@@ -209,6 +209,8 @@ def init_db() -> None:
     _db.known_users.create_index([("chat_id", ASCENDING), ("username", ASCENDING)])
     # topics: VC topic suggestions, permanent serial numbers (see _next_topic_serial).
     _db.topics.create_index([("chat_id", ASCENDING), ("state", ASCENDING), ("serial", ASCENDING)])
+    _db.meet_codes.create_index([("chat_id", ASCENDING), ("code", ASCENDING)], unique=True)
+    _db.tg_codes.create_index([("chat_id", ASCENDING), ("code", ASCENDING)], unique=True)
 
 
 def _coll(name: str):
@@ -253,8 +255,10 @@ def record_vc_session(
     duration_sec: int,
     started_at: datetime | None,
     participants: Iterable[tuple[int, str, int]],
+    
 ) -> None:
     """participants: (user_id, display_name, estimated_seconds)."""
+    participants = list(participants)
     coll = _coll("vc_sessions")
     if ended_at.tzinfo is None:
         ended_at = ended_at.replace(tzinfo=timezone.utc)
@@ -265,6 +269,9 @@ def record_vc_session(
         {"user_id": uid, "display_name": name[:512], "estimated_seconds": est}
         for uid, name, est in participants
     ]
+    for _uid, _name, _est in participants:
+        if _uid > 0:
+            get_or_assign_tg_code(chat_id, _uid, _name)
     coll.insert_one(
         {
             "chat_id": chat_id,
@@ -1223,8 +1230,8 @@ def fetch_all_known_user_ids(chat_id: int) -> list[tuple[int, str]]:
             }
         },
     ]
-    rows = list(coll.aggregate(pipeline))
-    return [(int(r["_id"]), str(r["display_name"])) for r in rows]
+    rows = list(coll.aggregate(pipeline)) 
+    return [(int(r["_id"]), str(r["display_name"])) for r in rows if int(r["_id"]) > 0]
 
 
 # --- Admin-only export / lookup (bot.py: /exportdata, /user) ----------------
@@ -1994,3 +2001,176 @@ def award_engagement_xp(chat_id: int, user_id: int, display_name: str, amount: i
         },
         upsert=True,
     )
+
+
+# =============================================================================
+# Google Meet: watches, permanent 3-digit codes, linking
+# =============================================================================
+
+
+def add_meet_watch(chat_id: int, code: str, by_id: int, by_name: str) -> bool:
+    try:
+        _coll("meet_watches").insert_one({
+            "_id": f"{chat_id}:{code}", "chat_id": chat_id, "code": code,
+            "by_id": by_id, "by_name": by_name[:512],
+            "created_at": datetime.now(timezone.utc),
+        })
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+def list_meet_watches(chat_id: int | None = None) -> list[dict]:
+    q = {"chat_id": chat_id} if chat_id is not None else {}
+    return list(_coll("meet_watches").find(q))
+
+
+def remove_meet_watch(watch_id: str) -> bool:
+    return _coll("meet_watches").delete_one({"_id": watch_id}).deleted_count > 0
+
+
+def _next_code(chat_id: int, kind: str) -> int:
+    doc = _coll("code_counters").find_one_and_update(
+        {"_id": f"{chat_id}:{kind}"}, {"$inc": {"seq": 1}},
+        upsert=True, return_document=ReturnDocument.AFTER,
+    )
+    code = 99 + int(doc["seq"])          # first code is 100, so codes are always 3 digits
+    if code > 999:
+        raise RuntimeError("Out of 3-digit codes for this group")
+    return code
+
+
+def get_or_assign_meet_code(chat_id: int, google_key: str, name: str) -> dict:
+    coll = _coll("meet_codes")
+    _id = f"{chat_id}:{google_key}"
+    d = coll.find_one({"_id": _id})
+    if d:
+        return d
+    code = _next_code(chat_id, "meet")
+    try:
+        coll.insert_one({
+            "_id": _id, "chat_id": chat_id, "google_key": google_key,
+            "name": name[:512], "code": code, "linked_tg_user_id": None,
+            "created_at": datetime.now(timezone.utc),
+        })
+    except DuplicateKeyError:
+        pass
+    return coll.find_one({"_id": _id})
+
+
+def get_or_assign_tg_code(chat_id: int, user_id: int, name: str) -> int:
+    if user_id <= 0:
+        return 0
+    coll = _coll("tg_codes")
+    _id = f"{chat_id}:{user_id}"
+    d = coll.find_one({"_id": _id})
+    if d:
+        return int(d["code"])
+    code = _next_code(chat_id, "tg")
+    try:
+        coll.insert_one({
+            "_id": _id, "chat_id": chat_id, "user_id": user_id,
+            "name": name[:512], "code": code,
+            "created_at": datetime.now(timezone.utc),
+        })
+        return code
+    except DuplicateKeyError:
+        return int(coll.find_one({"_id": _id})["code"])
+
+
+def get_my_codes(chat_id: int, user_id: int) -> tuple[int | None, int | None]:
+    """(telegram_code, linked_meet_code)"""
+    t = _coll("tg_codes").find_one({"_id": f"{chat_id}:{user_id}"})
+    m = _coll("meet_codes").find_one({"chat_id": chat_id, "linked_tg_user_id": user_id})
+    return (int(t["code"]) if t else None, int(m["code"]) if m else None)
+
+
+def preview_link_codes(chat_id: int, meet_code: int, tg_code: int):
+    """Returns (error_or_None, meet_doc, tg_doc)."""
+    m = _coll("meet_codes").find_one({"chat_id": chat_id, "code": meet_code})
+    t = _coll("tg_codes").find_one({"chat_id": chat_id, "code": tg_code})
+    if not m:
+        return f"No Meet code {meet_code} in this group.", None, None
+    if not t:
+        return f"No Telegram code {tg_code} in this group.", None, None
+    if m.get("linked_tg_user_id"):
+        return f"Meet code {meet_code} is already linked.", None, None
+    if _coll("meet_codes").find_one({"chat_id": chat_id, "linked_tg_user_id": t["user_id"]}):
+        return f"Telegram code {tg_code} is already linked to another Meet code.", None, None
+    return None, m, t
+
+
+def merge_synthetic_into_user(chat_id: int, synthetic_id: int, real_id: int, real_name: str) -> None:
+    sess = _coll("vc_sessions")
+    att = _coll("user_attendance")
+    syn = att.find_one({"_id": f"{chat_id}:{synthetic_id}"}) or {}
+
+    # 1) Move the Meet sessions onto the real Telegram user.
+    sess.update_many(
+        {"chat_id": chat_id, "participants.user_id": synthetic_id},
+        {"$set": {"participants.$[p].user_id": real_id}},
+        array_filters=[{"p.user_id": synthetic_id}],
+    )
+
+    # 2) Recompute streaks from all of this user's sessions (Telegram + Meet).
+    threshold = present_threshold_sec()
+    days = set()
+    for s in sess.find({"chat_id": chat_id, "participants.user_id": real_id},
+                       {"participants.$": 1, "ended_at": 1}):
+        p = (s.get("participants") or [{}])[0]
+        if int(p.get("estimated_seconds", 0)) > threshold:
+            days.add(s["ended_at"].date())
+    longest = run = 0
+    prev = None
+    for d in sorted(days):
+        run = run + 1 if prev and (d - prev).days == 1 else 1
+        longest = max(longest, run)
+        prev = d
+    today = datetime.now(timezone.utc).date()
+    current = run if prev and (today - prev).days <= 1 else 0
+
+    # 3) Make sure the real doc exists, then merge (two steps avoid $setOnInsert/$inc conflicts).
+    real_doc_id = f"{chat_id}:{real_id}"
+    att.update_one(
+        {"_id": real_doc_id},
+        {"$setOnInsert": {"chat_id": chat_id, "user_id": real_id, "display_name": real_name[:512],
+                          "xp": 0, "present_days": 0, "current_streak": 0,
+                          "longest_streak": 0, "badges": {}}},
+        upsert=True,
+    )
+    existing = att.find_one({"_id": real_doc_id})
+    _migrate_badges_field(existing)
+
+    inc = {"xp": int(syn.get("xp", 0)),
+           "present_days": int(syn.get("present_days", 0)),
+           "session_count": int(syn.get("session_count", 0))}
+    syn_badges = syn.get("badges")
+    if isinstance(syn_badges, dict):
+        for bid, cnt in syn_badges.items():
+            if bid in BADGES:
+                inc[f"badges.{bid}"] = int(cnt)
+    sets = {"current_streak": current,
+            "longest_streak": max(longest, int(existing.get("longest_streak", 0)))}
+    if prev:
+        sets["last_present_date"] = prev.strftime("%Y-%m-%d")
+    att.update_one({"_id": real_doc_id}, {"$inc": inc, "$set": sets})
+    att.delete_one({"_id": f"{chat_id}:{synthetic_id}"})
+
+
+def link_codes(chat_id: int, meet_code: int, tg_code: int, by_id: int) -> str | None:
+    err, m, t = preview_link_codes(chat_id, meet_code, tg_code)
+    if err:
+        return err
+    _coll("meet_codes").update_one(
+        {"_id": m["_id"]},
+        {"$set": {"linked_tg_user_id": t["user_id"], "linked_by": by_id,
+                  "linked_at": datetime.now(timezone.utc)}},
+    )
+    merge_synthetic_into_user(chat_id, -meet_code, int(t["user_id"]), str(t["name"]))
+    return None
+
+
+def list_codes(chat_id: int) -> tuple[list[dict], list[dict]]:
+    meet = list(_coll("meet_codes").find({"chat_id": chat_id}).sort("code", ASCENDING))
+    tg = list(_coll("tg_codes").find({"chat_id": chat_id}).sort("code", ASCENDING))
+    return meet, tg
