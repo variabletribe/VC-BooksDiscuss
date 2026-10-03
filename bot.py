@@ -456,12 +456,7 @@ HELP_CATEGORIES: dict[str, str] = {
     "groupadmin": "🛠️ Group Admin Tools",
     "botadmin": "👑 Bot Owner Tools",
     "meet": "🎥 Google Meet",
-    "gmeetrec": ("meet", "/gmeetrec abc-defg-hij", "Start tracking a live Google Meet. Attendance is posted after it ends.", "Group admin"),
-    "gmeetstatus": ("meet", "/gmeetstatus", "Which Meets are being tracked in this group.", "Group admin"),
-    "gmeetstop": ("meet", "/gmeetstop abc-defg-hij", "Stop tracking a Meet without recording it.", "Group admin"),
-    "linkcode": ("meet", "/linkcode 321-325", "Link a Meet code to a Telegram code permanently (Meet first, then Telegram).", "Bot admin"),
-    "codes": ("meet", "/codes [meet|tg]", "View Meet codes, Telegram codes and who is linked.", "Bot admin"),
-    "mycode": ("meet", "/mycode", "Your Telegram code and linked Meet code.", "Anyone"),
+   
 }
 
 HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
@@ -534,6 +529,12 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "exportdata": ("botadmin", "/exportdata [chat_id]", "CSV of every user who's joined a VC — hours, present days, streaks, XP, level, join dates. Works only in a DM with the bot.", "Bot admin, DM only"),
     "user": ("botadmin", "/user USER_ID [chat_id]", "Full stats for any one user by id, without needing them to run /mystats themselves. DM only.", "Bot admin, DM only"),
     "health": ("botadmin", "/health", "Checks MongoDB, the Telegram Bot API, the Telethon assistant, and Groq — catches a silent failure before it's noticed the hard way. DM only.", "Bot admin, DM only"),
+    "gmeetrec": ("meet", "/gmeetrec abc-defg-hij", "Start tracking a live Google Meet. Attendance is posted after it ends.", "Group admin"),
+    "gmeetstatus": ("meet", "/gmeetstatus", "Which Meets are being tracked in this group.", "Group admin"),
+    "gmeetstop": ("meet", "/gmeetstop abc-defg-hij", "Stop tracking a Meet without recording it.", "Group admin"),
+    "linkcode": ("meet", "/linkcode 321-325", "Link a Meet code to a Telegram code permanently (Meet first, then Telegram).", "Bot admin"),
+    "codes": ("meet", "/codes [meet|tg]", "View Meet codes, Telegram codes and who is linked.", "Bot admin"),
+    "mycode": ("meet", "/mycode", "Your Telegram code and linked Meet code.", "Anyone"),
 }
 
 
