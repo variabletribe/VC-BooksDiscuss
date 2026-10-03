@@ -248,20 +248,12 @@ def list_chats_with_monthly_reports() -> list[int]:
     cursor = coll.find({"monthly_reports": True}, {"_id": 1})
     return [int(d["_id"]) for d in cursor]
 
-
 def record_vc_session(
     chat_id: int,
     ended_at: datetime,
     duration_sec: int,
     started_at: datetime | None,
     participants: Iterable[tuple[int, str, int]],
-    for _uid, _name, _est in participants:
-        if _uid > 0:
-            try:
-                get_or_assign_tg_code(chat_id, _uid, _name)
-            except Exception:
-                pass
-    
 ) -> None:
     """participants: (user_id, display_name, estimated_seconds)."""
     participants = list(participants)
@@ -277,7 +269,10 @@ def record_vc_session(
     ]
     for _uid, _name, _est in participants:
         if _uid > 0:
-            get_or_assign_tg_code(chat_id, _uid, _name)
+            try:
+                get_or_assign_tg_code(chat_id, _uid, _name)
+            except Exception:
+                pass
     coll.insert_one(
         {
             "chat_id": chat_id,
@@ -287,8 +282,6 @@ def record_vc_session(
             "participants": participant_docs,
         }
     )
-
-
 def month_bounds_utc(year: int, month: int) -> tuple[datetime, datetime]:
     start = datetime(year, month, 1, tzinfo=timezone.utc)
     if month == 12:
