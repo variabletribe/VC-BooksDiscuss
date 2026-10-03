@@ -455,6 +455,13 @@ HELP_CATEGORIES: dict[str, str] = {
     "everyone": "🔔 Everyone",
     "groupadmin": "🛠️ Group Admin Tools",
     "botadmin": "👑 Bot Owner Tools",
+    "meet": "🎥 Google Meet",
+    "gmeetrec": ("meet", "/gmeetrec abc-defg-hij", "Start tracking a live Google Meet. Attendance is posted after it ends.", "Group admin"),
+    "gmeetstatus": ("meet", "/gmeetstatus", "Which Meets are being tracked in this group.", "Group admin"),
+    "gmeetstop": ("meet", "/gmeetstop abc-defg-hij", "Stop tracking a Meet without recording it.", "Group admin"),
+    "linkcode": ("meet", "/linkcode 321-325", "Link a Meet code to a Telegram code permanently (Meet first, then Telegram).", "Bot admin"),
+    "codes": ("meet", "/codes [meet|tg]", "View Meet codes, Telegram codes and who is linked.", "Bot admin"),
+    "mycode": ("meet", "/mycode", "Your Telegram code and linked Meet code.", "Anyone"),
 }
 
 HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
@@ -1013,6 +1020,17 @@ async def on_confirmation_callback(update: Update, context: ContextTypes.DEFAULT
                 failed += 1
             await asyncio.sleep(0.05)
         await _safe_edit(query, f"📣 Broadcast done: {sent} sent, {failed} failed (out of {len(users)}).")
+    elif kind == "linkcode":
+        err = await asyncio.to_thread(
+            dbmod.link_codes, chat_id, payload["meet_code"], payload["tg_code"], actor.id
+        )
+        if err:
+            await _safe_edit(query, f"❌ {html.escape(err, quote=False)}")
+        else:
+            await _safe_edit(
+                query,
+                f"✅ Linked Meet #{payload['meet_code']} ↔ Telegram #{payload['tg_code']}. History merged.",
+            )    
 
 
 async def _safe_edit(query, text: str) -> None:
@@ -1992,6 +2010,12 @@ async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg.from_user.username,
         _user_label(msg.from_user),
     )
+    key = (update.effective_chat.id, msg.from_user.id)
+    if key not in _tg_code_seen:
+        await asyncio.to_thread(
+            dbmod.get_or_assign_tg_code, key[0], key[1], _user_label(msg.from_user)
+        )
+        _tg_code_seen.add(key)
 
 
 # --- @admin tagging ----------------------------------------------------------
@@ -4441,6 +4465,13 @@ async def post_init(application: Application) -> None:
         time=dt_time(hour=0, minute=5, tzinfo=timezone.utc),
         name="daily_streak_reset_job",
     )
+    try:
+        import meet_tracker
+        jq.run_repeating(meet_tracker.meet_watch_job, interval=60, first=30, name="meet_watch_job")
+        logger.info("Scheduled Google Meet watch job (every 60s)")
+    except ImportError:
+        logger.warning("google-apps-meet not installed; Meet tracking disabled")
+        
     logger.info("Scheduled hourly check for monthly VC reports (UTC hour=%s)", os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
     logger.info("Scheduled hourly check for weekly digest (Mondays, UTC hour=%s)", os.getenv("MONTHLY_REPORT_HOUR_UTC", "9"))
     logger.info("Scheduled daily streak reset job (00:05 UTC)")
@@ -4534,6 +4565,12 @@ def main() -> None:
     app.add_handler(CommandHandler("floodmode", cmd_floodmode))
     app.add_handler(CommandHandler("timer", cmd_timer))
     app.add_handler(CommandHandler("canceltimer", cmd_canceltimer))
+    app.add_handler(CommandHandler(["gmeetrec", "gmeet_rec"], cmd_gmeetrec))
+    app.add_handler(CommandHandler("gmeetstatus", cmd_gmeetstatus))
+    app.add_handler(CommandHandler("gmeetstop", cmd_gmeetstop))
+    app.add_handler(CommandHandler("linkcode", cmd_linkcode))
+    app.add_handler(CommandHandler("codes", cmd_codes))
+    app.add_handler(CommandHandler("mycode", cmd_mycode))
     # Inline-button callbacks: generic confirm/cancel (ban, removeuser, broadcast) and
     # new-member captcha verification. Matched by callback_data prefix via `pattern`.
     app.add_handler(CallbackQueryHandler(on_confirmation_callback, pattern=r"^(confirm|cancel):"))
