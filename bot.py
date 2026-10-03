@@ -264,7 +264,7 @@ def _start_http_on_port_for_render() -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.write(b"ok")
+            self.wfile.write(b"ok")
 
     def _run():
         HTTPServer(("0.0.0.0", port), _Handler).serve_forever()
@@ -3588,6 +3588,8 @@ async def cmd_disallowlink(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    
+    
     """Show the list of users allowed to send links."""
     if not update.message or not update.effective_chat:
         return
@@ -3615,6 +3617,192 @@ async def cmd_allowlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
+# =============================================================================
+# Google Meet: /gmeetrec, /gmeetstatus, /gmeetstop, /linkcode, /codes, /mycode
+# =============================================================================
+
+_LINK_RE = re.compile(r"^(\d{3})-(\d{3})$")
+_tg_code_seen: set[tuple[int, int]] = set()
+
+
+async def cmd_gmeetrec(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can start Meet tracking.")
+        return
+    try:
+        import meet_tracker
+    except ImportError:
+        await _reply_autodelete(update, context, "Meet tracking isn't installed (missing google-apps-meet).")
+        return
+    code = meet_tracker.normalize_meet_code(context.args[0] if context.args else "")
+    if not code:
+        await _reply_autodelete(update, context, "Usage: /gmeetrec abc-defg-hij (or the full Meet link)")
+        return
+    status = await asyncio.to_thread(meet_tracker.find_live_conference, code)
+    if status == "error":
+        await _reply_autodelete(
+            update, context,
+            "Couldn't read that meeting from the Meet API. Check the Google credentials, "
+            "and that the meeting belongs to the authorized Google account.",
+        )
+        return
+    if status is None:
+        await _reply_autodelete(update, context, "No live meeting found for that code. Start the meeting first, then retry.")
+        return
+    added = await asyncio.to_thread(
+        dbmod.add_meet_watch, chat.id, code, update.effective_user.id, _user_label(update.effective_user)
+    )
+    await _reply_autodelete(
+        update, context,
+        f"🎥 Tracking Meet {code}. Attendance will be posted after it ends." if added
+        else f"Already tracking {code}.",
+    )
+
+
+async def cmd_gmeetstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can view this.")
+        return
+    watches = await asyncio.to_thread(dbmod.list_meet_watches, chat.id)
+    if not watches:
+        await _reply_autodelete(update, context, "No Meets are being tracked in this group.")
+        return
+    lines = ["🎥 <b>Tracked Meets</b>", ""]
+    for w in watches:
+        lines.append(f"• {html.escape(w['code'], quote=False)} — started by {html.escape(w.get('by_name', '?'), quote=False)}")
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_gmeetstop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can stop tracking.")
+        return
+    try:
+        import meet_tracker
+    except ImportError:
+        return
+    code = meet_tracker.normalize_meet_code(context.args[0] if context.args else "")
+    if not code:
+        await _reply_autodelete(update, context, "Usage: /gmeetstop abc-defg-hij")
+        return
+    removed = await asyncio.to_thread(dbmod.remove_meet_watch, f"{chat.id}:{code}")
+    await _reply_autodelete(
+        update, context,
+        f"⏹️ Stopped tracking {code}. Nothing will be recorded for it." if removed
+        else f"{code} wasn't being tracked.",
+    )
+
+
+async def cmd_linkcode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin only: /linkcode <meetcode>-<tgcode>, e.g. /linkcode 321-325"""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in the group.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await _reply_autodelete(update, context, "Bot admins only.")
+        return
+    m = _LINK_RE.match((context.args[0] if context.args else "").strip())
+    if not m:
+        await _reply_autodelete(update, context, "Usage: /linkcode MEET-TG, e.g. /linkcode 321-325")
+        return
+    meet_code, tg_code = int(m.group(1)), int(m.group(2))
+    err, mdoc, tdoc = await asyncio.to_thread(dbmod.preview_link_codes, chat.id, meet_code, tg_code)
+    if err:
+        await _reply_autodelete(update, context, err)
+        return
+    token = _register_pending_confirmation(
+        "linkcode", chat.id, update.effective_user.id,
+        {"meet_code": meet_code, "tg_code": tg_code},
+    )
+    await update.message.reply_text(
+        f"🔗 Link Meet <b>#{meet_code}</b> ({html.escape(mdoc['name'], quote=False)}) "
+        f"→ Telegram <b>#{tg_code}</b> ({html.escape(tdoc['name'], quote=False)})?\n"
+        f"<i>This is permanent. Their Meet history will be merged into the Telegram account.</i>",
+        parse_mode="HTML", reply_markup=_confirm_keyboard(token),
+    )
+
+
+async def cmd_codes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/codes [meet|tg|linked] — bot admin only."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in the group.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await _reply_autodelete(update, context, "Bot admins only.")
+        return
+    which = context.args[0].lower() if context.args else "linked"
+    meet, tg = await asyncio.to_thread(dbmod.list_codes, chat.id)
+    tg_by_user = {int(t["user_id"]): t for t in tg}
+    meet_by_user = {int(d["linked_tg_user_id"]): d for d in meet if d.get("linked_tg_user_id")}
+    CAP = 60
+    if which == "meet":
+        lines = [f"🎥 <b>Meet codes</b> ({len(meet)})", ""]
+        for d in meet[:CAP]:
+            t = tg_by_user.get(int(d["linked_tg_user_id"])) if d.get("linked_tg_user_id") else None
+            link = f" → TG #{t['code']}" if t else ""
+            lines.append(f"#{d['code']} {html.escape(d['name'], quote=False)}{link}")
+        if len(meet) > CAP:
+            lines.append(f"<i>+ {len(meet) - CAP} more not shown.</i>")
+    elif which == "tg":
+        lines = [f"💬 <b>Telegram codes</b> ({len(tg)})", ""]
+        for t in tg[:CAP]:
+            d = meet_by_user.get(int(t["user_id"]))
+            link = f" → Meet #{d['code']}" if d else ""
+            lines.append(f"#{t['code']} {html.escape(t['name'], quote=False)}{link}")
+        if len(tg) > CAP:
+            lines.append(f"<i>+ {len(tg) - CAP} more not shown.</i>")
+    else:
+        linked = [d for d in meet if d.get("linked_tg_user_id")]
+        lines = [f"🔗 <b>Linked</b> ({len(linked)})", ""]
+        for d in linked[:CAP]:
+            t = tg_by_user.get(int(d["linked_tg_user_id"]))
+            lines.append(f"Meet #{d['code']} ↔ TG #{t['code'] if t else '?'} — {html.escape(d['name'], quote=False)}")
+        if len(linked) > CAP:
+            lines.append(f"<i>+ {len(linked) - CAP} more not shown.</i>")
+        lines += ["", f"Unlinked Meet codes: {len(meet) - len(linked)} · Telegram codes: {len(tg)}",
+                  "<i>Use /codes meet or /codes tg for the full lists.</i>"]
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_mycode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    user = update.effective_user
+    await asyncio.to_thread(dbmod.get_or_assign_tg_code, chat.id, user.id, _user_label(user))
+    tg_code, meet_code = await asyncio.to_thread(dbmod.get_my_codes, chat.id, user.id)
+    meet_text = f"Meet code: <b>#{meet_code}</b> (linked)" if meet_code else "Meet: not linked yet"
+    await _reply_autodelete(
+        update, context, f"🔢 Telegram code: <b>#{tg_code}</b>\n{meet_text}", parse_mode="HTML"
+    )
+    
 async def _http_bot_send_message(chat_id: int, text: str) -> bool:
     """Direct Bot API HTTP (works even when python-telegram-bot polling hits Conflict)."""
     token = (os.environ.get("BOT_TOKEN") or "").strip()
