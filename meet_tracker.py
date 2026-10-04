@@ -28,12 +28,24 @@ def normalize_meet_code(raw: str) -> str | None:
     return t if MEET_CODE_RE.match(t) else None
 
 
+def _env(name: str) -> str:
+    return (os.environ.get(name) or "").strip().strip('"').strip("'")
+
+
 def _client():
+    cid = _env("GOOGLE_CLIENT_ID")
+    secret = _env("GOOGLE_CLIENT_SECRET")
+    logger.info(
+        "Meet creds check: id_ok=%s secret_prefix_ok=%s secret_len=%s",
+        cid.endswith(".apps.googleusercontent.com"),
+        secret.startswith("GOCSPX-"),
+        len(secret),
+    )
     creds = Credentials(
         None,
-        refresh_token=os.environ["GOOGLE_REFRESH_TOKEN"],
-        client_id=os.environ["GOOGLE_CLIENT_ID"],
-        client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+        refresh_token=_env("GOOGLE_REFRESH_TOKEN"),
+        client_id=cid,
+        client_secret=secret,
         token_uri="https://oauth2.googleapis.com/token",
         scopes=SCOPES,
     )
