@@ -80,13 +80,15 @@ def _collect(c, rec, ended: bool):
     """[(google_key, display_name, seconds)] for everyone seen so far."""
     totals: dict[str, list] = {}
     for p in c.list_participants(parent=rec.name):
-        if p.signed_in_user.user:
-            key, name = p.signed_in_user.user, p.signed_in_user.display_name
-        elif p.anonymous_user.display_name:
+        if _has(p, "signedin_user"):
+            key, name = p.signedin_user.user, p.signedin_user.display_name
+        elif _has(p, "anonymous_user"):
             key, name = f"anon:{p.anonymous_user.display_name}", p.anonymous_user.display_name
-        elif p.phone_user.display_name:
+        elif _has(p, "phone_user"):
             key, name = f"phone:{p.phone_user.display_name}", p.phone_user.display_name
         else:
+            continue
+        if not key:
             continue
         entry = totals.setdefault(key, [name or key, 0])   # created even if still in the call
         for s in c.list_participant_sessions(parent=p.name):
@@ -100,8 +102,7 @@ def _collect(c, rec, ended: bool):
                 continue
             entry[1] += max(0, int((end - s.start_time).total_seconds()))
     return [(k, v[0], v[1]) for k, v in totals.items()]
-
-
+    
 def _check_watch(w: dict):
     c, rec = _latest_record(w["code"])
     if rec is None:
