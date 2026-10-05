@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, NamedTuple
 
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -620,12 +620,13 @@ def get_my_stats(chat_id: int, user_id: int, fallback_display_name: str = "") ->
 
     level, into_level, for_next = _level_for_xp(xp)
     vc_stats = get_user_vc_stats(chat_id, user_id)
+    vc_adjust = int(doc.get("vc_adjust", 0)) if doc else 0
 
     return MyStats(
         user_id=user_id,
         display_name=display_name,
         present_days=present_days,
-        vc_count=vc_stats.vc_count,
+        vc_count=max(0, vc_stats.vc_count + vc_adjust),
         total_seconds=vc_stats.total_seconds,
         group_joined_at=group_joined_at,
         first_vc_at=vc_stats.first_vc_at,
@@ -2189,3 +2190,74 @@ def list_codes(chat_id: int) -> tuple[list[dict], list[dict]]:
     meet = list(_coll("meet_codes").find({"chat_id": chat_id}).sort("code", ASCENDING))
     tg = list(_coll("tg_codes").find({"chat_id": chat_id}).sort("code", ASCENDING))
     return meet, tg
+
+
+# =============================================================================
+# Admin stat edits (/setstat)
+# =============================================================================
+
+EDITABLE_STATS = {
+    "vcs": "vcs", "vc": "vcs",
+    "days": "present_days", "present_days": "present_days",
+    "streak": "current_streak", "current_streak": "current_streak",
+    "longest": "longest_streak", "longest_streak": "longest_streak",
+}
+
+
+def find_user_by_tg_code(chat_id: int, code: int):
+    d = _coll("tg_codes").find_one({"chat_id": chat_id, "code": code})
+    return (int(d["user_id"]), str(d["name"])) if d else None
+
+
+def preview_stat_edit(chat_id: int, user_id: int, field: str, value: int):
+    """Returns (error_or_None, plan_or_None). plan = {name, old, new, sets}."""
+    att = _coll("user_attendance")
+    doc = att.find_one({"_id": f"{chat_id}:{user_id}"})
+    if not doc:
+        return "No attendance record for that user in this group.", None
+    name = str(doc.get("display_name") or user_id)
+    cur = int(doc.get("current_streak", 0))
+    lng = int(doc.get("longest_streak", 0))
+    today = datetime.now(timezone.utc).date()
+    sets: dict = {}
+
+    if field == "present_days":
+        old, new = int(doc.get("present_days", 0)), value
+        sets["present_days"] = new
+    elif field == "current_streak":
+        old, new = cur, value
+        sets["current_streak"] = new
+        if new > lng:
+            sets["longest_streak"] = new
+        if new > 0:
+            keep = False
+            last = doc.get("last_present_date")
+            if last:
+                try:
+                    keep = (today - datetime.strptime(last, "%Y-%m-%d").date()).days <= 1
+                except ValueError:
+                    pass
+            if not keep:
+                # keeps the streak alive through the 00:05 UTC daily reset
+                sets["last_present_date"] = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    elif field == "longest_streak":
+        old, new = lng, value
+        if new < cur:
+            return f"Longest streak can't be lower than the current streak ({cur}). Set the current streak first.", None
+        sets["longest_streak"] = new
+    elif field == "vcs":
+        stats = get_user_vc_stats(chat_id, user_id)
+        old = max(0, stats.vc_count + int(doc.get("vc_adjust", 0)))
+        new = value
+        sets["vc_adjust"] = new - stats.vc_count
+    else:
+        return "Unknown field.", None
+    return None, {"name": name, "old": old, "new": new, "sets": sets}
+
+
+def apply_stat_edit(chat_id: int, user_id: int, field: str, value: int):
+    err, plan = preview_stat_edit(chat_id, user_id, field, value)
+    if err:
+        return err, None
+    _coll("user_attendance").update_one({"_id": f"{chat_id}:{user_id}"}, {"$set": plan["sets"]})
+    return None, plan
