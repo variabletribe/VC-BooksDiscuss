@@ -392,7 +392,8 @@ def fetch_vc_stats(
                 "total": {"$sum": "$participants.estimated_seconds"},
             }
         },
-        {"$sort": {"total": -1, "vcs": -1}},
+    
+        {"$sort": {"total": -1, "vcs": -1, "_id": 1}},
     ]
     rows = list(coll.aggregate(pipeline))
     return [
@@ -961,7 +962,19 @@ def fetch_weekly_digest(chat_id: int, now: datetime | None = None) -> WeeklyDige
     period_start = now.fromtimestamp(now.timestamp() - 7 * 86400, tz=timezone.utc)
 
     stats = fetch_vc_stats(chat_id, period_start, period_end)
-    streaks = fetch_streak_leaderboard(chat_id, limit=5)
+    week_secs = {r.user_id: r.total_seconds for r in stats}
+    streaks = [
+        s for s in fetch_streak_leaderboard(chat_id, limit=100000)
+        if s.current_streak > 0
+    ]
+    streaks.sort(
+        key=lambda s: (
+            -s.current_streak,                 # longer streak first
+            -week_secs.get(s.user_id, 0),      # then most hours this week
+            -s.longest_streak,                 # then longest streak ever
+            s.display_name.lower(),            # then name, so the order is fixed
+        )
+    )
 
     sessions_coll = _coll("vc_sessions")
     match = _match_stage(chat_id, period_start, period_end)
@@ -972,7 +985,7 @@ def fetch_weekly_digest(chat_id: int, now: datetime | None = None) -> WeeklyDige
         period_start=period_start,
         period_end=period_end,
         top_by_hours=stats[:5],
-        top_streaks=[s for s in streaks if s.current_streak > 0][:5],
+        top_streaks=streaks[:5],
         total_sessions=total_sessions,
         total_participant_seconds=total_seconds,
     )
@@ -2148,10 +2161,13 @@ def merge_synthetic_into_user(chat_id: int, synthetic_id: int, real_id: int, rea
         for bid, cnt in syn_badges.items():
             if bid in BADGES:
                 inc[f"badges.{bid}"] = int(cnt)
-    sets = {"current_streak": current,
-            "longest_streak": max(longest, int(existing.get("longest_streak", 0)))}
-    if prev:
-        sets["last_present_date"] = prev.strftime("%Y-%m-%d")
+    existing_current = int(existing.get("current_streak", 0))
+    sets = {"longest_streak": max(longest, current, int(existing.get("longest_streak", 0)))}
+    if current >= existing_current:
+        # Meet days can only extend the streak, never cut it down
+        sets["current_streak"] = current
+        if prev:
+            sets["last_present_date"] = prev.strftime("%Y-%m-%d")
     att.update_one({"_id": real_doc_id}, {"$inc": inc, "$set": sets})
     att.delete_one({"_id": f"{chat_id}:{synthetic_id}"})
 
