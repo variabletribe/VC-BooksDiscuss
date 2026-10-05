@@ -1022,10 +1022,19 @@ async def on_confirmation_callback(update: Update, context: ContextTypes.DEFAULT
                 failed += 1
             await asyncio.sleep(0.05)
         await _safe_edit(query, f"📣 Broadcast done: {sent} sent, {failed} failed (out of {len(users)}).")
+
     elif kind == "linkcode":
         err = await asyncio.to_thread(
             dbmod.link_codes, chat_id, payload["meet_code"], payload["tg_code"], actor.id
         )
+        if err:
+            await _safe_edit(query, f"❌ {html.escape(err, quote=False)}")
+        else:
+            await _safe_edit(
+                query,
+                f"✅ Linked Meet #{payload['meet_code']} ↔ Telegram #{payload['tg_code']}. History merged.",
+            )
+
     elif kind == "setstat":
         err, plan = await asyncio.to_thread(
             dbmod.apply_stat_edit, chat_id, payload["user_id"], payload["field"], payload["value"]
@@ -1041,13 +1050,6 @@ async def on_confirmation_callback(update: Update, context: ContextTypes.DEFAULT
                 query,
                 f"✅ {payload['label']} for {html.escape(plan['name'], quote=False)}: {plan['old']} → {plan['new']}",
             )
-        if err:
-            await _safe_edit(query, f"❌ {html.escape(err, quote=False)}")
-        else:
-            await _safe_edit(
-                query,
-                f"✅ Linked Meet #{payload['meet_code']} ↔ Telegram #{payload['tg_code']}. History merged.",
-            )    
 
 
 async def _safe_edit(query, text: str) -> None:
