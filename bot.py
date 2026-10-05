@@ -535,6 +535,7 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "linkcode": ("meet", "/linkcode 321-325", "Link a Meet code to a Telegram code permanently (Meet first, then Telegram).", "Bot admin"),
     "codes": ("meet", "/codes [meet|tg]", "View Meet codes, Telegram codes and who is linked.", "Bot admin"),
     "mycode": ("meet", "/mycode", "Your Telegram code and linked Meet code.", "Anyone"),
+    "setstat": ("meet", "/setstat USER_ID_or_CODE field value", "Edit VCs joined, present days, current streak or longest streak for one user. Asks to confirm and is logged in /modlog.", "Bot admin"),
 }
 
 
@@ -1025,6 +1026,21 @@ async def on_confirmation_callback(update: Update, context: ContextTypes.DEFAULT
         err = await asyncio.to_thread(
             dbmod.link_codes, chat_id, payload["meet_code"], payload["tg_code"], actor.id
         )
+    elif kind == "setstat":
+        err, plan = await asyncio.to_thread(
+            dbmod.apply_stat_edit, chat_id, payload["user_id"], payload["field"], payload["value"]
+        )
+        if err:
+            await _safe_edit(query, f"❌ {html.escape(err, quote=False)}")
+        else:
+            await asyncio.to_thread(
+                dbmod.log_mod_action, chat_id, "setstat", payload["user_id"], plan["name"],
+                actor.id, _user_label(actor), f"{payload['label']}: {plan['old']} -> {plan['new']}",
+            )
+            await _safe_edit(
+                query,
+                f"✅ {payload['label']} for {html.escape(plan['name'], quote=False)}: {plan['old']} → {plan['new']}",
+            )
         if err:
             await _safe_edit(query, f"❌ {html.escape(err, quote=False)}")
         else:
@@ -3831,6 +3847,63 @@ async def cmd_mycode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _reply_autodelete(
         update, context, f"🔢 Telegram code: <b>#{tg_code}</b>\n{meet_text}", parse_mode="HTML"
     )
+
+_STAT_LABELS = {
+    "vcs": "VCs joined", "present_days": "Present days",
+    "current_streak": "Current streak", "longest_streak": "Longest streak",
+}
+
+
+async def cmd_setstat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin only: /setstat USER_ID_or_TG_CODE FIELD VALUE"""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in the group.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await _reply_autodelete(update, context, "Bot admins only.")
+        return
+    usage = ("Usage: /setstat USER_ID_or_TG_CODE FIELD VALUE\n"
+             "Fields: vcs, days, streak, longest\nExample: /setstat 105 streak 40")
+    args = context.args or []
+    if len(args) != 3:
+        await _reply_autodelete(update, context, usage)
+        return
+    target_raw, field_raw, value_raw = args
+    field = dbmod.EDITABLE_STATS.get(field_raw.lower())
+    if field is None or not target_raw.isdigit() or not value_raw.isdigit():
+        await _reply_autodelete(update, context, usage)
+        return
+    value = int(value_raw)
+    if value > 100000:
+        await _reply_autodelete(update, context, "VALUE is too large.")
+        return
+
+    if len(target_raw) <= 3:
+        found = await asyncio.to_thread(dbmod.find_user_by_tg_code, chat.id, int(target_raw))
+        if not found:
+            await _reply_autodelete(update, context, f"No Telegram code {target_raw} in this group.")
+            return
+        user_id = found[0]
+    else:
+        user_id = int(target_raw)
+
+    err, plan = await asyncio.to_thread(dbmod.preview_stat_edit, chat.id, user_id, field, value)
+    if err:
+        await _reply_autodelete(update, context, err)
+        return
+    label = _STAT_LABELS[field]
+    token = _register_pending_confirmation(
+        "setstat", chat.id, update.effective_user.id,
+        {"user_id": user_id, "field": field, "value": value, "label": label},
+    )
+    await update.message.reply_text(
+        f"✏️ Change <b>{label}</b> for <b>{html.escape(plan['name'], quote=False)}</b> "
+        f"(<code>{user_id}</code>): {plan['old']} → <b>{plan['new']}</b>?",
+        parse_mode="HTML", reply_markup=_confirm_keyboard(token),
+    )
     
 async def _http_bot_send_message(chat_id: int, text: str) -> bool:
     """Direct Bot API HTTP (works even when python-telegram-bot polling hits Conflict)."""
@@ -4576,6 +4649,7 @@ def main() -> None:
     app.add_handler(CommandHandler("linkcode", cmd_linkcode))
     app.add_handler(CommandHandler("codes", cmd_codes))
     app.add_handler(CommandHandler("mycode", cmd_mycode))
+    app.add_handler(CommandHandler("setstat", cmd_setstat))
     # Inline-button callbacks: generic confirm/cancel (ban, removeuser, broadcast) and
     # new-member captcha verification. Matched by callback_data prefix via `pattern`.
     app.add_handler(CallbackQueryHandler(on_confirmation_callback, pattern=r"^(confirm|cancel):"))
