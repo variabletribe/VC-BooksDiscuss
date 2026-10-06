@@ -401,26 +401,42 @@ async def _delete_messages_later(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
 
+
+TELEGRAM_SAFE_LEN = 3800
+
+
+def _split_for_telegram(text: str, limit: int = TELEGRAM_SAFE_LEN) -> list[str]:
+    """Telegram rejects messages over 4096 characters. Split on line breaks so each
+    leaderboard row stays whole (our HTML tags open and close on a single line)."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        if cur and len(cur) + 1 + len(line) > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 async def _reply_autodelete(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
     parse_mode: str | None = None,
 ):
-    """Reply to a command, then — only in groups — schedule both that reply and the
-    person's own /command message for deletion after COMMAND_AUTODELETE_SECONDS.
-
-    Every cmd_* handler below uses this instead of update.message.reply_text directly.
-    Nothing the bot posts on its own initiative goes through this helper, so this only
-    ever affects command-and-response pairs, never the bot's automatic messages.
-
-    Requires the bot to be a group admin with "Delete messages" permission — without it,
-    Telegram just silently refuses the delete (logged at debug level); nothing breaks,
-    the messages simply stay visible.
-    """
+    """Reply to a command (splitting long text), then — only in groups — schedule the
+    command and all reply messages for deletion after COMMAND_AUTODELETE_SECONDS."""
     if not update.message or not update.effective_chat:
         return None
-    sent = await update.message.reply_text(text, parse_mode=parse_mode)
+    sent_msgs = []
+    for chunk in _split_for_telegram(text):
+        sent_msgs.append(await update.message.reply_text(chunk, parse_mode=parse_mode))
+    sent = sent_msgs[0]
     if update.effective_chat.type not in ("group", "supergroup"):
         return sent
     jq = context.job_queue
@@ -431,7 +447,7 @@ async def _reply_autodelete(
         when=COMMAND_AUTODELETE_SECONDS,
         data={
             "chat_id": update.effective_chat.id,
-            "message_ids": [update.message.message_id, sent.message_id],
+            "message_ids": [update.message.message_id] + [m.message_id for m in sent_msgs],
         },
         name=f"autodelete-{update.effective_chat.id}-{sent.message_id}",
     )
@@ -2675,6 +2691,7 @@ async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _reply_autodelete(update, context, _format_attendance_html(rows), parse_mode="HTML")
 
 
+
 async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -2682,22 +2699,30 @@ async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
-
-    now = datetime.now(timezone.utc)
-    y, m = dbmod.previous_calendar_month(now.year, now.month)
-    rows, start, end = await asyncio.to_thread(dbmod.fetch_month_vc_stats, chat.id, y, m)
-    if not rows:
+    try:
+        now = datetime.now(timezone.utc)
+        arg = (context.args[0].lower() if context.args else "")
+        if arg in ("this", "current"):
+            y, m = now.year, now.month
+        else:
+            y, m = dbmod.previous_calendar_month(now.year, now.month)
+        rows, start, end = await asyncio.to_thread(dbmod.fetch_month_vc_stats, chat.id, y, m)
+        if not rows:
+            await _reply_autodelete(
+                update, context, f"No recorded VC data for {_month_name(m)} {y} in this group."
+            )
+            return
+        if start and end:
+            subtitle = f"{_month_name(m)} {y}: {_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
+        else:
+            subtitle = f"{_month_name(m)} {y} (UTC)"
+        text = _format_vc_stats_html(f"Monthly VC report — {_month_name(m)} {y}", subtitle, rows)
+        await _reply_autodelete(update, context, text, parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("monthreport failed chat_id=%s", chat.id)
         await _reply_autodelete(
-            update, context, f"No recorded VC data for {_month_name(m)} {y} in this group."
+            update, context, f"⚠️ Error generating report: {html.escape(str(exc), quote=False)}"
         )
-        return
-    if start and end:
-        subtitle = f"{_month_name(m)} {y}: {_format_date_utc(start)} → {_format_date_utc(end)} (UTC)"
-    else:
-        subtitle = f"{_month_name(m)} {y} (UTC)"
-    text = _format_vc_stats_html(f"Monthly VC report — {_month_name(m)} {y}", subtitle, rows)
-    await _reply_autodelete(update, context, text, parse_mode="HTML")
-
 
 async def cmd_vcstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
@@ -4435,7 +4460,8 @@ async def hourly_monthly_gate(context: ContextTypes.DEFAULT_TYPE) -> None:
             rows,
         )
         try:
-            await bot.send_message(chat_id, text, parse_mode="HTML")
+            for chunk in _split_for_telegram(text):
+                await bot.send_message(chat_id, chunk, parse_mode="HTML")
             await asyncio.to_thread(dbmod.mark_monthly_report_sent, chat_id, report_y, report_m)
         except Exception:
             logger.exception("Failed monthly report chat_id=%s", chat_id)
