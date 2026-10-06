@@ -980,7 +980,11 @@ def fetch_weekly_digest(chat_id: int, now: datetime | None = None) -> WeeklyDige
     sessions_coll = _coll("vc_sessions")
     match = _match_stage(chat_id, period_start, period_end)
     total_sessions = sessions_coll.count_documents(match)
-    total_seconds = sum(r.total_seconds for r in stats)
+    agg = list(sessions_coll.aggregate([
+        {"$match": match},
+        {"$group": {"_id": None, "total": {"$sum": "$duration_sec"}}},
+    ]))
+    total_seconds = int(agg[0]["total"] or 0) if agg else 0
 
     return WeeklyDigest(
         period_start=period_start,
@@ -993,11 +997,14 @@ def fetch_weekly_digest(chat_id: int, now: datetime | None = None) -> WeeklyDige
 
 
 def format_weekly_digest_message(chat_title: str, digest: WeeklyDigest) -> str:
+    secs = digest.total_participant_seconds
+    h, rem = divmod(secs, 3600)
+    run_time = f"{h}h {rem // 60}m" if h else f"{rem // 60}m"
     lines = [
         f"📊 <b>Weekly Digest — {html.escape(chat_title, quote=False)}</b>",
         f"<i>{digest.period_start.strftime('%b %d')} – {digest.period_end.strftime('%b %d')}</i>",
         "",
-        f"🗓️ {digest.total_sessions} VC session(s) · {digest.total_participant_seconds // 3600}h total",
+        f"🗓️ {digest.total_sessions} VC session(s) · {run_time} of VC time",
         "",
     ]
     if digest.top_by_hours:
