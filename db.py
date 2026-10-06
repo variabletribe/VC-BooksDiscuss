@@ -953,6 +953,7 @@ def check_and_award_session_badges(
     return newly_earned
 
 
+
 def fetch_weekly_digest(chat_id: int, now: datetime | None = None) -> WeeklyDigest:
     """Stats for the last 7 days: top performers by hours + streak leaders."""
     if now is None:
@@ -980,6 +981,9 @@ def fetch_weekly_digest(chat_id: int, now: datetime | None = None) -> WeeklyDige
     sessions_coll = _coll("vc_sessions")
     match = _match_stage(chat_id, period_start, period_end)
     total_sessions = sessions_coll.count_documents(match)
+
+    # How long calls actually ran this week: add up each session's own length,
+    # not every participant's time (five people in one 2h call = 2h, not 10h).
     agg = list(sessions_coll.aggregate([
         {"$match": match},
         {"$group": {"_id": None, "total": {"$sum": "$duration_sec"}}},
@@ -1000,6 +1004,7 @@ def format_weekly_digest_message(chat_title: str, digest: WeeklyDigest) -> str:
     secs = digest.total_participant_seconds
     h, rem = divmod(secs, 3600)
     run_time = f"{h}h {rem // 60}m" if h else f"{rem // 60}m"
+
     lines = [
         f"📊 <b>Weekly Digest — {html.escape(chat_title, quote=False)}</b>",
         f"<i>{digest.period_start.strftime('%b %d')} – {digest.period_end.strftime('%b %d')}</i>",
@@ -1023,8 +1028,7 @@ def format_weekly_digest_message(chat_title: str, digest: WeeklyDigest) -> str:
     if not digest.top_by_hours and not digest.top_streaks:
         lines.append("<i>No activity this week.</i>")
     return "\n".join(lines)
-
-
+    
 def format_level_message(info: LevelInfo) -> str:
     safe = html.escape(info.display_name, quote=False)
     if info.xp_for_next_level == -1:
