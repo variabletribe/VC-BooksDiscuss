@@ -552,6 +552,9 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "codes": ("meet", "/codes [meet|tg]", "View Meet codes, Telegram codes and who is linked.", "Bot admin"),
     "mycode": ("meet", "/mycode", "Your Telegram code and linked Meet code.", "Anyone"),
     "setstat": ("meet", "/setstat USER_ID_or_CODE field value", "Edit VCs joined, present days, current streak or longest streak for one user. Asks to confirm and is logged in /modlog.", "Bot admin"),
+    "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
+    "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
+    "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
 }
 
 
@@ -4678,6 +4681,9 @@ def main() -> None:
     app.add_handler(CommandHandler("codes", cmd_codes))
     app.add_handler(CommandHandler("mycode", cmd_mycode))
     app.add_handler(CommandHandler("setstat", cmd_setstat))
+    app.add_handler(CommandHandler("addcmd", cmd_addcmd))
+    app.add_handler(CommandHandler("delcmd", cmd_delcmd))
+    app.add_handler(CommandHandler("cmds", cmd_cmds))
     # Inline-button callbacks: generic confirm/cancel (ban, removeuser, broadcast) and
     # new-member captcha verification. Matched by callback_data prefix via `pattern`.
     app.add_handler(CallbackQueryHandler(on_confirmation_callback, pattern=r"^(confirm|cancel):"))
@@ -4714,6 +4720,7 @@ def main() -> None:
             on_video_chat_service,
         )
     )
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, on_custom_command), group=7)
     # Records "joined the group" timestamps for /mystats (going forward only — see
     # on_new_chat_members's docstring for what this can't recover historically).
     app.add_handler(
