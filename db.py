@@ -422,22 +422,19 @@ def present_threshold_sec() -> int:
         return 1200
 
 
+
 def record_present_attendance(
     chat_id: int,
     participants: Iterable[tuple[int, str, int]],
 ) -> list[AttendanceRow]:
-    """+1 present day per user who stayed longer than the threshold in this call.
+    """+1 present day per user who stayed longer than the threshold in this call,
+    but at most ONE present day per UTC day (a second 20+ min call the same day
+    still counts as a VC and gives XP, just not another day).
     Also awards XP (1 per minute of estimated_seconds, all participants regardless of
     threshold) and updates day-streaks for those who cross the present threshold.
 
     IMPORTANT: MongoDB forbids a field appearing in both `$inc`/`$set` and
-    `$setOnInsert` in the same update — it raises a WriteError ("would create a
-    conflict"). We build the update dict per-user so a field is only ever placed
-    in one operator, never both. This applies to present_days AND to
-    current_streak/longest_streak: whichever branch (crossing vs. not crossing
-    the threshold) sets them via $set must NOT also default them via
-    $setOnInsert in that same call, or every present-day write throws and the
-    whole update (including the xp $inc) silently fails to apply.
+    `$setOnInsert` in the same update, so each field goes in only one operator.
     """
     coll = _coll("user_attendance")
     threshold = present_threshold_sec()
@@ -459,18 +456,11 @@ def record_present_attendance(
             "user_id": uid,
             "display_name": name[:512],
         }
-        set_on_insert: dict = {
-            "badges": {},
-        }
+        set_on_insert: dict = {"badges": {}}
 
         crosses_threshold = sec > threshold
         if crosses_threshold:
-            # present_days AND current_streak/longest_streak are all being
-            # $set/$inc'd this call, so none of them may also appear in
-            # $setOnInsert (that's the bug that made every present-day write
-            # for a fresh OR existing doc throw a WriteError and silently
-            # drop the whole update, including present_days and xp).
-            inc["present_days"] = 1
+            new_day = True  # does this call earn a NEW present day?
             if last_day_str:
                 last_day = datetime.strptime(last_day_str, "%Y-%m-%d").date()
                 gap = (today - last_day).days
@@ -478,17 +468,22 @@ def record_present_attendance(
                     new_streak = current_streak + 1
                 elif gap == 0:
                     new_streak = max(current_streak, 1)
+                    new_day = False  # already got today's present day
                 else:
                     new_streak = 1
             else:
                 new_streak = 1
+
+            if new_day:
+                inc["present_days"] = 1
+            else:
+                set_on_insert["present_days"] = 0  # untouched for an existing doc
+
             new_longest = max(longest_streak, new_streak)
             set_fields["current_streak"] = new_streak
             set_fields["longest_streak"] = new_longest
             set_fields["last_present_date"] = today.strftime("%Y-%m-%d")
         else:
-            # Not incrementing/setting these this call, so it's safe to default
-            # them here on first-ever insert for this user.
             set_on_insert["present_days"] = 0
             set_on_insert["current_streak"] = 0
             set_on_insert["longest_streak"] = 0
@@ -1196,7 +1191,7 @@ def format_attendance_message(earned: list[AttendanceRow]) -> str:
         "📋 <b>Present attendance</b>",
         " <i>Counts from 4 August 2026</i>",
         "",
-        f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
+        f"<i>More than {threshold_min} minutes in a call = +1 present day (max once per day).</i>",
         "",
     ]
     if earned:
@@ -1725,6 +1720,135 @@ def resolve_username(chat_id: int, username: str) -> tuple[int, str] | None:
     return int(doc["user_id"]), str(doc.get("display_name") or f"@{key}")
 
 
+# =============================================================================
+# Custom slash commands: /addcmd, /delcmd, /cmds + the /name handler
+# Unlike filters, these only answer when someone types the command.
+# =============================================================================
+
+_CMD_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+
+
+def _builtin_command_names() -> set[str]:
+    return set(HELP_COMMANDS.keys()) | {"start", "gmeet_rec"}
+
+
+async def cmd_addcmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin: /addcmd <name> <reply text>  — or reply to any message with /addcmd <name>."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can add commands.")
+        return
+
+    usage = (
+        "Usage: /addcmd <name> <reply text>\n"
+        "Or reply to any message (text, photo, video, ...) with /addcmd <name>\n"
+        "Example: /addcmd rules Be kind. No spam."
+    )
+    reply = update.message.reply_to_message
+    if reply is not None:
+        if not context.args:
+            await _reply_autodelete(update, context, usage)
+            return
+        raw_name = context.args[0]
+        data = _filter_data_from_message(reply)
+        if data is None:
+            await _reply_autodelete(update, context, "I can't save that message type as a command.")
+            return
+    else:
+        parsed = _extract_filter_command_body(update.message)
+        if parsed is None:
+            await _reply_autodelete(update, context, usage)
+            return
+        raw_name, body_text, body_entities = parsed
+        data = {
+            "type": "text",
+            "file_id": None,
+            "text": body_text,
+            "entities": [_entity_to_dict(e) for e in body_entities],
+        }
+
+    name = raw_name.lstrip("/").lower()
+    if not _CMD_NAME_RE.match(name):
+        await _reply_autodelete(
+            update, context,
+            "Command names can only use letters, numbers and underscores (max 32), e.g. /addcmd rules ...",
+        )
+        return
+    if name in _builtin_command_names():
+        await _reply_autodelete(update, context, f"/{name} is a built-in command — pick another name.")
+        return
+
+    await asyncio.to_thread(dbmod.add_custom_command, chat.id, name, data)
+    await _reply_autodelete(update, context, f"✅ Command /{name} saved. Anyone can now type /{name}.")
+
+
+async def cmd_delcmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin: /delcmd <name>"""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can delete commands.")
+        return
+    if not context.args:
+        await _reply_autodelete(update, context, "Usage: /delcmd <name>")
+        return
+    name = context.args[0].lstrip("/").lower()
+    removed = await asyncio.to_thread(dbmod.remove_custom_command, chat.id, name)
+    text = f"🗑️ Command /{name} deleted." if removed else f"No custom command /{name} found."
+    await _reply_autodelete(update, context, text)
+
+
+async def cmd_cmds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: list this group's custom commands."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    cmds = await asyncio.to_thread(dbmod.get_custom_commands, chat.id)
+    if not cmds:
+        await _reply_autodelete(
+            update, context,
+            "No custom commands yet.\nAdmins can add one with /addcmd <name> <reply text>",
+        )
+        return
+    lines = [f"📌 <b>Custom commands</b> ({len(cmds)})", ""]
+    lines.extend(f"• /{n}" for n in sorted(cmds))
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def on_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs on every /command in a group (handler group=7, so it never competes with the
+    real command handlers). Answers only if the command is a saved custom command."""
+    msg = update.message
+    if not msg or not msg.text or not update.effective_chat:
+        return
+    if update.effective_chat.type not in ("group", "supergroup"):
+        return
+    token = msg.text.split(None, 1)[0]
+    if not token.startswith("/"):
+        return
+    name, _, target_bot = token[1:].partition("@")
+    name = name.lower()
+    if target_bot and target_bot.lower() != (context.bot.username or "").lower():
+        return  # addressed to a different bot
+    if not _CMD_NAME_RE.match(name) or name in _builtin_command_names():
+        return
+    data = await asyncio.to_thread(dbmod.get_custom_command, update.effective_chat.id, name)
+    if not data:
+        return
+    await _send_filter_response(context, update.effective_chat.id, msg.message_id, data)
+    
 # =============================================================================
 # VC Topic Management (/addtopic, /topics, /deletetopic, /deletedtopics,
 # /topicdone, /alltopics)
@@ -2272,3 +2396,46 @@ def apply_stat_edit(chat_id: int, user_id: int, field: str, value: int):
         return err, None
     _coll("user_attendance").update_one({"_id": f"{chat_id}:{user_id}"}, {"$set": plan["sets"]})
     return None, plan
+
+
+# =============================================================================
+# Custom slash commands (/addcmd, /delcmd, /cmds) — admin-defined /rules, /about ...
+# Stored like filters: {"type", "text", "entities", "file_id"}
+# =============================================================================
+
+_CMD_NAME_OK = re.compile(r"^[a-z0-9_]{1,32}$")
+
+
+def get_custom_commands(chat_id: int) -> dict[str, dict]:
+    doc = _coll("custom_commands").find_one({"_id": chat_id})
+    if not doc:
+        return {}
+    return {str(k): v for k, v in (doc.get("commands") or {}).items()}
+
+
+def get_custom_command(chat_id: int, name: str) -> dict | None:
+    if not _CMD_NAME_OK.match(name):
+        return None
+    doc = _coll("custom_commands").find_one({"_id": chat_id}, {f"commands.{name}": 1})
+    if not doc:
+        return None
+    return (doc.get("commands") or {}).get(name)
+
+
+def add_custom_command(chat_id: int, name: str, data: dict) -> None:
+    if not _CMD_NAME_OK.match(name):
+        raise ValueError("bad command name")
+    _coll("custom_commands").update_one(
+        {"_id": chat_id},
+        {"$set": {f"commands.{name}": data, "chat_id": chat_id}},
+        upsert=True,
+    )
+
+
+def remove_custom_command(chat_id: int, name: str) -> bool:
+    if not _CMD_NAME_OK.match(name):
+        return False
+    result = _coll("custom_commands").update_one(
+        {"_id": chat_id}, {"$unset": {f"commands.{name}": ""}}
+    )
+    return result.modified_count > 0
