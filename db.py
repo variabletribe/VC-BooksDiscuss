@@ -2431,3 +2431,309 @@ def get_last_backup_at() -> datetime | None:
 
 def set_last_backup_at(when: datetime) -> None:
     _coll("meta").update_one({"_id": "last_backup"}, {"$set": {"at": when}}, upsert=True)
+
+
+# =============================================================================
+# Read & Record (/rnr)
+#
+# One document per recorded audio in `rnr_records`:
+#   _id "chat_id:message_id", serial (permanent per-chat number), user_id, display_name,
+#   kind (voice|audio), duration, audio_at (when the audio was SENT), day ("YYYY-MM-DD" in
+#   the R&R timezone), recorded_at (when /rnr was used), file_unique_id,
+#   storage_chat_id / storage_msg_id (the copy in the private storage group), deleted.
+# Rules: only the sender's own, non-forwarded audio; 30s to 4min; max 3 per user per
+# rolling 24h; the same audio can't be recorded twice. Nothing is removed when a member
+# leaves or is removed from the group, and /delrnr only soft-deletes.
+# Days/streaks use RNR_TZ_OFFSET_MINUTES (default 330 = IST).
+# =============================================================================
+
+RNR_MIN_SECONDS = 30
+RNR_MAX_SECONDS = 240
+RNR_DAILY_LIMIT = 3
+
+BADGES.update(
+    {
+        "rnr_5": {"label": "🎙️ Voice Starter", "desc": "Recorded 5 Read & Records"},
+        "rnr_25": {"label": "🎧 Voice Regular", "desc": "Recorded 25 Read & Records"},
+        "rnr_100": {"label": "🏆 Voice Legend", "desc": "Recorded 100 Read & Records"},
+        "rnr_streak7": {"label": "📖 Reader's Week", "desc": "Recorded on 7 days in a row"},
+        "rnr_streak30": {"label": "🌟 Reader's Month", "desc": "Recorded on 30 days in a row"},
+    }
+)
+_RNR_TOTAL_BADGES = {5: "rnr_5", 25: "rnr_25", 100: "rnr_100"}
+_RNR_STREAK_BADGES = {7: "rnr_streak7", 30: "rnr_streak30"}
+
+_rnr_indexes_ready = False
+
+
+def _rnr():
+    global _rnr_indexes_ready
+    coll = _coll("rnr_records")
+    if not _rnr_indexes_ready:
+        coll.create_index([("chat_id", ASCENDING), ("serial", ASCENDING)], unique=True)
+        coll.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
+        coll.create_index([("chat_id", ASCENDING), ("file_unique_id", ASCENDING)])
+        coll.create_index([("user_id", ASCENDING), ("recorded_at", DESCENDING)])
+        _rnr_indexes_ready = True
+    return coll
+
+
+def _utc(dt: datetime | None) -> datetime | None:
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def rnr_tz_offset() -> timedelta:
+    try:
+        return timedelta(minutes=int(os.getenv("RNR_TZ_OFFSET_MINUTES", "330")))
+    except ValueError:
+        return timedelta(minutes=330)
+
+
+def rnr_day_of(dt: datetime) -> str:
+    """'YYYY-MM-DD' of this moment in the R&R timezone."""
+    return (_utc(dt) + rnr_tz_offset()).strftime("%Y-%m-%d")
+
+
+def rnr_today() -> str:
+    return rnr_day_of(datetime.now(timezone.utc))
+
+
+def rnr_date_label(dt: datetime | None) -> str:
+    """'14 Oct 2026' in the R&R timezone."""
+    if dt is None:
+        return "-"
+    return (_utc(dt) + rnr_tz_offset()).strftime("%d %b %Y")
+
+
+def rnr_streaks(days, today: str | None = None) -> tuple[int, int]:
+    """(current_streak, longest_streak) from 'YYYY-MM-DD' strings. A streak is still
+    'current' if the last recording was today or yesterday."""
+    if not days:
+        return 0, 0
+    ordinals = sorted({datetime.strptime(d, "%Y-%m-%d").date().toordinal() for d in days})
+    longest = run = 0
+    prev = None
+    for o in ordinals:
+        run = run + 1 if prev is not None and o == prev + 1 else 1
+        longest = max(longest, run)
+        prev = o
+    today_o = datetime.strptime(today or rnr_today(), "%Y-%m-%d").date().toordinal()
+    current = run if prev is not None and today_o - prev <= 1 else 0
+    return current, longest
+
+
+def _rnr_next_serial(chat_id: int) -> int:
+    doc = _coll("rnr_counters").find_one_and_update(
+        {"_id": chat_id}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER
+    )
+    return int(doc["seq"])
+
+
+def rnr_user_progress(chat_id: int, user_id: int) -> tuple[int, int, int]:
+    """(total, current_streak, longest_streak) for one user in one chat."""
+    docs = list(
+        _rnr().find({"chat_id": chat_id, "user_id": user_id, "deleted": {"$ne": True}}, {"day": 1})
+    )
+    cur, lng = rnr_streaks({d["day"] for d in docs})
+    return len(docs), cur, lng
+
+
+def rnr_precheck(chat_id: int, user_id: int, msg_id: int, file_unique_id: str, now: datetime):
+    """('ok', None) | ('duplicate', existing_doc) | ('limit', {'free_at': datetime})."""
+    coll = _rnr()
+    dup = coll.find_one(
+        {
+            "chat_id": chat_id,
+            "deleted": {"$ne": True},
+            "$or": [{"_id": f"{chat_id}:{msg_id}"}, {"file_unique_id": file_unique_id}],
+        }
+    )
+    if dup:
+        return "duplicate", dup
+    recent = list(
+        coll.find(
+            {
+                "user_id": user_id,
+                "deleted": {"$ne": True},
+                "recorded_at": {"$gte": _utc(now) - timedelta(hours=24)},
+            }
+        ).sort("recorded_at", ASCENDING)
+    )
+    if len(recent) >= RNR_DAILY_LIMIT:
+        oldest_in_window = recent[len(recent) - RNR_DAILY_LIMIT]
+        return "limit", {"free_at": _utc(oldest_in_window["recorded_at"]) + timedelta(hours=24)}
+    return "ok", None
+
+
+def rnr_insert(
+    chat_id: int,
+    user_id: int,
+    display_name: str,
+    msg_id: int,
+    file_unique_id: str,
+    kind: str,
+    duration: int,
+    audio_at: datetime,
+    storage_chat_id: int,
+    storage_msg_id: int,
+    now: datetime,
+) -> dict:
+    """Save the record and return {serial, total, current_streak, longest_streak, badges}."""
+    coll = _rnr()
+    before_total, before_streak, _ = rnr_user_progress(chat_id, user_id)
+    fields = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "display_name": display_name[:512],
+        "kind": kind,
+        "duration": int(duration),
+        "audio_at": _utc(audio_at),
+        "day": rnr_day_of(audio_at),
+        "recorded_at": _utc(now),
+        "file_unique_id": file_unique_id,
+        "storage_chat_id": storage_chat_id,
+        "storage_msg_id": storage_msg_id,
+        "deleted": False,
+    }
+    doc_id = f"{chat_id}:{msg_id}"
+    existing = coll.find_one({"_id": doc_id})
+    if existing:  # soft-deleted earlier by an admin: bring it back under its old number
+        serial = int(existing["serial"])
+        coll.update_one({"_id": doc_id}, {"$set": fields})
+    else:
+        serial = _rnr_next_serial(chat_id)
+        coll.insert_one({"_id": doc_id, "serial": serial, "msg_id": msg_id, **fields})
+
+    total, cur, lng = rnr_user_progress(chat_id, user_id)
+    earned: list[BadgeEarned] = []
+    for n, bid in _RNR_TOTAL_BADGES.items():
+        if before_total < n <= total:
+            meta = BADGES[bid]
+            earned.append(BadgeEarned(user_id, display_name, bid, meta["label"], meta["desc"],
+                                      award_badge(chat_id, user_id, display_name, bid)))
+    for n, bid in _RNR_STREAK_BADGES.items():
+        if before_streak < n <= cur:
+            meta = BADGES[bid]
+            earned.append(BadgeEarned(user_id, display_name, bid, meta["label"], meta["desc"],
+                                      award_badge(chat_id, user_id, display_name, bid)))
+    return {"serial": serial, "total": total, "current_streak": cur, "longest_streak": lng, "badges": earned}
+
+
+def rnr_user_summary(chat_id: int, user_id: int) -> dict:
+    docs = list(
+        _rnr().find(
+            {"chat_id": chat_id, "user_id": user_id, "deleted": {"$ne": True}}, {"day": 1, "audio_at": 1}
+        )
+    )
+    if not docs:
+        return {"total": 0, "first_at": None, "last_at": None, "current_streak": 0, "longest_streak": 0}
+    times = [_utc(d["audio_at"]) for d in docs]
+    cur, lng = rnr_streaks({d["day"] for d in docs})
+    return {
+        "total": len(docs),
+        "first_at": min(times),
+        "last_at": max(times),
+        "current_streak": cur,
+        "longest_streak": lng,
+    }
+
+
+def format_rnr_stats_lines(s: dict) -> str:
+    """Extra lines for /mystats (HTML)."""
+    if not s["total"]:
+        return "🎙️ Read &amp; Record: <b>0</b> (reply /rnr to your voice note to start)"
+    return (
+        f"🎙️ Read &amp; Record: <b>{s['total']}</b> recording(s)\n"
+        f"📅 First: <b>{rnr_date_label(s['first_at'])}</b> · Latest: <b>{rnr_date_label(s['last_at'])}</b>\n"
+        f"🔥 R&amp;R streak: <b>{s['current_streak']}</b> day(s) · best <b>{s['longest_streak']}</b>"
+    )
+
+
+def rnr_list_for_user(user_id: int) -> list[dict]:
+    """All of a user's records (any chat), newest audio first."""
+    return list(_rnr().find({"user_id": user_id, "deleted": {"$ne": True}}).sort("audio_at", DESCENDING))
+
+
+def rnr_get(chat_id: int, serial: int) -> dict | None:
+    return _rnr().find_one({"chat_id": chat_id, "serial": serial, "deleted": {"$ne": True}})
+
+
+def rnr_soft_delete(chat_id: int, serial: int, by_id: int) -> dict | None:
+    """Hide a record (and free its audio to be recorded again). The storage copy is kept."""
+    return _rnr().find_one_and_update(
+        {"chat_id": chat_id, "serial": serial, "deleted": {"$ne": True}},
+        {"$set": {"deleted": True, "deleted_by": by_id, "deleted_at": datetime.now(timezone.utc)}},
+    )
+
+
+def _rnr_table(chat_id: int) -> dict[int, dict]:
+    table: dict[int, dict] = {}
+    cursor = _rnr().find(
+        {"chat_id": chat_id, "deleted": {"$ne": True}}, {"user_id": 1, "display_name": 1, "day": 1}
+    )
+    for d in cursor:
+        u = table.setdefault(
+            int(d["user_id"]),
+            {"user_id": int(d["user_id"]), "name": "", "total": 0, "day_counts": {}},
+        )
+        u["total"] += 1
+        u["name"] = d.get("display_name") or u["name"]
+        u["day_counts"][d["day"]] = u["day_counts"].get(d["day"], 0) + 1
+    for u in table.values():
+        u["current_streak"], u["longest_streak"] = rnr_streaks(set(u["day_counts"]))
+    return table
+
+
+def rnr_leaderboard(chat_id: int, limit: int = 20) -> list[dict]:
+    rows = list(_rnr_table(chat_id).values())
+    rows.sort(key=lambda u: (-u["total"], -u["current_streak"], u["name"].lower()))
+    return rows[:limit]
+
+
+def rnr_recorders_on_day(chat_id: int, day: str) -> list[dict]:
+    """Everyone who recorded (audio sent) on `day`, with that day's count, streak and total."""
+    rows = []
+    for u in _rnr_table(chat_id).values():
+        if day in u["day_counts"]:
+            rows.append({**u, "count": u["day_counts"][day]})
+    rows.sort(key=lambda u: (-u["count"], -u["current_streak"], -u["total"], u["name"].lower()))
+    return rows
+
+
+def rnr_recorders_in_days(chat_id: int, days: list[str]) -> list[dict]:
+    rows = []
+    for u in _rnr_table(chat_id).values():
+        count = sum(u["day_counts"].get(d, 0) for d in days)
+        if count:
+            rows.append({**u, "count": count})
+    rows.sort(key=lambda u: (-u["count"], -u["current_streak"], -u["total"], u["name"].lower()))
+    return rows
+
+
+def rnr_chat_ids() -> list[int]:
+    return [int(c) for c in _rnr().distinct("chat_id")]
+
+
+def get_rnr_reports_enabled(chat_id: int) -> bool:
+    doc = _coll("chat_settings").find_one({"_id": chat_id}) or {}
+    return bool(doc.get("rnr_reports", True))
+
+
+def set_rnr_reports(chat_id: int, enabled: bool) -> None:
+    _coll("chat_settings").update_one(
+        {"_id": chat_id},
+        {"$set": {"rnr_reports": enabled}, "$setOnInsert": {"monthly_reports": True}},
+        upsert=True,
+    )
+
+
+def rnr_posted(key: str) -> str | None:
+    """The day string a daily/weekly R&R post was last sent for (dedupes restarts)."""
+    doc = _coll("meta").find_one({"_id": key})
+    return doc.get("day") if doc else None
+
+
+def rnr_set_posted(key: str, day: str) -> None:
+    _coll("meta").update_one({"_id": key}, {"$set": {"day": day}}, upsert=True)
