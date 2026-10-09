@@ -1115,8 +1115,6 @@ def find_users_in_chat(chat_id: int, query: str, limit: int = 15) -> list[FindUs
     term = query.strip().lstrip("@")
     if not term:
         return []
-    # Match the text literally: input like "c++" or "(" is an invalid regex and used to crash.
-    term = re.escape(term)
 
     sessions_coll = _coll("vc_sessions")
     attendance_coll = _coll("user_attendance")
@@ -1673,17 +1671,15 @@ def remove_filter(chat_id: int, keyword: str) -> bool:
 
 
 def find_filter_match(chat_id: int, text: str) -> tuple[str, dict] | None:
-    """Case-insensitive whole-word match against saved keywords; returns (keyword,
+    """Case-insensitive substring match against saved keywords; returns (keyword,
     filter_data) for the first match, or None."""
     filters_map = get_filters(chat_id)
     if not filters_map:
         return None
     lowered = text.lower()
-    # Longest keyword first, whole words only: the filter "hi" no longer fires inside
-    # "this" or "which".
-    for keyword in sorted(filters_map, key=len, reverse=True):
-        if re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", lowered):
-            return keyword, filters_map[keyword]
+    for keyword, filter_data in filters_map.items():
+        if keyword in lowered:
+            return keyword, filter_data
     return None
 
 
@@ -2313,121 +2309,3 @@ def remove_custom_command(chat_id: int, name: str) -> bool:
         {"_id": chat_id}, {"$unset": {f"commands.{name}": ""}}
     )
     return result.modified_count > 0
-
-
-# =============================================================================
-# Welcome messages (/setwelcome, /welcome, /resetwelcome)
-# Stored in chat_settings like filters: {"type", "text", "entities", "file_id"}
-# =============================================================================
-
-
-def get_welcome(chat_id: int) -> tuple[bool, dict | None]:
-    """(enabled, welcome_data_or_None)."""
-    doc = _coll("chat_settings").find_one({"_id": chat_id}) or {}
-    return bool(doc.get("welcome_enabled", False)), doc.get("welcome")
-
-
-def set_welcome(chat_id: int, data: dict) -> None:
-    """Save the welcome message and switch it on."""
-    _coll("chat_settings").update_one(
-        {"_id": chat_id},
-        {
-            "$set": {"welcome": data, "welcome_enabled": True},
-            "$setOnInsert": {"monthly_reports": True},
-        },
-        upsert=True,
-    )
-
-
-def set_welcome_enabled(chat_id: int, enabled: bool) -> None:
-    _coll("chat_settings").update_one(
-        {"_id": chat_id},
-        {"$set": {"welcome_enabled": enabled}, "$setOnInsert": {"monthly_reports": True}},
-        upsert=True,
-    )
-
-
-def clear_welcome(chat_id: int) -> bool:
-    """Delete the saved welcome message and switch it off. True if one existed."""
-    result = _coll("chat_settings").update_one(
-        {"_id": chat_id, "welcome": {"$exists": True}},
-        {"$unset": {"welcome": ""}, "$set": {"welcome_enabled": False}},
-    )
-    return result.modified_count > 0
-
-
-# =============================================================================
-# Backup / restore (the bot DMs a gzipped JSON dump to the bot admins on a schedule)
-# =============================================================================
-
-
-def build_backup() -> tuple[bytes, dict[str, int]]:
-    """Dump every collection to gzipped JSON. Returns (bytes, {collection: doc_count})."""
-    import gzip
-
-    from bson import json_util
-
-    assert _db is not None, "init_db() must be called first"
-    collections: dict[str, list] = {}
-    counts: dict[str, int] = {}
-    for name in sorted(_db.list_collection_names()):
-        if name.startswith("system."):
-            continue
-        docs = list(_db[name].find({}))
-        collections[name] = docs
-        counts[name] = len(docs)
-    payload = {
-        "format": "vc_bot_backup",
-        "version": 1,
-        "created_at": datetime.now(timezone.utc),
-        "db": _db.name,
-        "collections": collections,
-    }
-    raw = json_util.dumps(payload).encode("utf-8")
-    return gzip.compress(raw, compresslevel=6), counts
-
-
-def parse_backup(blob: bytes) -> dict:
-    """Decode a backup file (gzipped or plain JSON) and sanity-check it."""
-    import gzip
-
-    from bson import json_util
-
-    try:
-        raw = gzip.decompress(blob)
-    except (OSError, EOFError):
-        raw = blob
-    payload = json_util.loads(raw.decode("utf-8"))
-    if not isinstance(payload, dict) or payload.get("format") != "vc_bot_backup":
-        raise ValueError("This file is not a vc_bot backup.")
-    return payload
-
-
-def restore_backup(blob: bytes, only: list[str] | None = None) -> dict[str, int]:
-    """Upsert every document from a backup by _id. Never deletes anything that is
-    already in the database. Returns {collection: docs_restored}."""
-    payload = parse_backup(blob)
-    restored: dict[str, int] = {}
-    for name, docs in (payload.get("collections") or {}).items():
-        if only and name not in only:
-            continue
-        coll = _coll(name)
-        count = 0
-        for d in docs:
-            if "_id" in d:
-                coll.replace_one({"_id": d["_id"]}, d, upsert=True)
-                count += 1
-        restored[name] = count
-    return restored
-
-
-def get_last_backup_at() -> datetime | None:
-    doc = _coll("meta").find_one({"_id": "last_backup"})
-    when = doc.get("at") if doc else None
-    if when is not None and when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return when
-
-
-def set_last_backup_at(when: datetime) -> None:
-    _coll("meta").update_one({"_id": "last_backup"}, {"$set": {"at": when}}, upsert=True)

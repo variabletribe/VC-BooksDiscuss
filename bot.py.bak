@@ -364,7 +364,7 @@ def _format_attendance_html(rows: list[dbmod.AttendanceRow]) -> str:
     lines = [
         "📋 <b>Present attendance</b>",
         " <i>Counts from 4 August 2026</i>",
-        f"<i>More than {threshold_min} minutes in a call = +1 present day (max once per day).</i>",
+        f"<i>More than {threshold_min} minutes in one call = +1 present day (once per call).</i>",
         "",
     ]
     for i, row in enumerate(rows, start=1):
@@ -400,41 +400,6 @@ async def _delete_messages_later(context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id,
             )
 
-
-
-# --- Per-user cooldown for heavy (database-aggregating) commands ------------
-
-_COMMAND_COOLDOWNS = {
-    "vcreport": 30,
-    "monthreport": 30,
-    "weekly": 30,
-    "attendance": 20,
-    "xpleaderboard": 15,
-}
-_cooldown_last: dict[tuple[int, int, str], float] = {}  # (chat, user, command) -> monotonic time
-
-
-async def _cooldown_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> bool:
-    """True (after telling the user to wait) if this user ran `command` too recently in
-    this chat. Group admins are exempt. Costs nothing on the normal path: the admin lookup
-    only happens when someone is actually inside the cooldown window."""
-    seconds = _COMMAND_COOLDOWNS.get(command, 0)
-    user, chat = update.effective_user, update.effective_chat
-    if seconds <= 0 or not user or not chat:
-        return False
-    now = time.monotonic()
-    key = (chat.id, user.id, command)
-    last = _cooldown_last.get(key)
-    if last is not None and now - last < seconds:
-        if not await _is_group_admin(update, context):
-            wait = int(seconds - (now - last)) + 1
-            await _reply_autodelete(update, context, f"Please wait {wait}s before using /{command} again.")
-            return True
-    _cooldown_last[key] = now
-    if len(_cooldown_last) > 5000:  # keep memory bounded
-        for k in [k for k, t in _cooldown_last.items() if now - t > 3600]:
-            _cooldown_last.pop(k, None)
-    return False
 
 
 TELEGRAM_SAFE_LEN = 3800
@@ -555,6 +520,7 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "lock": ("mod", "/lock links", "From now on, delete any non-admin message containing a link.", "Group admin"),
     "unlock": ("mod", "/unlock links", "Turn link-locking back off.", "Group admin"),
     "locks": ("mod", "/locks", "View which content types are currently locked.", "Group admin"),
+    "captcha": ("mod", "/captcha on|off", "New-member verification: joiners are muted and must tap a button within 5 minutes, or they're auto-kicked (and can rejoin to retry).", "Anyone can view; group admin to change"),
     "setflood": ("mod", "/setflood <count> [window_seconds]  or  /setflood off", "Auto-punish anyone posting too many messages too fast. Off by default.", "Anyone can view; group admin to change"),
     "floodmode": ("mod", "/floodmode [mute/kick/ban]", "What happens when flood control triggers.", "Anyone can view; group admin to change"),
     "modlog": ("mod", "/modlog [count]", "The last moderation actions in this group: who did what, to whom, when, and why.", "Group admin"),
@@ -589,13 +555,6 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
-    "setwelcome": ("groupadmin", "/setwelcome <text>  -  or reply to any message with /setwelcome", "Set the message new members get (text, photo, video, sticker, ...). Placeholders: {first} {last} {fullname} {username} {mention} {id} {chatname} {count}. Sends a preview and switches the welcome on.", "Group admin"),
-    "welcome": ("groupadmin", "/welcome [on|off]", "Show whether the welcome message is on, or switch it on/off.", "Anyone can view; group admin to change"),
-    "resetwelcome": ("groupadmin", "/resetwelcome", "Delete the saved welcome message and switch it off.", "Group admin"),
-    "purge": ("groupadmin", "/purge  (reply to the first message to delete)", "Delete everything from the replied-to message down to your command, up to 500 messages. Logged in /modlog.", "Group admin"),
-    "pin": ("groupadmin", "/pin [loud]  (reply to a message)", "Pin the replied-to message. Silent by default; add 'loud' to notify members.", "Group admin"),
-    "unpin": ("groupadmin", "/unpin  (reply to a message, or alone for the latest pin)", "Unpin the replied-to message, or the most recent pin if you don't reply.", "Group admin"),
-    "backup": ("botadmin", "/backup", "Build a full database backup and DM it to every bot admin. It also runs automatically (BACKUP_INTERVAL_DAYS, BACKUP_HOUR_UTC). DM only.", "Bot admin, DM only"),
 }
 
 
@@ -620,7 +579,7 @@ def _help_main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def _help_category_text(cat_key: str) -> str:
-    label = html.escape(HELP_CATEGORIES.get(cat_key, cat_key), quote=False)
+    label = HELP_CATEGORIES.get(cat_key, cat_key)
     return f"{label}\n\nTap a command to see what it does and how to use it."
 
 
@@ -737,10 +696,6 @@ async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return m.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 
 
-_ADMIN_CACHE_TTL_SECONDS = 60
-_admin_status_cache: dict[tuple[int, int], tuple[float, bool]] = {}  # (chat, user) -> (checked_at, is_admin)
-
-
 async def _message_sender_is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """True if the actual sender of update.message is a real group owner/admin — covers
     both a normal admin's own account AND an admin posting anonymously ("send as group",
@@ -750,7 +705,7 @@ async def _message_sender_is_admin(update: Update, context: ContextTypes.DEFAULT
     msg.from_user.id — that placeholder id is not itself a member with admin rights, so a
     naive lookup treats a real admin's anonymous post as an ordinary member's and lets
     enforcement fire on it."""
-    msg = update.effective_message  # also covers edited messages
+    msg = update.message
     chat = update.effective_chat
     if not msg or not chat:
         return False
@@ -758,20 +713,11 @@ async def _message_sender_is_admin(update: Update, context: ContextTypes.DEFAULT
         return True
     if not msg.from_user:
         return False
-    key = (chat.id, msg.from_user.id)
-    now = time.monotonic()
-    cached = _admin_status_cache.get(key)
-    if cached is not None and now - cached[0] < _ADMIN_CACHE_TTL_SECONDS:
-        return cached[1]
     try:
         member = await context.bot.get_chat_member(chat.id, msg.from_user.id)
     except Exception:
         return False
-    is_admin = member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
-    if len(_admin_status_cache) > 5000:
-        _admin_status_cache.clear()
-    _admin_status_cache[key] = (now, is_admin)
-    return is_admin
+    return member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
 
 
 # =============================================================================
@@ -1207,11 +1153,6 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reason,
         update.effective_user.id,
         _user_label(update.effective_user),
-    )
-
-    await asyncio.to_thread(
-        dbmod.log_mod_action, chat.id, "warn", target_id, target_label,
-        update.effective_user.id, _user_label(update.effective_user), reason,
     )
 
     # Now get the ACTIVE warning count (after the watermark)
@@ -1762,20 +1703,23 @@ async def on_text_check_blocklist(update: Update, context: ContextTypes.DEFAULT_
     sender) if it contains a blocklisted word. Registered in a separate handler group
     (group=1) so it always runs alongside whatever fires in the default group (group=0),
     instead of competing with other MessageHandlers for "first match wins"."""
-    msg = update.effective_message  # also fires for edited messages
-    text = ((msg.text or msg.caption) if msg else None) or ""
-    if not msg or not text or not msg.from_user or not update.effective_chat:
+    msg = update.message
+    if not msg or not msg.text or not msg.from_user or not update.effective_chat:
         return
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return
 
     # Never act on admins/owners — a bad blocklist word must not be able to gag the mods.
-    # (Checked only after a word matched, so ordinary messages cost no Telegram API call.)
-    matched = await asyncio.to_thread(dbmod.find_blocked_word, chat.id, text)
+    try:
+        member = await context.bot.get_chat_member(chat.id, msg.from_user.id)
+        if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+            return
+    except Exception:
+        pass
+
+    matched = await asyncio.to_thread(dbmod.find_blocked_word, chat.id, msg.text)
     if not matched:
-        return
-    if await _message_sender_is_admin(update, context):  # includes anonymous admins
         return
 
     try:
@@ -1975,12 +1919,6 @@ async def cmd_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "entities": [_entity_to_dict(e) for e in body_entities],
         }
 
-    if "." in keyword or keyword.startswith("$"):
-        await _reply_autodelete(
-            update, context,
-            "Filter keywords can't contain a dot (.) or start with $. Use a plain word instead.",
-        )
-        return
     await asyncio.to_thread(dbmod.add_filter, chat.id, keyword, filter_data)
     safe_kw = html.escape(keyword.lower(), quote=False)
     await _reply_autodelete(update, context, f"Filter saved for \"{safe_kw}\".", parse_mode="HTML")
@@ -2035,9 +1973,7 @@ async def _send_filter_response(
 ) -> None:
     ftype = filter_data.get("type", "text")
     text = filter_data.get("text")
-    entities = [
-        _dict_to_entity(d) for d in (filter_data.get("entities") or []) if d.get("type") != "text_mention"
-    ] or None
+    entities = [_dict_to_entity(d) for d in (filter_data.get("entities") or [])] or None
     file_id = filter_data.get("file_id")
     try:
         if ftype == "text":
@@ -2105,7 +2041,7 @@ _CMD_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
 def _builtin_command_names() -> set[str]:
-    return set(HELP_COMMANDS.keys()) | {"start", "help", "gmeet_rec"}
+    return set(HELP_COMMANDS.keys()) | {"start", "gmeet_rec"}
 
 
 async def cmd_addcmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2225,466 +2161,6 @@ async def on_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     await _send_filter_response(context, update.effective_chat.id, msg.message_id, data)
     
-
-
-# =============================================================================
-# Welcome messages: /setwelcome, /welcome, /resetwelcome
-#
-# Stored like filters ({"type", "text", "entities", "file_id"}) so bold/italic and
-# media survive. Placeholders: {first} {last} {fullname} {username} {mention} {id}
-# {chatname} {count}
-# =============================================================================
-
-_PLACEHOLDER_RE = re.compile(
-    r"\{(first|last|fullname|username|mention|id|chatname|count)\}", re.IGNORECASE
-)
-_WELCOME_HELP = "Placeholders: {first} {last} {fullname} {username} {mention} {id} {chatname} {count}"
-
-
-def _utf16_len(s: str) -> int:
-    """Telegram entity offsets/lengths count UTF-16 code units, not Python characters."""
-    return len(s.encode("utf-16-le")) // 2
-
-
-def _render_placeholders(
-    text: str, entities: list[dict], values: dict[str, str], mention_id: int | None
-) -> tuple[str, list[dict]]:
-    """Replace {placeholders} in `text` while keeping every formatting entity (bold,
-    italic, links...) correctly positioned. {mention} becomes a clickable link to the user.
-
-    Works right-to-left so offsets to the left of the current match are still valid, and
-    shifts/stretches each entity by the length difference of the replacement."""
-    ents = [dict(e) for e in entities]
-    for m in reversed(list(_PLACEHOLDER_RE.finditer(text))):
-        key = m.group(1).lower()
-        token_len = _utf16_len(m.group(0))
-        start = _utf16_len(text[: m.start()])
-        end = start + token_len
-        replacement = values.get(key, "")
-        new_len = _utf16_len(replacement)
-        delta = new_len - token_len
-        for e in ents:
-            if e["offset"] >= end:
-                e["offset"] += delta
-            elif e["offset"] <= start and e["offset"] + e["length"] >= end:
-                e["length"] += delta
-        if key == "mention" and mention_id is not None and new_len > 0:
-            ents.append(
-                {"type": "text_link", "offset": start, "length": new_len,
-                 "url": f"tg://user?id={mention_id}"}
-            )
-        text = text[: m.start()] + replacement + text[m.end():]
-    return text, [e for e in ents if e["length"] > 0]
-
-
-def _extract_command_body(msg) -> tuple[str, list[dict]] | None:
-    """(body_text, entity_dicts) for everything after the command token, keeping the
-    exact formatting. Same offset logic as _extract_filter_command_body, minus the keyword."""
-    text = msg.text or ""
-    parts = text.split(None, 1)
-    if len(parts) < 2:
-        return None
-    idx = len(parts[0])
-    while idx < len(text) and text[idx].isspace():
-        idx += 1
-    body = text[idx:]
-    if not body.strip():
-        return None
-    ents: list[dict] = []
-    for e in (msg.entities or []):
-        if e.offset >= idx:
-            d = _entity_to_dict(e)
-            d["offset"] = e.offset - idx
-            ents.append(d)
-    return body, ents
-
-
-async def _send_welcome(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, chat_title: str = "") -> None:
-    """Post this group's welcome message for `user`, if one is saved and switched on.
-    Never raises: a broken welcome must not break joins."""
-    try:
-        enabled, data = await asyncio.to_thread(dbmod.get_welcome, chat_id)
-        if not enabled or not data:
-            return
-        first = user.first_name or "there"
-        last = user.last_name or ""
-        values = {
-            "first": first,
-            "last": last,
-            "fullname": f"{first} {last}".strip(),
-            "username": f"@{user.username}" if user.username else first,
-            "mention": first,
-            "id": str(user.id),
-            "chatname": chat_title or "this group",
-            "count": "",
-        }
-        text = data.get("text") or ""
-        if re.search(r"\{count\}", text, re.IGNORECASE):
-            try:
-                values["count"] = str(await context.bot.get_chat_member_count(chat_id))
-            except Exception:
-                values["count"] = ""
-        entities = [e for e in (data.get("entities") or []) if e.get("type") != "text_mention"]
-        if text:
-            text, entities = _render_placeholders(text, entities, values, user.id)
-        rendered = {**data, "text": text if text else data.get("text"), "entities": entities}
-        await _send_filter_response(context, chat_id, None, rendered)
-    except Exception:
-        logger.exception("Welcome message failed chat_id=%s", chat_id)
-
-
-async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Records when someone joins the group (for /mystats's "Joined group" field) and
-    posts the welcome message if one is set.
-
-    Two known limits, both unavoidable without Telegram giving us historical data:
-    - No join date exists for anyone who was already in the group before this shipped.
-    - If the group has "Hide join/leave messages" turned on, this event never fires for
-      them either; /mystats will show "Unknown" in both cases, which is accurate."""
-    msg = update.message
-    if not msg or not msg.chat or not msg.new_chat_members:
-        return
-    chat = msg.chat
-    if chat.type not in ("group", "supergroup"):
-        return
-    when = msg.date or datetime.now(timezone.utc)
-
-    welcomed = 0  # cap welcomes per join event so a mass-join can't flood the chat
-    for user in msg.new_chat_members:
-        if user.is_bot:
-            continue
-        await asyncio.to_thread(dbmod.record_group_join, chat.id, user.id, _user_label(user), when)
-        if welcomed < 5:
-            welcomed += 1
-            await _send_welcome(context, chat.id, user, chat.title or "")
-
-
-async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group admin: /setwelcome <text>  - or reply to any message with /setwelcome."""
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can set the welcome message.")
-        return
-
-    reply = update.message.reply_to_message
-    if reply is not None:
-        data = _filter_data_from_message(reply)
-        if data is None:
-            await _reply_autodelete(update, context, "I can't use that message type as a welcome message.")
-            return
-    else:
-        parsed = _extract_command_body(update.message)
-        if parsed is None:
-            await _reply_autodelete(
-                update, context,
-                "Usage: /setwelcome <text>\n"
-                "Or reply to any message (text, photo, video, sticker, ...) with /setwelcome\n\n"
-                + _WELCOME_HELP,
-            )
-            return
-        body, ents = parsed
-        data = {"type": "text", "file_id": None, "text": body, "entities": ents}
-
-    await asyncio.to_thread(dbmod.set_welcome, chat.id, data)
-    await _reply_autodelete(update, context, "Welcome message saved and switched on. Preview below:")
-    await _send_welcome(context, chat.id, update.effective_user, chat.title or "")
-
-
-async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone can view the status; group admins can switch it: /welcome [on|off]."""
-    if not update.message or not update.effective_chat:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    enabled, data = await asyncio.to_thread(dbmod.get_welcome, chat.id)
-    if not context.args:
-        if data is None:
-            text = "No welcome message set yet.\nSet one with /setwelcome <text>\n\n" + _WELCOME_HELP
-        else:
-            text = (
-                f"Welcome message is {'on' if enabled else 'off'}.\n"
-                "Change it with /setwelcome, switch it with /welcome on|off, "
-                "or remove it with /resetwelcome."
-            )
-        await _reply_autodelete(update, context, text)
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can change this.")
-        return
-    arg = context.args[0].lower()
-    if arg not in ("on", "off"):
-        await _reply_autodelete(update, context, "Usage: /welcome on|off")
-        return
-    if arg == "on" and data is None:
-        await _reply_autodelete(update, context, "Set a welcome message first with /setwelcome <text>.")
-        return
-    await asyncio.to_thread(dbmod.set_welcome_enabled, chat.id, arg == "on")
-    await _reply_autodelete(update, context, f"Welcome message turned {arg}.")
-
-
-async def cmd_resetwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group admin: delete the saved welcome message."""
-    if not update.message or not update.effective_chat:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can reset the welcome message.")
-        return
-    removed = await asyncio.to_thread(dbmod.clear_welcome, chat.id)
-    await _reply_autodelete(
-        update, context,
-        "Welcome message deleted and switched off." if removed else "There was no welcome message to delete.",
-    )
-
-
-# =============================================================================
-# /purge, /pin, /unpin
-# =============================================================================
-
-_PURGE_MAX_MESSAGES = 500
-
-
-async def cmd_purge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group admin: reply to a message with /purge to delete it and everything after it,
-    down to the command itself (max 500 messages)."""
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can purge messages.")
-        return
-    reply = update.message.reply_to_message
-    if reply is None:
-        await _reply_autodelete(
-            update, context,
-            "Reply to the first message you want deleted. Everything from there down to your "
-            "/purge command will be removed.",
-        )
-        return
-
-    first_id, last_id = reply.message_id, update.message.message_id
-    count = last_id - first_id + 1
-    if count > _PURGE_MAX_MESSAGES:
-        await _reply_autodelete(
-            update, context,
-            f"That would delete {count} messages; the limit is {_PURGE_MAX_MESSAGES} per purge. "
-            "Reply to a more recent message.",
-        )
-        return
-
-    ids = list(range(first_id, last_id + 1))
-    chunks = failed = 0
-    for i in range(0, len(ids), 100):
-        chunks += 1
-        try:
-            await context.bot.delete_messages(chat.id, ids[i : i + 100])
-        except Exception:
-            failed += 1
-            logger.exception("Purge chunk failed chat_id=%s", chat.id)
-    if failed == chunks:
-        await _reply_autodelete(
-            update, context,
-            "Couldn't delete the messages. Make sure I'm an admin with the 'Delete messages' right.",
-        )
-        return
-
-    actor = update.effective_user
-    await asyncio.to_thread(
-        dbmod.log_mod_action, chat.id, "purge", 0, "messages", actor.id, _user_label(actor),
-        f"{count} message ids ({first_id}-{last_id})",
-    )
-    try:
-        notice = await context.bot.send_message(chat.id, "Purge complete.")
-    except Exception:
-        return
-    jq = context.job_queue
-    if jq is not None:
-        jq.run_once(
-            _delete_messages_later,
-            when=5,
-            data={"chat_id": chat.id, "message_ids": [notice.message_id]},
-            name=f"purge-notice-{chat.id}-{notice.message_id}",
-        )
-
-
-async def cmd_pin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group admin: reply to a message with /pin [loud]. Silent unless 'loud' is given."""
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can pin messages.")
-        return
-    reply = update.message.reply_to_message
-    if reply is None:
-        await _reply_autodelete(update, context, "Reply to the message you want to pin.")
-        return
-    loud = bool(context.args) and context.args[0].lower() in ("loud", "notify")
-    try:
-        await context.bot.pin_chat_message(chat.id, reply.message_id, disable_notification=not loud)
-    except Exception:
-        logger.exception("pin failed chat_id=%s", chat.id)
-        await _reply_autodelete(update, context, "Couldn't pin. I need to be an admin with the 'Pin messages' right.")
-        return
-    author = reply.from_user
-    await asyncio.to_thread(
-        dbmod.log_mod_action, chat.id, "pin", author.id if author else 0,
-        _user_label(author) if author else "message", update.effective_user.id,
-        _user_label(update.effective_user), f"message {reply.message_id}",
-    )
-    await _reply_autodelete(
-        update, context,
-        "Pinned (members notified)." if loud else "Pinned silently. Add 'loud' to notify members.",
-    )
-
-
-async def cmd_unpin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group admin: /unpin (reply to a message to unpin that one, otherwise the latest pin)."""
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can unpin messages.")
-        return
-    reply = update.message.reply_to_message
-    try:
-        if reply is not None:
-            await context.bot.unpin_chat_message(chat.id, message_id=reply.message_id)
-        else:
-            await context.bot.unpin_chat_message(chat.id)
-    except Exception:
-        logger.exception("unpin failed chat_id=%s", chat.id)
-        await _reply_autodelete(update, context, "Couldn't unpin. I need to be an admin with the 'Pin messages' right.")
-        return
-    author = reply.from_user if reply is not None else None
-    await asyncio.to_thread(
-        dbmod.log_mod_action, chat.id, "unpin", author.id if author else 0,
-        _user_label(author) if author else "latest pin", update.effective_user.id,
-        _user_label(update.effective_user), f"message {reply.message_id}" if reply else "",
-    )
-    await _reply_autodelete(update, context, "Unpinned.")
-
-
-# =============================================================================
-# Database backup: /backup (bot admins, DM only) + automatic scheduled backups.
-# Atlas's free tier (M0) has no automatic backups, so the bot sends a gzipped JSON dump
-# to every bot admin. Restore with restore_backup.py.
-#   BACKUP_INTERVAL_DAYS (default 7)   BACKUP_HOUR_UTC (default 21)
-# =============================================================================
-
-_BACKUP_MAX_BYTES = 49 * 1024 * 1024  # Telegram bots can upload up to 50 MB
-
-
-def _backup_hour_utc() -> int:
-    try:
-        return min(23, max(0, int(os.getenv("BACKUP_HOUR_UTC", "21"))))
-    except ValueError:
-        return 21
-
-
-def _backup_interval_days() -> int:
-    try:
-        return max(1, int(os.getenv("BACKUP_INTERVAL_DAYS", "7")))
-    except ValueError:
-        return 7
-
-
-async def _deliver_backup(context: ContextTypes.DEFAULT_TYPE) -> tuple[int, str]:
-    """Build a backup and DM it to every bot admin (falling back to the admin relay
-    group if no DM goes through). Returns (chats_delivered_to, summary)."""
-    blob, counts = await asyncio.to_thread(dbmod.build_backup)
-    summary = f"{sum(counts.values())} documents in {len(counts)} collections, {len(blob) / 1024:.0f} KB"
-    if len(blob) > _BACKUP_MAX_BYTES:
-        raise ValueError(f"backup is {len(blob) / 1048576:.1f} MB, over Telegram's 50 MB upload limit")
-    filename = f"vc_bot_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json.gz"
-    caption = f"Database backup: {summary}\nRestore with restore_backup.py"
-
-    delivered = 0
-    for uid in sorted(app_state.parse_admin_user_ids()):
-        try:
-            await context.bot.send_document(
-                uid, document=InputFile(io.BytesIO(blob), filename=filename), caption=caption
-            )
-            delivered += 1
-        except Exception:
-            logger.warning("Backup DM failed for admin %s (they may need to /start the bot)", uid)
-    relay = app_state.admin_relay_chat_id()
-    if delivered == 0 and relay:
-        try:
-            await context.bot.send_document(
-                relay, document=InputFile(io.BytesIO(blob), filename=filename), caption=caption
-            )
-            delivered += 1
-        except Exception:
-            logger.exception("Backup to admin relay chat failed")
-    if delivered:
-        await asyncio.to_thread(dbmod.set_last_backup_at, datetime.now(timezone.utc))
-    return delivered, summary
-
-
-async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Runs daily; actually backs up only when BACKUP_INTERVAL_DAYS have passed since the
-    last successful one (state lives in MongoDB, so restarts don't cause repeats or gaps)."""
-    try:
-        last = await asyncio.to_thread(dbmod.get_last_backup_at)
-        if last is not None:
-            due_after = last + timedelta(days=_backup_interval_days()) - timedelta(hours=1)
-            if datetime.now(timezone.utc) < due_after:
-                return
-        delivered, summary = await _deliver_backup(context)
-        if delivered:
-            logger.info("Scheduled backup sent to %s chat(s): %s", delivered, summary)
-        else:
-            logger.error("Scheduled backup was built but could not be delivered to any admin")
-    except Exception as exc:
-        logger.exception("Scheduled backup failed")
-        for uid in sorted(app_state.parse_admin_user_ids()):
-            try:
-                await context.bot.send_message(uid, f"Scheduled database backup failed: {str(exc)[:300]}")
-            except Exception:
-                pass
-
-
-async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bot admin, DM only: /backup - build and send a backup right now."""
-    if not update.message or not update.effective_user or not update.effective_chat:
-        return
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("This command only works in a private chat with me.")
-        return
-    if not _is_admin_user(update.effective_user.id):
-        await update.message.reply_text("Admins only.")
-        return
-    status = await update.message.reply_text("Building backup...")
-    try:
-        delivered, summary = await _deliver_backup(context)
-    except Exception as exc:
-        logger.exception("Manual backup failed")
-        await status.edit_text(f"Backup failed: {str(exc)[:300]}")
-        return
-    if delivered:
-        await status.edit_text(f"Backup sent to {delivered} chat(s): {summary}")
-    else:
-        await status.edit_text("Backup built, but I couldn't deliver it. Admins must /start the bot first.")
 
 
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2843,8 +2319,6 @@ async def cmd_locks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 _MODLOG_ACTION_LABELS = {
-    "warn": "⚠️ Warn", "setstat": "✏️ Stat edit", "purge": "🧹 Purge",
-    "pin": "📌 Pin", "unpin": "📌 Unpin",
     "ban": "🚫 Ban", "tban": "🚫 Temp ban", "unban": "✅ Unban",
     "kick": "👢 Kick", "mute": "🔇 Mute", "tmute": "🔇 Temp mute", "unmute": "🔊 Unmute",
     "resetwarn": "♻️ Reset warnings",
@@ -2896,9 +2370,8 @@ async def on_text_check_links(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Deletes messages containing a link if "links" is locked for this chat and the
     sender isn't an admin or on the link allowlist. Checks both Telegram's own url/text_link
     entities (catches formatted/masked links) and a plain-text regex fallback.
-    Registered in its own handler group (group=5). Also runs on edited messages, so a
-    link can't be smuggled in by editing a clean message."""
-    msg = update.effective_message
+    Registered in its own handler group (group=5)."""
+    msg = update.message
     if not msg or not update.effective_chat or not msg.from_user:
         return
     chat = update.effective_chat
@@ -3308,8 +2781,6 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
-    if await _cooldown_blocked(update, context, "vcreport"):
-        return
 
     try:
         rows, start, end = await asyncio.to_thread(dbmod.fetch_alltime_vc_stats, chat.id)
@@ -3319,8 +2790,7 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Cap the number of rows to avoid Telegram's 4096-character limit
         MAX_ROWS = 50
-        total_rows = len(rows)
-        truncated = total_rows > MAX_ROWS
+        truncated = len(rows) > MAX_ROWS
         if truncated:
             rows = rows[:MAX_ROWS]
 
@@ -3328,7 +2798,7 @@ async def cmd_vcreport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text = _format_vc_stats_html("All-time VC report", subtitle, rows)
 
         if truncated:
-            text += f"\n\n<i>+ {total_rows - MAX_ROWS} more users not shown.</i>"
+            text += f"\n\n<i>+ {len(rows) - MAX_ROWS} more users not shown.</i>"
 
         await _reply_autodelete(update, context, text, parse_mode="HTML")
     except Exception as e:
@@ -3341,8 +2811,6 @@ async def cmd_attendance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if await _cooldown_blocked(update, context, "attendance"):
         return
 
     rows = await asyncio.to_thread(dbmod.fetch_all_attendance, chat.id)
@@ -3366,8 +2834,6 @@ async def cmd_monthreport(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if await _cooldown_blocked(update, context, "monthreport"):
         return
     try:
         now = datetime.now(timezone.utc)
@@ -3574,6 +3040,151 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+_CAPTCHA_TIMEOUT_SECONDS = 300  # 5 minutes to click "I'm not a bot" before being kicked
+_pending_captchas: dict[tuple[int, int], dict] = {}  # (chat_id, user_id) -> {message_id}
+
+
+async def on_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Records when someone joins the group, for /mystats's "Joined group" field, and — if
+    /captcha is enabled for this chat — mutes the new member and posts a button they must
+    click within 5 minutes to be unmuted, or they're auto-kicked. This is the actual
+    security gap the bot had versus Rose: without it, moderation is entirely reactive (an
+    admin has to notice and act), so a spam-bot wave posting immediately after joining
+    goes completely unchecked until someone happens to be watching.
+
+    Fires off Telegram's "X joined the group" service message. Two known limits, both
+    unavoidable without Telegram giving us historical data:
+    - No join date exists for anyone who was already in the group before this shipped.
+    - If the group has "Hide join/leave messages" turned on, this event never fires for
+      them either — /mystats will show "Unknown" in both cases, which is accurate, not a bug.
+    """
+    msg = update.message
+    if not msg or not msg.chat or not msg.new_chat_members:
+        return
+    chat = msg.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    when = msg.date or datetime.now(timezone.utc)
+
+    settings = await asyncio.to_thread(dbmod.get_antispam_settings, chat.id)
+    captcha_on = settings["captcha_enabled"]
+
+    for user in msg.new_chat_members:
+        if user.is_bot:
+            continue
+        label = _user_label(user)
+        await asyncio.to_thread(dbmod.record_group_join, chat.id, user.id, label, when)
+
+        if not captcha_on:
+            continue
+        try:
+            await context.bot.restrict_chat_member(chat.id, user.id, permissions=_MUTE_PERMISSIONS)
+            safe = html.escape(label, quote=False)
+            sent = await context.bot.send_message(
+                chat.id,
+                f"👋 Welcome, {safe}! Tap the button below within 5 minutes to unlock chat.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("✅ I'm not a bot", callback_data=f"captcha:{chat.id}:{user.id}")]]
+                ),
+            )
+        except Exception:
+            logger.exception("Captcha setup failed chat_id=%s user_id=%s", chat.id, user.id)
+            continue
+
+        _pending_captchas[(chat.id, user.id)] = {"message_id": sent.message_id, "label": label}
+        jq = context.job_queue
+        if jq is not None:
+            jq.run_once(
+                _captcha_timeout_kick,
+                when=_CAPTCHA_TIMEOUT_SECONDS,
+                data={"chat_id": chat.id, "user_id": user.id},
+                name=f"captcha-timeout-{chat.id}-{user.id}",
+            )
+
+
+async def _captcha_timeout_kick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """job_queue callback: if a new member never clicked the captcha button in time,
+    kick them (they can rejoin and try again) and clean up the prompt message."""
+    data = context.job.data or {}
+    chat_id = data.get("chat_id")
+    user_id = data.get("user_id")
+    entry = _pending_captchas.pop((chat_id, user_id), None)
+    if entry is None:
+        return  # already verified, or already handled
+    try:
+        await context.bot.ban_chat_member(chat_id, user_id)
+        await context.bot.unban_chat_member(chat_id, user_id)
+    except Exception:
+        logger.exception("Captcha timeout kick failed chat_id=%s user_id=%s", chat_id, user_id)
+    try:
+        await context.bot.delete_message(chat_id, entry["message_id"])
+    except Exception:
+        pass
+
+
+async def on_captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
+    _prefix, _, rest = query.data.partition(":")
+    try:
+        chat_id_s, user_id_s = rest.split(":")
+        chat_id, target_user_id = int(chat_id_s), int(user_id_s)
+    except ValueError:
+        return
+
+    if query.from_user.id != target_user_id:
+        await query.answer("This verification isn't for you.", show_alert=True)
+        return
+
+    entry = _pending_captchas.pop((chat_id, target_user_id), None)
+    if entry is None:
+        await query.answer("Already verified (or this expired).")
+        return
+
+    try:
+        restore = _UNMUTE_FALLBACK_PERMISSIONS
+        try:
+            group_chat = await context.bot.get_chat(chat_id)
+            if group_chat.permissions:
+                restore = group_chat.permissions
+        except Exception:
+            pass
+        await context.bot.restrict_chat_member(chat_id, target_user_id, permissions=restore)
+    except Exception:
+        logger.exception("Captcha verify unmute failed chat_id=%s user_id=%s", chat_id, target_user_id)
+        await query.answer("Verified, but I couldn't unmute you — ask an admin.", show_alert=True)
+        return
+
+    await query.answer("Verified — welcome!")
+    try:
+        await query.edit_message_text(f"✅ {html.escape(entry.get('label', 'User'), quote=False)} verified.")
+    except Exception:
+        pass
+
+
+async def cmd_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: /captcha on|off — new-member verification for this group."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    settings = await asyncio.to_thread(dbmod.get_antispam_settings, chat.id)
+    if not context.args:
+        state = "on" if settings["captcha_enabled"] else "off"
+        await _reply_autodelete(update, context, f"Captcha is currently {state}.\nUsage: /captcha on|off")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can change this.")
+        return
+    arg = context.args[0].lower()
+    if arg not in ("on", "off"):
+        await _reply_autodelete(update, context, "Usage: /captcha on|off")
+        return
+    await asyncio.to_thread(dbmod.set_captcha_enabled, chat.id, arg == "on")
+    await _reply_autodelete(update, context, f"Captcha turned {arg}.")
 
 
 # --- Flood control -------------------------------------------------------
@@ -3602,9 +3213,12 @@ async def on_text_check_flood(update: Update, context: ContextTypes.DEFAULT_TYPE
     if limit <= 0:
         return
 
-    # Exempt admins/owners, including anonymous "send as group" admins (cached for a minute).
-    if await _message_sender_is_admin(update, context):
-        return
+    try:
+        member = await context.bot.get_chat_member(chat.id, msg.from_user.id)
+        if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+            return
+    except Exception:
+        pass
 
     window = settings["flood_window_seconds"]
     key = (chat.id, msg.from_user.id)
@@ -4095,16 +3709,6 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
         else:
             lines.append("⚠️ Telethon assistant: not configured (ASSISTANT_GROUP_IDS unset)")
-
-    try:
-        last_backup = await asyncio.to_thread(dbmod.get_last_backup_at)
-        if last_backup:
-            hours = int((datetime.now(timezone.utc) - last_backup).total_seconds() // 3600)
-            lines.append(f"✅ Backup: last sent {hours}h ago")
-        else:
-            lines.append("⚠️ Backup: none sent yet (automatic, or run /backup)")
-    except Exception as exc:
-        lines.append(f"❌ Backup status: {html.escape(str(exc)[:200], quote=False)}")
 
     groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
     if not groq_key:
@@ -4863,8 +4467,6 @@ async def cmd_xpleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
-    if await _cooldown_blocked(update, context, "xpleaderboard"):
-        return
     rows = await asyncio.to_thread(dbmod.fetch_xp_leaderboard, chat.id, 10)
     if not rows:
         await _reply_autodelete(update, context, "No XP recorded in this group yet.")
@@ -4961,8 +4563,6 @@ async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    if await _cooldown_blocked(update, context, "weekly"):
         return
     digest = await asyncio.to_thread(dbmod.fetch_weekly_digest, chat.id)
     text = dbmod.format_weekly_digest_message(chat.title or "This group", digest)
@@ -5107,15 +4707,6 @@ async def post_init(application: Application) -> None:
         time=dt_time(hour=0, minute=5, tzinfo=timezone.utc),
         name="daily_streak_reset_job",
     )
-    jq.run_daily(
-        daily_backup_job,
-        time=dt_time(hour=_backup_hour_utc(), minute=30, tzinfo=timezone.utc),
-        name="daily_backup_job",
-    )
-    logger.info(
-        "Scheduled database backup check daily at %02d:30 UTC (every %s day(s))",
-        _backup_hour_utc(), _backup_interval_days(),
-    )
     try:
         import meet_tracker
         jq.run_repeating(meet_tracker.meet_watch_job, interval=60, first=30, name="meet_watch_job")
@@ -5155,7 +4746,7 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("vcreport", cmd_vcreport))
     app.add_handler(CommandHandler("attendance", cmd_attendance))
     app.add_handler(CommandHandler("monthreport", cmd_monthreport))
@@ -5211,6 +4802,7 @@ def main() -> None:
     app.add_handler(CommandHandler("upvote", cmd_upvote))
     app.add_handler(CommandHandler("modlog", cmd_modlog))
     app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("captcha", cmd_captcha))
     app.add_handler(CommandHandler("setflood", cmd_setflood))
     app.add_handler(CommandHandler("floodmode", cmd_floodmode))
     app.add_handler(CommandHandler("timer", cmd_timer))
@@ -5225,22 +4817,16 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
-    app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
-    app.add_handler(CommandHandler("welcome", cmd_welcome))
-    app.add_handler(CommandHandler("resetwelcome", cmd_resetwelcome))
-    app.add_handler(CommandHandler("purge", cmd_purge))
-    app.add_handler(CommandHandler("pin", cmd_pin))
-    app.add_handler(CommandHandler("unpin", cmd_unpin))
-    app.add_handler(CommandHandler("backup", cmd_backup))
-    # Inline-button callbacks: generic confirm/cancel (ban, removeuser, broadcast) and the
-    # /start help menu. Matched by callback_data prefix via `pattern`.
+    # Inline-button callbacks: generic confirm/cancel (ban, removeuser, broadcast) and
+    # new-member captcha verification. Matched by callback_data prefix via `pattern`.
     app.add_handler(CallbackQueryHandler(on_confirmation_callback, pattern=r"^(confirm|cancel):"))
+    app.add_handler(CallbackQueryHandler(on_captcha_callback, pattern=r"^captcha:"))
     app.add_handler(CallbackQueryHandler(on_help_menu_callback, pattern=r"^menu:"))
     # Auto-enforcement on plain text messages — separate handler groups (1, 2, 4, 5, 6) so
     # all always run alongside command dispatch in the default group (0); PTB only runs
     # the first matching handler *within* a group, not across groups.
     app.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, on_text_check_blocklist),
+        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, on_text_check_blocklist),
         group=1,
     )
     app.add_handler(
