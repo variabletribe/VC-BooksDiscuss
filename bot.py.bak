@@ -500,6 +500,7 @@ async def _reply_autodelete(
 # =============================================================================
 
 HELP_CATEGORIES: dict[str, str] = {
+    "rnr": "🎙️ Read & Record",
     "stats": "📊 Stats & Progress",
     "topics": "🗂️ VC Topics",
     "mod": "🛡️ Moderation",
@@ -589,6 +590,11 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
+    "rnr": ("rnr", "/rnr  (reply to your own voice note or audio)", "Record a Read & Record. Your audio (30s to 4 min) is saved with the date it was sent. Each audio counts once, max 3 recordings per 24 hours, forwarded audio doesn't count.", "Anyone"),
+    "myrnr": ("rnr", "/myrnr  (in a private chat with the bot)", "List all your recordings with dates. Tap one to get the audio back.", "Anyone"),
+    "rnrboard": ("rnr", "/rnrboard", "Read & Record leaderboard with streaks.", "Anyone"),
+    "delrnr": ("rnr", "/delrnr <number>", "Remove a wrong record. The saved audio copy is kept.", "Group admin"),
+    "rnrreports": ("rnr", "/rnrreports on|off", "Switch the morning post and the Monday weekly list on or off.", "Anyone can view; group admin to change"),
     "setwelcome": ("groupadmin", "/setwelcome <text>  -  or reply to any message with /setwelcome", "Set the message new members get (text, photo, video, sticker, ...). Placeholders: {first} {last} {fullname} {username} {mention} {id} {chatname} {count}. Sends a preview and switches the welcome on.", "Group admin"),
     "welcome": ("groupadmin", "/welcome [on|off]", "Show whether the welcome message is on, or switch it on/off.", "Anyone can view; group admin to change"),
     "resetwelcome": ("groupadmin", "/resetwelcome", "Delete the saved welcome message and switch it off.", "Group admin"),
@@ -2685,6 +2691,366 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await status.edit_text(f"Backup sent to {delivered} chat(s): {summary}")
     else:
         await status.edit_text("Backup built, but I couldn't deliver it. Admins must /start the bot first.")
+
+
+# =============================================================================
+# Read & Record: /rnr, /myrnr, /rnrboard, /delrnr, /rnrreports
+#
+# A member replies /rnr to THEIR OWN voice note / audio (30s - 4min). The bot copies it
+# into the private storage group (RNR_STORAGE_CHAT_ID), numbers it (RNR #n) and records
+# who/when. Members fetch their recordings later with /myrnr in a private chat with the bot.
+#   RNR_STORAGE_CHAT_ID      private group that stores the audio copies
+#   RNR_TZ_OFFSET_MINUTES    day boundary for streaks/reports (default 330 = IST)
+#   RNR_MORNING_HOUR         local hour the daily post goes out (default 8)
+# =============================================================================
+
+_RNR_STORAGE_DEFAULT = -5469935473
+_COMMAND_COOLDOWNS["rnrboard"] = 20
+_rnr_lock = asyncio.Lock()  # one /rnr at a time, so a double-tap can't save an audio twice
+_RNR_PAGE_SIZE = 8
+
+
+def _rnr_storage_chat_id() -> int:
+    raw = (os.environ.get("RNR_STORAGE_CHAT_ID") or "").strip()
+    try:
+        return int(raw) if raw else _RNR_STORAGE_DEFAULT
+    except ValueError:
+        return _RNR_STORAGE_DEFAULT
+
+
+def _rnr_morning_hour() -> int:
+    try:
+        return min(17, max(0, int(os.getenv("RNR_MORNING_HOUR", "8"))))
+    except ValueError:
+        return 8
+
+
+async def cmd_rnr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to your own voice note / audio with /rnr to record it."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use /rnr in the group, as a reply to your voice note.")
+        return
+    reply = update.message.reply_to_message
+    media = (reply.voice or reply.audio) if reply is not None else None
+    if reply is None or media is None:
+        await _reply_autodelete(update, context, "Reply to your own voice note or audio with /rnr.")
+        return
+    if getattr(reply, "forward_origin", None) is not None:
+        await _reply_autodelete(update, context, "Forwarded audio can't be recorded. Record it yourself and reply /rnr to it.")
+        return
+    if not reply.from_user or reply.from_user.id != user.id:
+        await _reply_autodelete(update, context, "You can only record your own audio. Reply /rnr to a voice note you sent.")
+        return
+
+    duration = int(media.duration or 0)
+    if duration < dbmod.RNR_MIN_SECONDS:
+        await _reply_autodelete(
+            update, context,
+            f"Too short ({_format_duration(duration)}). A Read & Record must be at least "
+            f"{dbmod.RNR_MIN_SECONDS}s.",
+        )
+        return
+    if duration > dbmod.RNR_MAX_SECONDS:
+        await _reply_autodelete(
+            update, context,
+            f"Too long ({_format_duration(duration)}). A Read & Record can be at most "
+            f"{dbmod.RNR_MAX_SECONDS // 60} minutes.",
+        )
+        return
+
+    kind = "voice" if reply.voice else "audio"
+    label = _user_label(user)
+    now = datetime.now(timezone.utc)
+    audio_at = reply.date or now
+
+    async with _rnr_lock:
+        status, info = await asyncio.to_thread(
+            dbmod.rnr_precheck, chat.id, user.id, reply.message_id, media.file_unique_id, now
+        )
+        if status == "duplicate":
+            await _reply_autodelete(
+                update, context,
+                f"Already recorded as RNR #{info['serial']} ({dbmod.rnr_date_label(info.get('audio_at'))}).",
+            )
+            return
+        if status == "limit":
+            wait = max(1, int((info["free_at"] - now).total_seconds()))
+            await _reply_autodelete(
+                update, context,
+                f"Limit reached: {dbmod.RNR_DAILY_LIMIT} recordings per 24 hours. "
+                f"Try again in {_format_duration(wait)}.",
+            )
+            return
+
+        storage = _rnr_storage_chat_id()
+        caption = (
+            f"RNR from {label} (id {user.id}) | sent {audio_at.strftime('%d %b %Y %H:%M')} UTC"
+            f" | {chat.title or chat.id}"
+        )[:1000]
+        try:
+            copied = await context.bot.copy_message(storage, chat.id, reply.message_id, caption=caption)
+        except Exception:
+            logger.exception("RNR: copying to storage chat %s failed", storage)
+            await _reply_autodelete(
+                update, context,
+                "I couldn't save your audio to the storage group, so nothing was recorded. "
+                "An admin needs to check that I'm a member of it.",
+            )
+            return
+        result = await asyncio.to_thread(
+            dbmod.rnr_insert, chat.id, user.id, label, reply.message_id, media.file_unique_id,
+            kind, duration, audio_at, storage, copied.message_id, now,
+        )
+
+    safe = html.escape(label, quote=False)
+    await _reply_autodelete(
+        update, context,
+        f"🎙️ <b>Recorded as RNR #{result['serial']}</b> — {safe}\n"
+        f"📅 Audio sent: {dbmod.rnr_date_label(audio_at)} · ⏱️ {_format_duration(duration)}\n"
+        f"🔥 Streak: <b>{result['current_streak']}</b> day(s) · Total: <b>{result['total']}</b>",
+        parse_mode="HTML",
+    )
+    if result["badges"]:
+        try:  # badge announcements stay (they are not auto-deleted like command replies)
+            await context.bot.send_message(chat.id, _format_badges_earned_html(result["badges"]), parse_mode="HTML")
+        except Exception:
+            logger.debug("RNR badge announcement failed chat_id=%s", chat.id)
+
+
+def _rnr_list_view(docs: list[dict], page: int) -> tuple[str, InlineKeyboardMarkup]:
+    pages = max(1, (len(docs) + _RNR_PAGE_SIZE - 1) // _RNR_PAGE_SIZE)
+    page = min(max(page, 0), pages - 1)
+    chunk = docs[page * _RNR_PAGE_SIZE : (page + 1) * _RNR_PAGE_SIZE]
+    rows = [
+        [InlineKeyboardButton(
+            f"#{d['serial']} · {dbmod.rnr_date_label(d.get('audio_at'))} · {_format_duration(int(d.get('duration') or 0))}",
+            callback_data=f"rnr:get:{d['chat_id']}:{d['serial']}",
+        )]
+        for d in chunk
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Newer", callback_data=f"rnr:pg:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Older ▶", callback_data=f"rnr:pg:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    text = (
+        f"🎙️ <b>Your Read &amp; Record</b> — {len(docs)} recording(s)\n"
+        f"Page {page + 1}/{pages}. Tap one and I'll send you the audio."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_myrnr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """In a private chat with the bot: list your recordings with buttons to fetch each."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        uname = context.bot.username or "the bot"
+        await _reply_autodelete(update, context, f"Send /myrnr to me in a private chat: @{uname}")
+        return
+    docs = await asyncio.to_thread(dbmod.rnr_list_for_user, update.effective_user.id)
+    if not docs:
+        await update.message.reply_text(
+            "You have no Read & Record yet. In the group, reply /rnr to your voice note."
+        )
+        return
+    text, keyboard = _rnr_list_view(docs, 0)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def on_rnr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
+    parts = query.data.split(":")
+    try:
+        if len(parts) == 3 and parts[1] == "pg":
+            docs = await asyncio.to_thread(dbmod.rnr_list_for_user, query.from_user.id)
+            if not docs:
+                await query.answer("No recordings found.", show_alert=True)
+                return
+            text, keyboard = _rnr_list_view(docs, int(parts[2]))
+            await query.answer()
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+            except Exception:
+                pass
+            return
+        if len(parts) == 4 and parts[1] == "get":
+            chat_id, serial = int(parts[2]), int(parts[3])
+            doc = await asyncio.to_thread(dbmod.rnr_get, chat_id, serial)
+            if not doc or (doc["user_id"] != query.from_user.id and not _is_admin_user(query.from_user.id)):
+                await query.answer("That recording wasn't found.", show_alert=True)
+                return
+            await context.bot.copy_message(
+                chat_id=query.from_user.id,
+                from_chat_id=doc["storage_chat_id"],
+                message_id=doc["storage_msg_id"],
+                caption=f"RNR #{serial} · {dbmod.rnr_date_label(doc.get('audio_at'))}",
+            )
+            await query.answer("Sending your audio...")
+            return
+    except Exception:
+        logger.exception("RNR callback failed data=%s", query.data)
+        await query.answer("Couldn't fetch that audio. Please tell an admin.", show_alert=True)
+        return
+    await query.answer()
+
+
+def _rnr_row_line(i: int, u: dict, count_label: str, show_total: bool = True) -> str:
+    medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+    safe = html.escape(u["name"] or str(u["user_id"]), quote=False)
+    line = f"{medal} {safe} — <b>{u['count']}</b> {count_label} · 🔥 {u['current_streak']}"
+    return line + (f" · total {u['total']}" if show_total else "")
+
+
+async def cmd_rnrboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """All-time Read & Record leaderboard."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if await _cooldown_blocked(update, context, "rnrboard"):
+        return
+    rows = await asyncio.to_thread(dbmod.rnr_leaderboard, chat.id, 20)
+    if not rows:
+        await _reply_autodelete(update, context, "No Read & Record yet. Reply /rnr to your voice note to start.")
+        return
+    lines = ["🎙️ <b>Read &amp; Record leaderboard</b>", "<i>🔥 = current streak</i>", ""]
+    for i, u in enumerate(rows, start=1):
+        lines.append(_rnr_row_line(i, {**u, "count": u["total"]}, "recordings", show_total=False))
+    await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_delrnr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin: /delrnr <number> - hide a wrong record (the audio copy is kept)."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can delete a record.")
+        return
+    try:
+        serial = int((context.args or [""])[0].lstrip("#"))
+    except ValueError:
+        await _reply_autodelete(update, context, "Usage: /delrnr <number>   e.g. /delrnr 12")
+        return
+    doc = await asyncio.to_thread(dbmod.rnr_soft_delete, chat.id, serial, update.effective_user.id)
+    if doc is None:
+        await _reply_autodelete(update, context, f"No active record RNR #{serial}.")
+        return
+    await asyncio.to_thread(
+        dbmod.log_mod_action, chat.id, "delrnr", int(doc["user_id"]), str(doc.get("display_name", "")),
+        update.effective_user.id, _user_label(update.effective_user), f"RNR #{serial}",
+    )
+    await _reply_autodelete(
+        update, context,
+        f"RNR #{serial} removed from the records. The saved audio copy is kept, and the "
+        "member can record that audio again.",
+    )
+
+
+async def cmd_rnrreports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin: /rnrreports on|off - the daily/weekly Read & Record posts."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    enabled = await asyncio.to_thread(dbmod.get_rnr_reports_enabled, chat.id)
+    if not context.args:
+        await _reply_autodelete(
+            update, context,
+            f"Daily/weekly Read & Record posts are {'on' if enabled else 'off'}.\nUsage: /rnrreports on|off",
+        )
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can change this.")
+        return
+    arg = context.args[0].lower()
+    if arg not in ("on", "off"):
+        await _reply_autodelete(update, context, "Usage: /rnrreports on|off")
+        return
+    await asyncio.to_thread(dbmod.set_rnr_reports, chat.id, arg == "on")
+    await _reply_autodelete(update, context, f"Daily/weekly Read & Record posts turned {arg}.")
+
+
+def _format_rnr_daily(day: str, rows: list[dict]) -> str:
+    label = datetime.strptime(day, "%Y-%m-%d").strftime("%d %b")
+    lines = [
+        f"🌅 <b>Read &amp; Record — {label}</b>",
+        f"<i>{len(rows)} member(s) recorded · 🔥 = current streak</i>",
+        "",
+    ]
+    for i, u in enumerate(rows, start=1):
+        lines.append(_rnr_row_line(i, u, "recording" if u["count"] == 1 else "recordings"))
+    lines += ["", "<i>Reply /rnr to your voice note to join today's list.</i>"]
+    return "\n".join(lines)
+
+
+def _format_rnr_weekly(days: list[str], rows: list[dict]) -> str:
+    start = datetime.strptime(days[0], "%Y-%m-%d").strftime("%d %b")
+    end = datetime.strptime(days[-1], "%Y-%m-%d").strftime("%d %b")
+    total = sum(u["count"] for u in rows)
+    lines = [
+        f"📅 <b>Weekly Read &amp; Record — {start} to {end}</b>",
+        f"<i>{len(rows)} member(s) recorded · {total} recording(s) in total</i>",
+        "",
+    ]
+    for i, u in enumerate(rows, start=1):
+        lines.append(_rnr_row_line(i, u, "this week"))
+    return "\n".join(lines)
+
+
+async def rnr_morning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Checked every 30 minutes. Each morning (local time) posts yesterday's recorders with
+    streak and total; on Mondays also the full list of everyone who recorded last week.
+    Progress is stored in MongoDB, so restarts never double-post, and a late restart still
+    catches up the same morning."""
+    try:
+        local = datetime.now(timezone.utc) + dbmod.rnr_tz_offset()
+        start_hour = _rnr_morning_hour()
+        if not (start_hour <= local.hour < start_hour + 6):
+            return
+        today = local.strftime("%Y-%m-%d")
+        yesterday = (local - timedelta(days=1)).strftime("%Y-%m-%d")
+        week_days = [(local - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7, 0, -1)]
+        chat_ids = await asyncio.to_thread(dbmod.rnr_chat_ids)
+    except Exception:
+        logger.exception("RNR morning job setup failed")
+        return
+
+    for chat_id in chat_ids:
+        try:
+            if not await asyncio.to_thread(dbmod.get_rnr_reports_enabled, chat_id):
+                continue
+            daily_key = f"rnr_daily:{chat_id}"
+            if await asyncio.to_thread(dbmod.rnr_posted, daily_key) != today:
+                rows = await asyncio.to_thread(dbmod.rnr_recorders_on_day, chat_id, yesterday)
+                if rows:
+                    for chunk in _split_for_telegram(_format_rnr_daily(yesterday, rows)):
+                        await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
+                await asyncio.to_thread(dbmod.rnr_set_posted, daily_key, today)
+            weekly_key = f"rnr_weekly:{chat_id}"
+            if local.weekday() == 0 and await asyncio.to_thread(dbmod.rnr_posted, weekly_key) != today:
+                rows = await asyncio.to_thread(dbmod.rnr_recorders_in_days, chat_id, week_days)
+                if rows:
+                    for chunk in _split_for_telegram(_format_rnr_weekly(week_days, rows)):
+                        await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
+                await asyncio.to_thread(dbmod.rnr_set_posted, weekly_key, today)
+        except Exception:
+            logger.exception("RNR morning post failed chat_id=%s", chat_id)
 
 
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4907,7 +5273,13 @@ async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     label = _user_label(user)
     stats = await asyncio.to_thread(dbmod.get_my_stats, chat.id, user.id, label)
-    await _reply_autodelete(update, context, dbmod.format_my_stats_message(stats), parse_mode="HTML")
+    text = dbmod.format_my_stats_message(stats)
+    try:
+        rnr = await asyncio.to_thread(dbmod.rnr_user_summary, chat.id, user.id)
+        text += "\n\n" + dbmod.format_rnr_stats_lines(rnr)
+    except Exception:
+        logger.exception("R&R stats failed for /mystats chat_id=%s", chat.id)
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
 
 
 async def cmd_streakboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5112,6 +5484,7 @@ async def post_init(application: Application) -> None:
         time=dt_time(hour=_backup_hour_utc(), minute=30, tzinfo=timezone.utc),
         name="daily_backup_job",
     )
+    jq.run_repeating(rnr_morning_job, interval=1800, first=90, name="rnr_morning_job")
     logger.info(
         "Scheduled database backup check daily at %02d:30 UTC (every %s day(s))",
         _backup_hour_utc(), _backup_interval_days(),
@@ -5225,6 +5598,12 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
+    app.add_handler(CommandHandler("rnr", cmd_rnr))
+    app.add_handler(CommandHandler("myrnr", cmd_myrnr))
+    app.add_handler(CommandHandler("rnrboard", cmd_rnrboard))
+    app.add_handler(CommandHandler("delrnr", cmd_delrnr))
+    app.add_handler(CommandHandler("rnrreports", cmd_rnrreports))
+    app.add_handler(CallbackQueryHandler(on_rnr_callback, pattern=r"^rnr:"))
     app.add_handler(CommandHandler("setwelcome", cmd_setwelcome))
     app.add_handler(CommandHandler("welcome", cmd_welcome))
     app.add_handler(CommandHandler("resetwelcome", cmd_resetwelcome))

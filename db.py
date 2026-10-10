@@ -2737,3 +2737,142 @@ def rnr_posted(key: str) -> str | None:
 
 def rnr_set_posted(key: str, day: str) -> None:
     _coll("meta").update_one({"_id": key}, {"$set": {"day": day}}, upsert=True)
+
+
+# =============================================================================
+# Privacy: data export for /mydata
+# =============================================================================
+
+
+def _export_json_default(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    if isinstance(value, (set, frozenset)):
+        return sorted(value)
+    return str(value)
+
+
+def export_user_data(user_id: int) -> dict:
+    """Everything this bot stores about one user across all chats. Read-only. Never
+    includes anyone else's data and leaves out admin names on moderation entries."""
+    out: dict = {
+        "about": (
+            "Everything this bot stores about you. Times are UTC. The audio files of your "
+            "Read & Record are not in this file; use /myrnr in a private chat to get them back."
+        ),
+        "user_id": user_id,
+        "exported_at": datetime.now(timezone.utc),
+    }
+
+    stats = []
+    for d in _coll("user_attendance").find({"user_id": user_id}):
+        row = {k: v for k, v in d.items() if k != "_id"}
+        row["level"] = _level_for_xp(int(d.get("xp", 0)))[0]
+        stats.append(row)
+    out["stats"] = stats
+
+    sessions = []
+    cursor = _coll("vc_sessions").find(
+        {"participants.user_id": user_id},
+        {"participants": 1, "chat_id": 1, "started_at": 1, "ended_at": 1, "duration_sec": 1},
+    ).sort("ended_at", ASCENDING)
+    for s in cursor:
+        p = next((x for x in (s.get("participants") or []) if x.get("user_id") == user_id), {})
+        sessions.append(
+            {
+                "chat_id": s.get("chat_id"),
+                "started_at": s.get("started_at"),
+                "ended_at": s.get("ended_at"),
+                "call_length_sec": s.get("duration_sec"),
+                "your_estimated_sec": p.get("estimated_seconds"),
+                "name_shown": p.get("display_name"),
+            }
+        )
+    out["voice_chat_sessions"] = sessions
+
+    out["recordings"] = [
+        {
+            "chat_id": d.get("chat_id"),
+            "number": d.get("serial"),
+            "kind": d.get("kind"),
+            "duration_sec": d.get("duration"),
+            "audio_sent_at": d.get("audio_at"),
+            "recorded_at": d.get("recorded_at"),
+            "removed_by_admin": bool(d.get("deleted")),
+        }
+        for d in _coll("rnr_records").find({"user_id": user_id}).sort("audio_at", ASCENDING)
+    ]
+
+    warnings = []
+    for d in _coll("warnings").find({"user_id": user_id}):
+        cleared = d.get("cleared_before")
+        warnings.append(
+            {
+                "chat_id": d.get("chat_id"),
+                "warnings": [
+                    {
+                        "reason": w.get("reason"),
+                        "at": w.get("at"),
+                        "active": (not cleared or w["at"] > cleared),
+                    }
+                    for w in d.get("warns", [])
+                ],
+            }
+        )
+    out["warnings"] = warnings
+
+    out["moderation_actions"] = [
+        {"chat_id": d.get("chat_id"), "action": d.get("action"), "reason": d.get("reason"), "at": d.get("at")}
+        for d in _coll("mod_log").find({"target_id": user_id}).sort("at", ASCENDING)
+    ]
+
+    out["topics_added"] = [
+        {
+            "chat_id": d.get("chat_id"),
+            "number": d.get("serial"),
+            "text": d.get("text"),
+            "state": d.get("state"),
+            "votes": d.get("votes", 0),
+            "added_at": d.get("added_at"),
+        }
+        for d in _coll("topics").find({"added_by_id": user_id}).sort("added_at", ASCENDING)
+    ]
+    out["topics_voted_for"] = [
+        {"chat_id": d.get("chat_id"), "number": d.get("serial")}
+        for d in _coll("topics").find({"voter_ids": user_id}, {"chat_id": 1, "serial": 1})
+    ]
+
+    out["codes"] = [
+        {"chat_id": d.get("chat_id"), "telegram_code": d.get("code")}
+        for d in _coll("tg_codes").find({"user_id": user_id})
+    ] + [
+        {"chat_id": d.get("chat_id"), "linked_meet_code": d.get("code")}
+        for d in _coll("meet_codes").find({"linked_tg_user_id": user_id})
+    ]
+
+    out["seen_as"] = [
+        {
+            "chat_id": d.get("chat_id"),
+            "username": d.get("username"),
+            "display_name": d.get("display_name"),
+            "last_seen": d.get("updated_at"),
+        }
+        for d in _coll("known_users").find({"user_id": user_id})
+    ]
+
+    out["allowed_to_post_links_in"] = [
+        d["_id"] for d in _coll("chat_settings").find({"link_allowlist": user_id}, {"_id": 1})
+    ]
+    return out
+
+
+def export_user_data_json(user_id: int) -> tuple[bytes, dict[str, int]]:
+    """(pretty JSON bytes, {section: item_count}) for /mydata."""
+    import json
+
+    data = export_user_data(user_id)
+    counts = {k: len(v) for k, v in data.items() if isinstance(v, list)}
+    raw = json.dumps(data, indent=2, ensure_ascii=False, default=_export_json_default)
+    return raw.encode("utf-8"), counts
