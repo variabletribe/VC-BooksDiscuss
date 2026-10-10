@@ -590,6 +590,8 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
+    "privacy": ("everyone", "/privacy", "What the bot stores about you, who can see it, and how to get or delete your data.", "Anyone"),
+    "mydata": ("everyone", "/mydata  (in a private chat with the bot)", "Get a file with everything the bot has stored about you: stats, voice-chat sessions, recordings, warnings, topics.", "Anyone"),
     "rnr": ("rnr", "/rnr  (reply to your own voice note or audio)", "Record a Read & Record. Your audio (30s to 4 min) is saved with the date it was sent. Each audio counts once, max 3 recordings per 24 hours, forwarded audio doesn't count.", "Anyone"),
     "myrnr": ("rnr", "/myrnr  (in a private chat with the bot)", "List all your recordings with dates. Tap one to get the audio back.", "Anyone"),
     "rnrboard": ("rnr", "/rnrboard", "Read & Record leaderboard with streaks.", "Anyone"),
@@ -672,6 +674,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     like a normal command response."""
     if not update.message:
         return
+    arg = context.args[0].lower() if context.args else ""
+    if update.effective_chat and update.effective_chat.type == "private":
+        if arg == "privacy":
+            await cmd_privacy(update, context)
+            return
+        if arg == "mydata":
+            await cmd_mydata(update, context)
+            return
     await update.message.reply_text(
         _help_main_menu_text(), parse_mode="HTML", reply_markup=_help_main_menu_keyboard()
     )
@@ -3051,6 +3061,127 @@ async def rnr_morning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await asyncio.to_thread(dbmod.rnr_set_posted, weekly_key, today)
         except Exception:
             logger.exception("RNR morning post failed chat_id=%s", chat_id)
+
+
+# =============================================================================
+# Privacy: /privacy and /mydata
+# /privacy explains what is stored and who can see it. /mydata sends a member a file with
+# everything stored about THEM. Both open in a private chat (also via t.me/<bot>?start=...),
+# so personal data is never posted in the group.
+# =============================================================================
+
+_PRIVACY_TEXT = (
+    "🔒 <b>Privacy notice</b>\n\n"
+    "<b>What I store about you</b>\n"
+    "• Your Telegram ID, name and @username, to show your stats and to find you for admin commands.\n"
+    "• Voice-chat activity: when you join calls, estimated minutes, present days, streaks, XP and badges.\n"
+    "• The date I first saw you join the group.\n"
+    "• Read &amp; Record: a copy of each voice note or audio you record with /rnr (kept in a private "
+    "storage group), plus its date and length.\n"
+    "• Topics you suggest and vote for, and your member codes.\n"
+    "• Moderation: warnings, mutes, bans and kicks given to you, with the reason.\n\n"
+    "<b>What I don't store</b>\n"
+    "• The text of group messages. I read messages only to apply group rules (blocked words, links, "
+    "flooding, filters) and to remember @usernames, then forget the text.\n"
+    "• Messages you send me privately are forwarded to the group admins so they can reply.\n\n"
+    "<b>Who can see it</b>\n"
+    "• Everyone in the group sees the leaderboards (name, hours, days, streaks).\n"
+    "• Bot admins and group admins can look up your stats and warnings.\n"
+    "• Everyone in the Read &amp; Record storage group can hear the saved audio.\n"
+    "• If AI recaps are switched on, names and call minutes are sent to an AI service (Groq) to write "
+    "the post-call summary.\n"
+    "• Bot admins receive regular database backups that contain this data.\n\n"
+    "<b>How long</b>\n"
+    "Until an admin deletes it. Leaving the group does not delete your data.\n\n"
+    "<b>Your options</b>\n"
+    "• /mydata: get a file with everything stored about you.\n"
+    "• /myrnr: get your recordings back.\n"
+    "• To have your data corrected or deleted, ask a group admin."
+)
+
+_MYDATA_COOLDOWN_SECONDS = 60
+_mydata_last: dict[int, float] = {}  # user_id -> monotonic time of last export
+
+
+async def _redirect_to_private(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str, text: str) -> None:
+    """In a group: point the user to a private chat with a one-tap button; tidy up after 60s."""
+    uname = context.bot.username
+    keyboard = None
+    if uname:
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Open private chat", url=f"https://t.me/{uname}?start={topic}")]]
+        )
+    sent = await update.message.reply_text(text, reply_markup=keyboard)
+    jq = context.job_queue
+    if jq is not None and update.effective_chat:
+        jq.run_once(
+            _delete_messages_later,
+            when=60,
+            data={"chat_id": update.effective_chat.id, "message_ids": [update.message.message_id, sent.message_id]},
+            name=f"{topic}-redirect-{update.effective_chat.id}-{sent.message_id}",
+        )
+
+
+async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone: what the bot stores, who can see it, and how to get/delete your data."""
+    if not update.message or not update.effective_chat:
+        return
+    if update.effective_chat.type != "private":
+        await _redirect_to_private(
+            update, context, "privacy", "The privacy notice is long, so I'll show it in a private chat."
+        )
+        return
+    await update.message.reply_text(_PRIVACY_TEXT, parse_mode="HTML")
+
+
+async def cmd_mydata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone, private chat only: send the member a JSON file of everything stored about them."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        await _redirect_to_private(
+            update, context, "mydata", "Your data is personal, so I only send it in a private chat."
+        )
+        return
+
+    user = update.effective_user
+    now = time.monotonic()
+    last = _mydata_last.get(user.id)
+    if last is not None and now - last < _MYDATA_COOLDOWN_SECONDS:
+        wait = int(_MYDATA_COOLDOWN_SECONDS - (now - last)) + 1
+        await update.message.reply_text(f"Please wait {wait}s before asking again.")
+        return
+    _mydata_last[user.id] = now
+
+    try:
+        blob, counts = await asyncio.to_thread(dbmod.export_user_data_json, user.id)
+    except Exception:
+        logger.exception("/mydata export failed user_id=%s", user.id)
+        await update.message.reply_text("Sorry, I couldn't prepare your data right now. Please try again later.")
+        return
+
+    found = {k: v for k, v in counts.items() if v}
+    if not found:
+        await update.message.reply_text("I have no data stored about you.")
+        return
+    names = {
+        "stats": "group stats",
+        "voice_chat_sessions": "voice-chat sessions",
+        "recordings": "Read & Record recordings",
+        "warnings": "warning records",
+        "moderation_actions": "moderation actions",
+        "topics_added": "topics added",
+        "topics_voted_for": "topic votes",
+        "codes": "codes",
+        "seen_as": "name records",
+        "allowed_to_post_links_in": "link permissions",
+    }
+    summary = ", ".join(f"{v} {names.get(k, k)}" for k, v in found.items())
+    filename = f"my_data_{user.id}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.json"
+    await update.message.reply_document(
+        document=InputFile(io.BytesIO(blob), filename=filename),
+        caption=f"Everything I have stored about you: {summary}.\nSee /privacy for how it is used."[:1000],
+    )
 
 
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5598,6 +5729,8 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
+    app.add_handler(CommandHandler("privacy", cmd_privacy))
+    app.add_handler(CommandHandler("mydata", cmd_mydata))
     app.add_handler(CommandHandler("rnr", cmd_rnr))
     app.add_handler(CommandHandler("myrnr", cmd_myrnr))
     app.add_handler(CommandHandler("rnrboard", cmd_rnrboard))

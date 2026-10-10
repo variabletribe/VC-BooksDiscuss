@@ -4613,7 +4613,21 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     "https://api.groq.com/openai/v1/models",
                     headers={"Authorization": f"Bearer {groq_key}"},
                 )
-            lines.append("✅ Groq: reachable" if r.status_code == 200 else f"❌ Groq: HTTP {r.status_code}")
+            if r.status_code != 200:
+                lines.append(f"❌ Groq: HTTP {r.status_code}")
+            else:
+                try:
+                    available = {m.get("id") for m in r.json().get("data", [])}
+                except Exception:
+                    available = set()
+                usable = [m for m in _groq_models() if m in available]
+                if usable:
+                    lines.append(f"✅ Groq: reachable, recap model {usable[0]} is available")
+                elif available:
+                    lines.append("❌ Groq: key works but none of the recap models exist any more. Set GROQ_MODEL on Render."
+                                 )
+                else:
+                    lines.append("✅ Groq: reachable")
         except Exception as exc:
             lines.append(f"❌ Groq: {html.escape(str(exc)[:200], quote=False)}")
 
@@ -5273,6 +5287,63 @@ def _format_badges_earned_html(badges: list) -> str:
     return "\n".join(lines)
 
 
+# --- Groq (AI recap) --------------------------------------------------------
+# Groq retires models regularly (llama-3.3-70b-versatile was shut down on 16 Aug 2026), so
+# the model is configurable (GROQ_MODEL on Render) and the bot falls back to the next one
+# in this list if a model no longer exists. gpt-oss models "think" first, and those tokens
+# count against the limit, so they get a low reasoning effort and a roomy token budget.
+
+_GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+
+
+def _groq_models() -> list[str]:
+    custom = (os.environ.get("GROQ_MODEL") or "").strip()
+    models: list[str] = []
+    for m in ([custom] if custom else []) + _GROQ_MODEL_FALLBACKS:
+        if m not in models:
+            models.append(m)
+    return models
+
+
+async def _groq_recap_text(api_key: str, prompt: str) -> str | None:
+    """Ask Groq for the recap, trying each model in turn. Every failure is logged with
+    the model name and Groq's own error message, so Render's logs show what went wrong."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for model in _groq_models():
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_completion_tokens": 1024,
+                "temperature": 0.8,
+            }
+            if model.startswith("openai/gpt-oss"):
+                payload["reasoning_effort"] = "low"
+            try:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+            except Exception:
+                logger.exception("Groq summary request failed (model=%s)", model)
+                continue
+            if r.status_code != 200:
+                logger.warning("Groq summary failed: model=%s HTTP %s %s", model, r.status_code, r.text[:300])
+                if r.status_code in (401, 403):
+                    return None  # bad/revoked key: other models won't help
+                continue
+            try:
+                choice = r.json()["choices"][0]
+                text = (choice["message"].get("content") or "").strip()
+            except (KeyError, IndexError, ValueError, AttributeError):
+                logger.warning("Groq summary: unexpected response shape from %s: %s", model, r.text[:300])
+                continue
+            if text:
+                return text
+            logger.warning("Groq summary: %s returned no text (finish_reason=%s)", model, choice.get("finish_reason"))
+    return None
+
+
 async def generate_ai_vc_summary(
     chat_title: str,
     duration_sec: int,
@@ -5314,30 +5385,7 @@ async def generate_ai_vc_summary(
         f"formatting, just plain text. Keep it under 400 characters."
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 200,
-                    "temperature": 0.8,
-                },
-            )
-        if r.status_code != 200:
-            logger.warning("Groq summary failed: HTTP %s %s", r.status_code, r.text[:300])
-            return None
-        data = r.json()
-        text = data["choices"][0]["message"]["content"].strip()
-        return text or None
-    except Exception:
-        logger.exception("Groq summary request failed")
-        return None
+    return await _groq_recap_text(api_key, prompt)
 
 
 async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
