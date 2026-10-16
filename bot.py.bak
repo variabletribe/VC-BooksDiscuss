@@ -590,6 +590,7 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
+    "mylimits": ("everyone", "/mylimits  (in a private chat with the bot)", "See how many commands and audio downloads you have left today.", "Anyone"),
     "privacy": ("everyone", "/privacy", "What the bot stores about you, who can see it, and how to get or delete your data.", "Anyone"),
     "mydata": ("everyone", "/mydata  (in a private chat with the bot)", "Get a file with everything the bot has stored about you: stats, voice-chat sessions, recordings, warnings, topics.", "Anyone"),
     "rnr": ("rnr", "/rnr  (reply to your own voice note or audio)", "Record a Read & Record. Your audio (30s to 4 min) is saved with the date it was sent. Each audio counts once, max 3 recordings per 24 hours, forwarded audio doesn't count.", "Anyone"),
@@ -2897,12 +2898,29 @@ async def on_rnr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not doc or (doc["user_id"] != query.from_user.id and not _is_admin_user(query.from_user.id)):
                 await query.answer("That recording wasn't found.", show_alert=True)
                 return
+            is_admin = _is_admin_user(query.from_user.id)
+            if not is_admin:
+                used, opens_at = await asyncio.to_thread(
+                    dbmod.dm_quota_status, query.from_user.id, "audios", datetime.now(timezone.utc)
+                )
+                if used >= _DM_AUDIO_LIMIT:
+                    wait = int((opens_at - datetime.now(timezone.utc)).total_seconds()) if opens_at else 0
+                    await query.answer(
+                        f"Your limit is over ({_DM_AUDIO_LIMIT} audios per day). Come back after 24 hours "
+                        f"to get other audios. Next one unlocks in {_format_duration(max(60, wait))}.",
+                        show_alert=True,
+                    )
+                    return
             await context.bot.copy_message(
                 chat_id=query.from_user.id,
                 from_chat_id=doc["storage_chat_id"],
                 message_id=doc["storage_msg_id"],
                 caption=f"RNR #{serial} · {dbmod.rnr_date_label(doc.get('audio_at'))}",
             )
+            if not is_admin:
+                await asyncio.to_thread(
+                    dbmod.dm_quota_consume, query.from_user.id, "audios", datetime.now(timezone.utc)
+                )
             await query.answer("Sending your audio...")
             return
     except Exception:
@@ -3182,6 +3200,225 @@ async def cmd_mydata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         document=InputFile(io.BytesIO(blob), filename=filename),
         caption=f"Everything I have stored about you: {summary}.\nSee /privacy for how it is used."[:1000],
     )
+
+
+# =============================================================================
+# Private-chat limits and overload protection
+#
+#  * Each member gets DM_COMMAND_LIMIT commands (default 10) and DM_AUDIO_LIMIT audio
+#    downloads (default 5) per rolling 24 hours. Stored in MongoDB, so restarts don't reset it.
+#    /start, /help and /mylimits are free; menu buttons are not commands. Bot admins are exempt.
+#  * Burst guard: too many messages or button taps in a few seconds are ignored for a while.
+#  * Relay cap: non-command DMs are forwarded to the admin group, so they are capped per hour.
+#  * Global breaker: if far too many DMs arrive per minute, the excess is dropped.
+#  * Command-spam guard in groups (admins exempt).
+# Every gate fails OPEN: if a check itself breaks, the message goes through.
+# =============================================================================
+
+from collections import deque
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+_DM_COMMAND_LIMIT = _env_int("DM_COMMAND_LIMIT", 10)
+_DM_AUDIO_LIMIT = _env_int("DM_AUDIO_LIMIT", 5)
+_DM_FREE_COMMANDS = {"start", "help", "mylimits"}
+_DM_BURST_MESSAGES, _DM_BURST_WINDOW, _DM_BURST_PENALTY = 6, 10, 60      # msgs / seconds / block seconds
+_DM_TAP_LIMIT, _DM_TAP_WINDOW, _DM_TAP_PENALTY = 8, 10, 20               # button taps
+_DM_RELAY_PER_HOUR = 30
+_DM_GLOBAL_PER_MINUTE = _env_int("DM_GLOBAL_PER_MINUTE", 300)
+_GRP_CMD_LIMIT, _GRP_CMD_WINDOW, _GRP_CMD_PENALTY = 8, 20, 60
+
+_dm_burst: dict[int, dict] = {}
+_dm_taps: dict[int, dict] = {}
+_dm_relay: dict[int, dict] = {}
+_dm_global: deque = deque()
+_dm_global_warned = float("-inf")
+_grp_cmd_state: dict[tuple[int, int], dict] = {}
+_dm_quota_lock = asyncio.Lock()
+
+
+def _prune_state(state: dict, now: float, idle_seconds: float) -> None:
+    """Keep these in-memory tables from growing forever."""
+    if len(state) > 2000:
+        for key in [k for k, v in state.items() if now - v.get("last", 0.0) > idle_seconds]:
+            state.pop(key, None)
+
+
+def _burst_blocked(state: dict, key, now: float, limit: int, window: int, penalty: int) -> tuple[bool, bool]:
+    """Sliding-window burst check. Returns (blocked, just_started_blocking)."""
+    st = state.setdefault(key, {"t": deque(), "until": 0.0, "last": now})
+    st["last"] = now
+    if now < st["until"]:
+        return True, False
+    times = st["t"]
+    while times and now - times[0] > window:
+        times.popleft()
+    times.append(now)
+    if len(times) > limit:
+        st["until"] = now + penalty
+        times.clear()
+        return True, True
+    return False, False
+
+
+def _global_overloaded(now: float) -> bool:
+    global _dm_global_warned
+    while _dm_global and now - _dm_global[0] > 60:
+        _dm_global.popleft()
+    _dm_global.append(now)
+    if len(_dm_global) > _DM_GLOBAL_PER_MINUTE:
+        if now - _dm_global_warned > 60:
+            _dm_global_warned = now
+            logger.warning("DM overload: more than %s private updates/minute, dropping the excess", _DM_GLOBAL_PER_MINUTE)
+        return True
+    return False
+
+
+async def _dm_check_message(msg, user) -> tuple[bool, str | None]:
+    """(blocked, notice_to_send). Silent block = (True, None)."""
+    now = time.monotonic()
+    if _global_overloaded(now):
+        return True, None
+
+    blocked, started = _burst_blocked(_dm_burst, user.id, now, _DM_BURST_MESSAGES, _DM_BURST_WINDOW, _DM_BURST_PENALTY)
+    if blocked:
+        return True, ("You're sending messages too fast. I'll listen again in a minute." if started else None)
+    _prune_state(_dm_burst, now, 3600)
+
+    text = msg.text or ""
+    if not text.startswith("/"):
+        st = _dm_relay.setdefault(user.id, {"t": deque(), "told": float("-inf"), "last": now})
+        st["last"] = now
+        while st["t"] and now - st["t"][0] > 3600:
+            st["t"].popleft()
+        if len(st["t"]) >= _DM_RELAY_PER_HOUR:
+            told = now - st["told"] < 3600
+            st["told"] = now if not told else st["told"]
+            return True, (None if told else "You've sent a lot of messages this hour. Please try again later.")
+        st["t"].append(now)
+        _prune_state(_dm_relay, now, 7200)
+        return False, None
+
+    parts = text.split()
+    name = parts[0][1:].split("@")[0].lower()
+    if name in _DM_FREE_COMMANDS and not (name == "start" and len(parts) > 1):  # "/start privacy" does real work
+        return False, None
+
+    async with _dm_quota_lock:
+        when = datetime.now(timezone.utc)
+        used, opens_at = await asyncio.to_thread(dbmod.dm_quota_status, user.id, "commands", when)
+        if used >= _DM_COMMAND_LIMIT:
+            wait = max(60, int((opens_at - when).total_seconds())) if opens_at else 60
+            return True, (
+                f"Your limit is over: {_DM_COMMAND_LIMIT} commands per 24 hours. "
+                f"Come back in about {_format_duration(wait)}."
+            )
+        await asyncio.to_thread(dbmod.dm_quota_consume, user.id, "commands", when)
+    return False, None
+
+
+async def dm_message_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every other handler (group -1) for private messages."""
+    from telegram.ext import ApplicationHandlerStop
+
+    msg, user = update.message, update.effective_user
+    if not msg or not user or user.is_bot or _is_admin_user(user.id):
+        return
+    try:
+        blocked, notice = await _dm_check_message(msg, user)
+    except Exception:
+        logger.exception("DM gate failed; letting the message through")
+        return
+    if blocked:
+        if notice:
+            try:
+                await msg.reply_text(notice)
+            except Exception:
+                pass
+        raise ApplicationHandlerStop
+
+
+async def dm_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Button taps: ignore rapid-fire tapping (and shed load if the whole bot is swamped)."""
+    from telegram.ext import ApplicationHandlerStop
+
+    query = update.callback_query
+    user = query.from_user if query else None
+    if not user or user.is_bot or _is_admin_user(user.id):
+        return
+    try:
+        now = time.monotonic()
+        overloaded = _global_overloaded(now)
+        blocked, started = _burst_blocked(_dm_taps, user.id, now, _DM_TAP_LIMIT, _DM_TAP_WINDOW, _DM_TAP_PENALTY)
+        _prune_state(_dm_taps, now, 3600)
+    except Exception:
+        logger.exception("Callback gate failed; letting the tap through")
+        return
+    if overloaded or blocked:
+        try:
+            await query.answer("Slow down a little, then try again." if started else None)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+
+
+async def group_command_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group command spam guard: more than 8 commands in 20s from one member are ignored
+    for a minute. Admins are never throttled."""
+    from telegram.ext import ApplicationHandlerStop
+
+    msg, user, chat = update.message, update.effective_user, update.effective_chat
+    if not msg or not user or user.is_bot or not chat:
+        return
+    try:
+        now = time.monotonic()
+        blocked, started = _burst_blocked(
+            _grp_cmd_state, (chat.id, user.id), now, _GRP_CMD_LIMIT, _GRP_CMD_WINDOW, _GRP_CMD_PENALTY
+        )
+        _prune_state(_grp_cmd_state, now, 3600)
+        if not blocked:
+            return
+        if await _is_group_admin(update, context):
+            _grp_cmd_state[(chat.id, user.id)]["until"] = 0.0
+            return
+    except Exception:
+        logger.exception("Group command gate failed; letting the command through")
+        return
+    if started:
+        try:
+            await _reply_autodelete(update, context, "Too many commands too quickly. Please wait a minute.")
+        except Exception:
+            pass
+    raise ApplicationHandlerStop
+
+
+async def cmd_mylimits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Private chat: how many commands and audio downloads you have left (rolling 24h)."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        await _reply_autodelete(update, context, "Send /mylimits to me in a private chat.")
+        return
+    user = update.effective_user
+    if _is_admin_user(user.id):
+        await update.message.reply_text("Bot admins have no limits.")
+        return
+    now = datetime.now(timezone.utc)
+    lines = ["Your limits (rolling 24 hours)", ""]
+    for kind, label, limit in (("commands", "Commands", _DM_COMMAND_LIMIT), ("audios", "Audios", _DM_AUDIO_LIMIT)):
+        used, opens_at = await asyncio.to_thread(dbmod.dm_quota_status, user.id, kind, now)
+        line = f"{label}: {used} of {limit} used, {max(0, limit - used)} left"
+        if used >= limit and opens_at:
+            line += f" (next slot in {_format_duration(max(60, int((opens_at - now).total_seconds())))})"
+        lines.append(line)
+    lines += ["", "/start, /help and /mylimits are free."]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4613,7 +4850,21 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     "https://api.groq.com/openai/v1/models",
                     headers={"Authorization": f"Bearer {groq_key}"},
                 )
-            lines.append("✅ Groq: reachable" if r.status_code == 200 else f"❌ Groq: HTTP {r.status_code}")
+            if r.status_code != 200:
+                lines.append(f"❌ Groq: HTTP {r.status_code}")
+            else:
+                try:
+                    available = {m.get("id") for m in r.json().get("data", [])}
+                except Exception:
+                    available = set()
+                usable = [m for m in _groq_models() if m in available]
+                if usable:
+                    lines.append(f"✅ Groq: reachable, recap model {usable[0]} is available")
+                elif available:
+                    lines.append("❌ Groq: key works but none of the recap models exist any more. Set GROQ_MODEL on Render."
+                                 )
+                else:
+                    lines.append("✅ Groq: reachable")
         except Exception as exc:
             lines.append(f"❌ Groq: {html.escape(str(exc)[:200], quote=False)}")
 
@@ -5273,6 +5524,63 @@ def _format_badges_earned_html(badges: list) -> str:
     return "\n".join(lines)
 
 
+# --- Groq (AI recap) --------------------------------------------------------
+# Groq retires models regularly (llama-3.3-70b-versatile was shut down on 16 Aug 2026), so
+# the model is configurable (GROQ_MODEL on Render) and the bot falls back to the next one
+# in this list if a model no longer exists. gpt-oss models "think" first, and those tokens
+# count against the limit, so they get a low reasoning effort and a roomy token budget.
+
+_GROQ_MODEL_FALLBACKS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+
+
+def _groq_models() -> list[str]:
+    custom = (os.environ.get("GROQ_MODEL") or "").strip()
+    models: list[str] = []
+    for m in ([custom] if custom else []) + _GROQ_MODEL_FALLBACKS:
+        if m not in models:
+            models.append(m)
+    return models
+
+
+async def _groq_recap_text(api_key: str, prompt: str) -> str | None:
+    """Ask Groq for the recap, trying each model in turn. Every failure is logged with
+    the model name and Groq's own error message, so Render's logs show what went wrong."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for model in _groq_models():
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_completion_tokens": 1024,
+                "temperature": 0.8,
+            }
+            if model.startswith("openai/gpt-oss"):
+                payload["reasoning_effort"] = "low"
+            try:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+            except Exception:
+                logger.exception("Groq summary request failed (model=%s)", model)
+                continue
+            if r.status_code != 200:
+                logger.warning("Groq summary failed: model=%s HTTP %s %s", model, r.status_code, r.text[:300])
+                if r.status_code in (401, 403):
+                    return None  # bad/revoked key: other models won't help
+                continue
+            try:
+                choice = r.json()["choices"][0]
+                text = (choice["message"].get("content") or "").strip()
+            except (KeyError, IndexError, ValueError, AttributeError):
+                logger.warning("Groq summary: unexpected response shape from %s: %s", model, r.text[:300])
+                continue
+            if text:
+                return text
+            logger.warning("Groq summary: %s returned no text (finish_reason=%s)", model, choice.get("finish_reason"))
+    return None
+
+
 async def generate_ai_vc_summary(
     chat_title: str,
     duration_sec: int,
@@ -5314,30 +5622,7 @@ async def generate_ai_vc_summary(
         f"formatting, just plain text. Keep it under 400 characters."
     )
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 200,
-                    "temperature": 0.8,
-                },
-            )
-        if r.status_code != 200:
-            logger.warning("Groq summary failed: HTTP %s %s", r.status_code, r.text[:300])
-            return None
-        data = r.json()
-        text = data["choices"][0]["message"]["content"].strip()
-        return text or None
-    except Exception:
-        logger.exception("Groq summary request failed")
-        return None
+    return await _groq_recap_text(api_key, prompt)
 
 
 async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5729,6 +6014,16 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
+    app.add_handler(CommandHandler("mylimits", cmd_mylimits))
+    # Gates run first (group -1) and stop the update when a limit is hit.
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE, dm_message_gate), group=-1
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & filters.COMMAND & filters.UpdateType.MESSAGE, group_command_gate),
+        group=-1,
+    )
+    app.add_handler(CallbackQueryHandler(dm_callback_gate), group=-1)
     app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("mydata", cmd_mydata))
     app.add_handler(CommandHandler("rnr", cmd_rnr))

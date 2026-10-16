@@ -590,6 +590,8 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
+    "sethost": ("topics", "/sethost <topic number> <host>", "Fix or set the host of a discussed topic.", "Group admin"),
+    "mylimits": ("everyone", "/mylimits  (in a private chat with the bot)", "See how many commands and audio downloads you have left today.", "Anyone"),
     "privacy": ("everyone", "/privacy", "What the bot stores about you, who can see it, and how to get or delete your data.", "Anyone"),
     "mydata": ("everyone", "/mydata  (in a private chat with the bot)", "Get a file with everything the bot has stored about you: stats, voice-chat sessions, recordings, warnings, topics.", "Anyone"),
     "rnr": ("rnr", "/rnr  (reply to your own voice note or audio)", "Record a Read & Record. Your audio (30s to 4 min) is saved with the date it was sent. Each audio counts once, max 3 recordings per 24 hours, forwarded audio doesn't count.", "Anyone"),
@@ -2897,12 +2899,29 @@ async def on_rnr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not doc or (doc["user_id"] != query.from_user.id and not _is_admin_user(query.from_user.id)):
                 await query.answer("That recording wasn't found.", show_alert=True)
                 return
+            is_admin = _is_admin_user(query.from_user.id)
+            if not is_admin:
+                used, opens_at = await asyncio.to_thread(
+                    dbmod.dm_quota_status, query.from_user.id, "audios", datetime.now(timezone.utc)
+                )
+                if used >= _DM_AUDIO_LIMIT:
+                    wait = int((opens_at - datetime.now(timezone.utc)).total_seconds()) if opens_at else 0
+                    await query.answer(
+                        f"Your limit is over ({_DM_AUDIO_LIMIT} audios per day). Come back after 24 hours "
+                        f"to get other audios. Next one unlocks in {_format_duration(max(60, wait))}.",
+                        show_alert=True,
+                    )
+                    return
             await context.bot.copy_message(
                 chat_id=query.from_user.id,
                 from_chat_id=doc["storage_chat_id"],
                 message_id=doc["storage_msg_id"],
                 caption=f"RNR #{serial} · {dbmod.rnr_date_label(doc.get('audio_at'))}",
             )
+            if not is_admin:
+                await asyncio.to_thread(
+                    dbmod.dm_quota_consume, query.from_user.id, "audios", datetime.now(timezone.utc)
+                )
             await query.answer("Sending your audio...")
             return
     except Exception:
@@ -3181,6 +3200,405 @@ async def cmd_mydata(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_document(
         document=InputFile(io.BytesIO(blob), filename=filename),
         caption=f"Everything I have stored about you: {summary}.\nSee /privacy for how it is used."[:1000],
+    )
+
+
+# =============================================================================
+# Private-chat limits and overload protection
+#
+#  * Each member gets DM_COMMAND_LIMIT commands (default 10) and DM_AUDIO_LIMIT audio
+#    downloads (default 5) per rolling 24 hours. Stored in MongoDB, so restarts don't reset it.
+#    /start, /help and /mylimits are free; menu buttons are not commands. Bot admins are exempt.
+#  * Burst guard: too many messages or button taps in a few seconds are ignored for a while.
+#  * Relay cap: non-command DMs are forwarded to the admin group, so they are capped per hour.
+#  * Global breaker: if far too many DMs arrive per minute, the excess is dropped.
+#  * Command-spam guard in groups (admins exempt).
+# Every gate fails OPEN: if a check itself breaks, the message goes through.
+# =============================================================================
+
+from collections import deque
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+_DM_COMMAND_LIMIT = _env_int("DM_COMMAND_LIMIT", 10)
+_DM_AUDIO_LIMIT = _env_int("DM_AUDIO_LIMIT", 5)
+_DM_FREE_COMMANDS = {"start", "help", "mylimits"}
+_DM_BURST_MESSAGES, _DM_BURST_WINDOW, _DM_BURST_PENALTY = 6, 10, 60      # msgs / seconds / block seconds
+_DM_TAP_LIMIT, _DM_TAP_WINDOW, _DM_TAP_PENALTY = 8, 10, 20               # button taps
+_DM_RELAY_PER_HOUR = 30
+_DM_GLOBAL_PER_MINUTE = _env_int("DM_GLOBAL_PER_MINUTE", 300)
+_GRP_CMD_LIMIT, _GRP_CMD_WINDOW, _GRP_CMD_PENALTY = 8, 20, 60
+
+_dm_burst: dict[int, dict] = {}
+_dm_taps: dict[int, dict] = {}
+_dm_relay: dict[int, dict] = {}
+_dm_global: deque = deque()
+_dm_global_warned = float("-inf")
+_grp_cmd_state: dict[tuple[int, int], dict] = {}
+_dm_quota_lock = asyncio.Lock()
+
+
+def _prune_state(state: dict, now: float, idle_seconds: float) -> None:
+    """Keep these in-memory tables from growing forever."""
+    if len(state) > 2000:
+        for key in [k for k, v in state.items() if now - v.get("last", 0.0) > idle_seconds]:
+            state.pop(key, None)
+
+
+def _burst_blocked(state: dict, key, now: float, limit: int, window: int, penalty: int) -> tuple[bool, bool]:
+    """Sliding-window burst check. Returns (blocked, just_started_blocking)."""
+    st = state.setdefault(key, {"t": deque(), "until": 0.0, "last": now})
+    st["last"] = now
+    if now < st["until"]:
+        return True, False
+    times = st["t"]
+    while times and now - times[0] > window:
+        times.popleft()
+    times.append(now)
+    if len(times) > limit:
+        st["until"] = now + penalty
+        times.clear()
+        return True, True
+    return False, False
+
+
+def _global_overloaded(now: float) -> bool:
+    global _dm_global_warned
+    while _dm_global and now - _dm_global[0] > 60:
+        _dm_global.popleft()
+    _dm_global.append(now)
+    if len(_dm_global) > _DM_GLOBAL_PER_MINUTE:
+        if now - _dm_global_warned > 60:
+            _dm_global_warned = now
+            logger.warning("DM overload: more than %s private updates/minute, dropping the excess", _DM_GLOBAL_PER_MINUTE)
+        return True
+    return False
+
+
+async def _dm_check_message(msg, user) -> tuple[bool, str | None]:
+    """(blocked, notice_to_send). Silent block = (True, None)."""
+    now = time.monotonic()
+    if _global_overloaded(now):
+        return True, None
+
+    blocked, started = _burst_blocked(_dm_burst, user.id, now, _DM_BURST_MESSAGES, _DM_BURST_WINDOW, _DM_BURST_PENALTY)
+    if blocked:
+        return True, ("You're sending messages too fast. I'll listen again in a minute." if started else None)
+    _prune_state(_dm_burst, now, 3600)
+
+    text = msg.text or ""
+    if not text.startswith("/"):
+        st = _dm_relay.setdefault(user.id, {"t": deque(), "told": float("-inf"), "last": now})
+        st["last"] = now
+        while st["t"] and now - st["t"][0] > 3600:
+            st["t"].popleft()
+        if len(st["t"]) >= _DM_RELAY_PER_HOUR:
+            told = now - st["told"] < 3600
+            st["told"] = now if not told else st["told"]
+            return True, (None if told else "You've sent a lot of messages this hour. Please try again later.")
+        st["t"].append(now)
+        _prune_state(_dm_relay, now, 7200)
+        return False, None
+
+    parts = text.split()
+    name = parts[0][1:].split("@")[0].lower()
+    if name in _DM_FREE_COMMANDS and not (name == "start" and len(parts) > 1):  # "/start privacy" does real work
+        return False, None
+
+    async with _dm_quota_lock:
+        when = datetime.now(timezone.utc)
+        used, opens_at = await asyncio.to_thread(dbmod.dm_quota_status, user.id, "commands", when)
+        if used >= _DM_COMMAND_LIMIT:
+            wait = max(60, int((opens_at - when).total_seconds())) if opens_at else 60
+            return True, (
+                f"Your limit is over: {_DM_COMMAND_LIMIT} commands per 24 hours. "
+                f"Come back in about {_format_duration(wait)}."
+            )
+        await asyncio.to_thread(dbmod.dm_quota_consume, user.id, "commands", when)
+    return False, None
+
+
+async def dm_message_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every other handler (group -1) for private messages."""
+    from telegram.ext import ApplicationHandlerStop
+
+    msg, user = update.message, update.effective_user
+    if not msg or not user or user.is_bot or _is_admin_user(user.id):
+        return
+    try:
+        blocked, notice = await _dm_check_message(msg, user)
+    except Exception:
+        logger.exception("DM gate failed; letting the message through")
+        return
+    if blocked:
+        if notice:
+            try:
+                await msg.reply_text(notice)
+            except Exception:
+                pass
+        raise ApplicationHandlerStop
+
+
+async def dm_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Button taps: ignore rapid-fire tapping (and shed load if the whole bot is swamped)."""
+    from telegram.ext import ApplicationHandlerStop
+
+    query = update.callback_query
+    user = query.from_user if query else None
+    if not user or user.is_bot or _is_admin_user(user.id):
+        return
+    try:
+        now = time.monotonic()
+        overloaded = _global_overloaded(now)
+        blocked, started = _burst_blocked(_dm_taps, user.id, now, _DM_TAP_LIMIT, _DM_TAP_WINDOW, _DM_TAP_PENALTY)
+        _prune_state(_dm_taps, now, 3600)
+    except Exception:
+        logger.exception("Callback gate failed; letting the tap through")
+        return
+    if overloaded or blocked:
+        try:
+            await query.answer("Slow down a little, then try again." if started else None)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+
+
+async def group_command_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group command spam guard: more than 8 commands in 20s from one member are ignored
+    for a minute. Admins are never throttled."""
+    from telegram.ext import ApplicationHandlerStop
+
+    msg, user, chat = update.message, update.effective_user, update.effective_chat
+    if not msg or not user or user.is_bot or not chat:
+        return
+    try:
+        now = time.monotonic()
+        blocked, started = _burst_blocked(
+            _grp_cmd_state, (chat.id, user.id), now, _GRP_CMD_LIMIT, _GRP_CMD_WINDOW, _GRP_CMD_PENALTY
+        )
+        _prune_state(_grp_cmd_state, now, 3600)
+        if not blocked:
+            return
+        if await _is_group_admin(update, context):
+            _grp_cmd_state[(chat.id, user.id)]["until"] = 0.0
+            return
+    except Exception:
+        logger.exception("Group command gate failed; letting the command through")
+        return
+    if started:
+        try:
+            await _reply_autodelete(update, context, "Too many commands too quickly. Please wait a minute.")
+        except Exception:
+            pass
+    raise ApplicationHandlerStop
+
+
+async def cmd_mylimits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Private chat: how many commands and audio downloads you have left (rolling 24h)."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        await _reply_autodelete(update, context, "Send /mylimits to me in a private chat.")
+        return
+    user = update.effective_user
+    if _is_admin_user(user.id):
+        await update.message.reply_text("Bot admins have no limits.")
+        return
+    now = datetime.now(timezone.utc)
+    lines = ["Your limits (rolling 24 hours)", ""]
+    for kind, label, limit in (("commands", "Commands", _DM_COMMAND_LIMIT), ("audios", "Audios", _DM_AUDIO_LIMIT)):
+        used, opens_at = await asyncio.to_thread(dbmod.dm_quota_status, user.id, kind, now)
+        line = f"{label}: {used} of {limit} used, {max(0, limit - used)} left"
+        if used >= limit and opens_at:
+            line += f" (next slot in {_format_duration(max(60, int((opens_at - now).total_seconds())))})"
+        lines.append(line)
+    lines += ["", "/start, /help and /mylimits are free."]
+    await update.message.reply_text("\n".join(lines))
+
+
+# =============================================================================
+# VC host/topic question: asked when a call ends, answered by a group admin
+#
+# Reply format:  (topic name)(host)     e.g.  (Atomic Habits)(Anna)   (also: Atomic Habits | Anna)
+# A bare number means an open topic:  (12)(Anna)  marks topic #12 as discussed.
+# The question stays open for 1 hour; after that the call is saved as
+# "Topic not recorded / Host: Don't know". Everything is stored in MongoDB (see db.py).
+# =============================================================================
+
+_VC_QUESTION_DELAY_SECONDS = 25  # let the call summary post first
+_VC_QUESTION_OPEN_HOURS = 1
+_VC_ANSWER_RE = re.compile(r"^\s*\(([^()]+)\)\s*\(([^()]+)\)\s*$", re.DOTALL)
+_vc_pending_ids: set[tuple[int, int]] = set()  # (chat_id, question message id): cheap filter for replies
+
+
+def _parse_vc_answer(text: str) -> tuple[str, str] | None:
+    """(topic, host) from '(topic)(host)' or 'topic | host'; None if it doesn't fit."""
+    m = _VC_ANSWER_RE.match(text or "")
+    if m:
+        topic, host = m.group(1).strip(), m.group(2).strip()
+    elif "|" in (text or "") and not text.lstrip().startswith("/"):
+        topic, host = [p.strip() for p in text.split("|", 1)]
+    else:
+        return None
+    if not topic or not host:
+        return None
+    return topic[:1000], host[:100]
+
+
+async def _schedule_vc_host_question(chat_id: int, ended_msg_id: int, ended_at: datetime, duration: int) -> None:
+    """Called when a call ends. Never raises; short calls are skipped."""
+    try:
+        if duration < dbmod.present_threshold_sec():
+            return
+        post_at = datetime.now(timezone.utc) + timedelta(seconds=_VC_QUESTION_DELAY_SECONDS)
+        await asyncio.to_thread(dbmod.vc_question_schedule, chat_id, ended_msg_id, ended_at, duration, post_at)
+    except Exception:
+        logger.exception("Could not schedule the VC host question chat_id=%s", chat_id)
+
+
+def _vc_question_text(duration: int) -> str:
+    return (
+        f"🎙️ <b>Voice chat ended</b> ({_format_duration(int(duration))}).\n"
+        "What was the topic name and who was the host?\n\n"
+        "Reply to this message with:\n"
+        "<code>(topic name)(host)</code>\n"
+        "Example: <code>(Atomic Habits)(Anna)</code>\n\n"
+        "<i>Group admins only. This question closes in 1 hour.</i>"
+    )
+
+
+async def vc_question_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every 30s: post questions that are due, close the ones open for over an hour (saving
+    'Topic not recorded / Don't know'), and refresh the set of open question messages."""
+    try:
+        docs = await asyncio.to_thread(dbmod.vc_questions_open)
+    except Exception:
+        logger.exception("VC question worker could not read the queue")
+        return
+    now = datetime.now(timezone.utc)
+    open_ids: set[tuple[int, int]] = set()
+    for d in docs:
+        try:
+            chat_id = int(d["chat_id"])
+            if d["status"] == "scheduled":
+                post_at = dbmod._aware(d.get("post_at")) or now
+                if post_at > now:
+                    continue
+                if await asyncio.to_thread(dbmod.vc_question_claim, d["_id"], "scheduled", "posting") is None:
+                    continue
+                try:
+                    sent = await context.bot.send_message(
+                        chat_id, _vc_question_text(d.get("duration", 0)), parse_mode="HTML"
+                    )
+                except Exception:
+                    logger.exception("Could not post the VC host question chat_id=%s", chat_id)
+                    await asyncio.to_thread(dbmod.vc_question_claim, d["_id"], "posting", "failed")
+                    continue
+                expires = now + timedelta(hours=_VC_QUESTION_OPEN_HOURS)
+                await asyncio.to_thread(dbmod.vc_question_set_posted, d["_id"], sent.message_id, expires)
+                open_ids.add((chat_id, sent.message_id))
+            elif d["status"] == "pending":
+                expires = dbmod._aware(d.get("expires_at")) or now
+                if expires > now:
+                    open_ids.add((chat_id, int(d["message_id"])))
+                    continue
+                if await asyncio.to_thread(dbmod.vc_question_claim, d["_id"], "pending", "expired") is None:
+                    continue
+                ended_at = dbmod._aware(d.get("ended_at")) or now
+                serial = await asyncio.to_thread(dbmod.vc_save_unrecorded, chat_id, ended_at)
+                try:
+                    await context.bot.edit_message_text(
+                        f"Question closed: nobody answered within 1 hour, so this call was saved as "
+                        f"topic #{serial} (topic not recorded, host unknown).",
+                        chat_id=chat_id, message_id=int(d["message_id"]),
+                    )
+                except Exception:
+                    logger.debug("Could not edit the closed VC question chat_id=%s", chat_id)
+        except Exception:
+            logger.exception("VC question worker failed on %s", d.get("_id"))
+    _vc_pending_ids.clear()
+    _vc_pending_ids.update(open_ids)
+
+
+async def on_vc_question_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A group admin replies to the question with (topic)(host). Runs in its own handler
+    group, so it never competes with other reply handlers."""
+    msg, chat = update.message, update.effective_chat
+    if not msg or not chat or not msg.reply_to_message or not msg.text:
+        return
+    qid = msg.reply_to_message.message_id
+    if (chat.id, qid) not in _vc_pending_ids:
+        return
+    if not await _message_sender_is_admin(update, context):
+        return  # only group admins can answer; everyone else is ignored quietly
+
+    parsed = _parse_vc_answer(msg.text)
+    if parsed is None:
+        await _reply_autodelete(
+            update, context,
+            "Please reply in this format: (topic name)(host)\nExample: (Atomic Habits)(Anna)",
+        )
+        return
+    topic_text, host = parsed
+    kind, serial, resolved_text = await asyncio.to_thread(dbmod.vc_resolve_topic, chat.id, topic_text)
+    if kind == "badnumber":
+        await _reply_autodelete(
+            update, context, f"Topic #{serial} isn't an open topic. Use its name instead, e.g. (Atomic Habits)(Anna)."
+        )
+        return
+
+    doc = await asyncio.to_thread(dbmod.vc_question_claim_answer, chat.id, qid)
+    if doc is None:
+        return  # someone else answered first
+    _vc_pending_ids.discard((chat.id, qid))
+
+    by = update.effective_user
+    by_name = _user_label(by) if by else "Admin"
+    ended_at = dbmod._aware(doc.get("ended_at")) or datetime.now(timezone.utc)
+    result = await asyncio.to_thread(
+        dbmod.vc_save_discussion, chat.id, serial if kind == "existing" else None,
+        resolved_text, host, ended_at, by.id if by else 0, by_name,
+    )
+    how = "marked as done" if not result["created"] else "added as a new topic"
+    await msg.reply_text(
+        f"✅ Saved: <b>{html.escape(resolved_text, quote=False)}</b> · {dbmod.topic_date_label(ended_at)} · "
+        f"Host: <b>{html.escape(host, quote=False)}</b>\n<i>Topic #{result['serial']} {how}.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_sethost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin: /sethost <topic number> <host>  - fix the host of a discussed topic."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can set a host.")
+        return
+    args = context.args or []
+    try:
+        serial = int(args[0].lstrip("#"))
+        host = " ".join(args[1:]).strip()[:100]
+        if not host:
+            raise ValueError
+    except (ValueError, IndexError):
+        await _reply_autodelete(update, context, "Usage: /sethost <topic number> <host>   e.g. /sethost 12 Anna")
+        return
+    ok = await asyncio.to_thread(dbmod.topic_set_host, chat.id, serial, host)
+    if not ok:
+        await _reply_autodelete(update, context, f"Topic #{serial} isn't a discussed (done) topic.")
+        return
+    await _reply_autodelete(
+        update, context, f"Host of topic #{serial} set to {html.escape(host, quote=False)}.", parse_mode="HTML"
     )
 
 
@@ -3497,8 +3915,8 @@ async def cmd_addtopic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: shows only Active topics, ranked by votes (see /upvote) so the group's
-    actual priority order is visible, not just insertion order."""
+    """Anyone: open topics ranked by votes (with who added them and when), then the most
+    recently discussed topics with their date and host."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -3506,18 +3924,31 @@ async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
     rows = await asyncio.to_thread(dbmod.get_active_topics, chat.id)
-    if not rows:
+    recent = await asyncio.to_thread(dbmod.get_recent_discussed, chat.id, 5)
+    if not rows and not recent:
         await _reply_autodelete(update, context, "No active topics yet.\n\nAdd one with /addtopic <topic>")
         return
-    shown = rows[:_MAX_TOPIC_ROWS]
     lines = ["📋 <b>Active Topics</b>", ""]
-    for r in shown:
+    if not rows:
+        lines.append("<i>No open topics right now.</i>")
+    for r in rows[:_MAX_TOPIC_ROWS]:
         safe = html.escape(r.text, quote=False)
         vote_badge = f" — 👍 {r.votes}" if r.votes else ""
         lines.append(f"{r.serial}. {safe}{vote_badge}")
+        if r.added_by_name:
+            lines.append(
+                f"    <i>added by {html.escape(r.added_by_name, quote=False)} · {dbmod.topic_date_label(r.added_at)}</i>"
+            )
     if len(rows) > _MAX_TOPIC_ROWS:
         lines.append("")
         lines.append(f"<i>+ {len(rows) - _MAX_TOPIC_ROWS} more not shown.</i>")
+    if recent:
+        lines += ["", "✅ <b>Recently discussed</b>"]
+        for r in recent:
+            lines.append(
+                f"{r.serial}. {html.escape(r.text, quote=False)} · {dbmod.topic_date_label(r.discussed_at)}"
+                f" · Host: {html.escape(r.host or '-', quote=False)}"
+            )
     lines.append("")
     lines.append("<i>Use the number shown with /topicdone, /deletetopic, or /upvote.</i>")
     await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
@@ -3656,8 +4087,8 @@ async def cmd_topicdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_alltopics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: every topic ever added, sorted by serial. Active = plain, Done = + ✅,
-    Deleted = struck through."""
+    """Anyone: every topic ever added, sorted by number. Open = plain, discussed = ✅ with the
+    date it was discussed and its host, deleted = struck through. Each shows who added it."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -3673,11 +4104,18 @@ async def cmd_alltopics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for r in shown:
         safe = html.escape(r.text, quote=False)
         if r.state == "done":
-            lines.append(f"{r.serial}. {safe} ✅")
+            lines.append(
+                f"{r.serial}. {safe} ✅ · {dbmod.topic_date_label(r.discussed_at)}"
+                f" · Host: {html.escape(r.host or '-', quote=False)}"
+            )
         elif r.state == "deleted":
             lines.append(f"<s>{r.serial}. {safe}</s>")
         else:
             lines.append(f"{r.serial}. {safe}")
+        if r.added_by_name:
+            lines.append(
+                f"    <i>added by {html.escape(r.added_by_name, quote=False)} · {dbmod.topic_date_label(r.added_at)}</i>"
+            )
     if len(rows) > _MAX_TOPIC_ROWS:
         lines.append("")
         lines.append(f"<i>+ {len(rows) - _MAX_TOPIC_ROWS} more not shown.</i>")
@@ -5116,6 +5554,8 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = chat.id
     now = msg.date
+    if msg.video_chat_ended:
+        await _schedule_vc_host_question(chat_id, msg.message_id, now, msg.video_chat_ended.duration)
     configured = app_state.configured_assistant_groups()
     assistant_group = chat_id in configured
     use_assistant = app_state.assistant_running and chat_id in app_state.assistant_chat_ids
@@ -5658,6 +6098,7 @@ async def post_init(application: Application) -> None:
         time=dt_time(hour=0, minute=5, tzinfo=timezone.utc),
         name="daily_streak_reset_job",
     )
+    jq.run_repeating(vc_question_worker, interval=30, first=45, name="vc_question_worker")
     jq.run_daily(
         daily_backup_job,
         time=dt_time(hour=_backup_hour_utc(), minute=30, tzinfo=timezone.utc),
@@ -5777,6 +6218,25 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
+    app.add_handler(CommandHandler("sethost", cmd_sethost))
+    # Answers to the "who was the host?" question; own handler group so it never shadows other reply handlers.
+    app.add_handler(
+        MessageHandler(
+            filters.REPLY & filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE,
+            on_vc_question_reply,
+        ),
+        group=8,
+    )
+    app.add_handler(CommandHandler("mylimits", cmd_mylimits))
+    # Gates run first (group -1) and stop the update when a limit is hit.
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE, dm_message_gate), group=-1
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & filters.COMMAND & filters.UpdateType.MESSAGE, group_command_gate),
+        group=-1,
+    )
+    app.add_handler(CallbackQueryHandler(dm_callback_gate), group=-1)
     app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("mydata", cmd_mydata))
     app.add_handler(CommandHandler("rnr", cmd_rnr))

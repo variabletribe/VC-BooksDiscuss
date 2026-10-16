@@ -125,6 +125,10 @@ class TopicRow(NamedTuple):
     text: str
     state: str
     votes: int = 0
+    added_by_name: str = ""
+    added_at: datetime | None = None
+    discussed_at: datetime | None = None
+    host: str = ""
 
 
 # XP: 1 XP per minute in VC. Level thresholds are cumulative XP required.
@@ -1772,15 +1776,13 @@ def get_topic(chat_id: int, serial: int) -> dict | None:
 
 
 def get_active_topics(chat_id: int) -> list[TopicRow]:
-    """Sorted by votes (highest first), then serial ascending as a tiebreak — so the
+    """Sorted by votes (highest first), then serial ascending as a tiebreak, so the
     topic the group most wants to discuss next surfaces at the top of /topics."""
     coll = _coll("topics")
     cursor = coll.find({"chat_id": chat_id, "state": "active"}).sort(
         [("votes", DESCENDING), ("serial", ASCENDING)]
     )
-    return [
-        TopicRow(int(d["serial"]), str(d["text"]), str(d["state"]), int(d.get("votes", 0))) for d in cursor
-    ]
+    return [_topic_row(d) for d in cursor]
 
 
 def get_deleted_topics(chat_id: int) -> list[TopicRow]:
@@ -1795,9 +1797,7 @@ def get_all_topics(chat_id: int) -> list[TopicRow]:
     """Sorted by serial (chronological record), unlike get_active_topics which sorts by votes."""
     coll = _coll("topics")
     cursor = coll.find({"chat_id": chat_id}).sort("serial", ASCENDING)
-    return [
-        TopicRow(int(d["serial"]), str(d["text"]), str(d["state"]), int(d.get("votes", 0))) for d in cursor
-    ]
+    return [_topic_row(d) for d in cursor]
 
 
 def mark_topic_done(chat_id: int, serial: int, by_id: int, by_name: str) -> bool:
@@ -2876,3 +2876,240 @@ def export_user_data_json(user_id: int) -> tuple[bytes, dict[str, int]]:
     counts = {k: len(v) for k, v in data.items() if isinstance(v, list)}
     raw = json.dumps(data, indent=2, ensure_ascii=False, default=_export_json_default)
     return raw.encode("utf-8"), counts
+
+
+# =============================================================================
+# Private-chat usage limits (command and audio quotas, /mylimits)
+# Stored per user in `dm_usage` as lists of timestamps, so a restart can't reset them.
+# =============================================================================
+
+_dm_usage_ready = False
+
+
+def _dm_usage():
+    global _dm_usage_ready
+    coll = _coll("dm_usage")
+    if not _dm_usage_ready:
+        coll.create_index("updated_at", expireAfterSeconds=3 * 24 * 3600)  # tidy up idle users
+        _dm_usage_ready = True
+    return coll
+
+
+def _dm_window_times(doc: dict, kind: str, now: datetime, hours: int) -> list[datetime]:
+    cutoff = now - timedelta(hours=hours)
+    out = []
+    for t in doc.get(kind, []):
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        if t > cutoff:
+            out.append(t)
+    return sorted(out)
+
+
+def dm_quota_status(user_id: int, kind: str, now: datetime, hours: int = 24) -> tuple[int, datetime | None]:
+    """(uses in the last `hours`, when the oldest of them drops out and a slot opens)."""
+    doc = _dm_usage().find_one({"_id": user_id}) or {}
+    times = _dm_window_times(doc, kind, now, hours)
+    return len(times), (times[0] + timedelta(hours=hours) if times else None)
+
+
+def dm_quota_consume(user_id: int, kind: str, now: datetime, hours: int = 24) -> None:
+    """Record one use (and drop uses older than the window)."""
+    coll = _dm_usage()
+    doc = coll.find_one({"_id": user_id}) or {}
+    times = _dm_window_times(doc, kind, now, hours)
+    times.append(now.replace(microsecond=(now.microsecond // 1000) * 1000))  # Mongo keeps milliseconds
+    coll.update_one({"_id": user_id}, {"$set": {kind: times, "updated_at": now}}, upsert=True)
+
+
+# =============================================================================
+# Topic discussions: host + date, asked right after a voice chat ends
+#
+# When a call of 20+ minutes ends, a question is stored ("scheduled"), posted ~25s later
+# ("pending", open for 1 hour) and either answered by a group admin ("answered") or closed
+# ("expired") and saved as "Topic not recorded / Host: Don't know". All state is in MongoDB,
+# so a restart never loses a question. Discussed topics become done topics with
+# discussed_at (the day the call ended) and host.
+# =============================================================================
+
+_vcq_ready = False
+
+
+def _vcq():
+    global _vcq_ready
+    coll = _coll("vc_questions")
+    if not _vcq_ready:
+        coll.create_index([("status", ASCENDING)])
+        coll.create_index([("chat_id", ASCENDING), ("message_id", ASCENDING)])
+        coll.create_index("created_at", expireAfterSeconds=30 * 24 * 3600)
+        _vcq_ready = True
+    return coll
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def topic_date_label(dt: datetime | None) -> str:
+    """'14 Oct 2026' in the group's timezone (RNR_TZ_OFFSET_MINUTES, default 330 = IST)."""
+    if dt is None:
+        return "-"
+    try:
+        offset = timedelta(minutes=int(os.getenv("RNR_TZ_OFFSET_MINUTES", "330")))
+    except ValueError:
+        offset = timedelta(minutes=330)
+    return (_aware(dt) + offset).strftime("%d %b %Y")
+
+
+def _topic_row(d: dict) -> TopicRow:
+    return TopicRow(
+        int(d["serial"]),
+        str(d["text"]),
+        str(d["state"]),
+        int(d.get("votes", 0)),
+        str(d.get("added_by_name") or ""),
+        d.get("added_at"),
+        d.get("discussed_at"),
+        str(d.get("host") or ""),
+    )
+
+
+def get_recent_discussed(chat_id: int, limit: int = 5) -> list[TopicRow]:
+    cursor = (
+        _coll("topics")
+        .find({"chat_id": chat_id, "state": "done", "discussed_at": {"$exists": True}})
+        .sort("discussed_at", DESCENDING)
+        .limit(limit)
+    )
+    return [_topic_row(d) for d in cursor]
+
+
+def vc_question_schedule(
+    chat_id: int, ended_msg_id: int, ended_at: datetime, duration: int, post_at: datetime
+) -> bool:
+    """Queue a question for one ended call. False if this call is already queued."""
+    try:
+        _vcq().insert_one(
+            {
+                "_id": f"{chat_id}:{ended_msg_id}",
+                "chat_id": chat_id,
+                "ended_at": _aware(ended_at),
+                "duration": int(duration),
+                "status": "scheduled",
+                "post_at": _aware(post_at),
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+def vc_questions_open() -> list[dict]:
+    return list(_vcq().find({"status": {"$in": ["scheduled", "pending"]}}))
+
+
+def vc_question_claim(doc_id: str, from_status: str, to_status: str) -> dict | None:
+    """Atomically move a question between states; None if someone else got there first."""
+    return _vcq().find_one_and_update(
+        {"_id": doc_id, "status": from_status}, {"$set": {"status": to_status}}
+    )
+
+
+def vc_question_set_posted(doc_id: str, message_id: int, expires_at: datetime) -> None:
+    _vcq().update_one(
+        {"_id": doc_id},
+        {"$set": {"status": "pending", "message_id": message_id, "expires_at": _aware(expires_at)}},
+    )
+
+
+def vc_question_claim_answer(chat_id: int, message_id: int) -> dict | None:
+    """First valid answer wins: pending -> answered, atomically."""
+    return _vcq().find_one_and_update(
+        {"chat_id": chat_id, "message_id": message_id, "status": "pending"},
+        {"$set": {"status": "answered", "answered_at": datetime.now(timezone.utc)}},
+    )
+
+
+def vc_resolve_topic(chat_id: int, text: str) -> tuple[str, int | None, str]:
+    """('existing', serial, text) | ('new', None, text) | ('badnumber', serial, text).
+    A bare number means "open topic #n"; otherwise an exact (case-insensitive) match against
+    open topics; otherwise it is a new topic."""
+    text = text.strip()
+    if text.isdigit():
+        topic = get_topic(chat_id, int(text))
+        if topic and topic.get("state") == "active":
+            return "existing", int(text), str(topic["text"])
+        return "badnumber", int(text), text
+    dup = find_active_topic_by_text(chat_id, text)
+    if dup is not None:
+        return "existing", dup.serial, dup.text
+    return "new", None, text
+
+
+def _create_done_topic(chat_id, text, host, discussed_at, by_id, by_name, source) -> int:
+    now = datetime.now(timezone.utc)
+    serial = _next_topic_serial(chat_id)
+    _coll("topics").insert_one(
+        {
+            "_id": f"{chat_id}:{serial}",
+            "chat_id": chat_id,
+            "serial": serial,
+            "text": text[:1000],
+            "state": "done",
+            "added_by_id": by_id,
+            "added_by_name": by_name[:512],
+            "added_at": now,
+            "votes": 0,
+            "voter_ids": [],
+            "done_by_id": by_id,
+            "done_by_name": by_name[:512],
+            "done_at": now,
+            "discussed_at": _aware(discussed_at),
+            "host": host[:100],
+            "source": source,
+        }
+    )
+    return serial
+
+
+def vc_save_discussion(
+    chat_id: int, serial: int | None, text: str, host: str,
+    discussed_at: datetime, by_id: int, by_name: str,
+) -> dict:
+    """Record what was discussed. An open topic is marked done (with date and host);
+    anything else becomes a new topic that is already done."""
+    if serial is not None:
+        result = _coll("topics").update_one(
+            {"_id": f"{chat_id}:{serial}", "state": "active"},
+            {
+                "$set": {
+                    "state": "done",
+                    "done_by_id": by_id,
+                    "done_by_name": by_name[:512],
+                    "done_at": datetime.now(timezone.utc),
+                    "discussed_at": _aware(discussed_at),
+                    "host": host[:100],
+                    "source": "vc",
+                }
+            },
+        )
+        if result.modified_count:
+            return {"serial": serial, "created": False, "text": text}
+    new_serial = _create_done_topic(chat_id, text, host, discussed_at, by_id, by_name, "vc")
+    return {"serial": new_serial, "created": True, "text": text}
+
+
+def vc_save_unrecorded(chat_id: int, discussed_at: datetime) -> int:
+    """Nobody answered in time: keep a record that the call happened."""
+    return _create_done_topic(chat_id, "Topic not recorded", "Don't know", discussed_at, 0, "Bot", "vc_unrecorded")
+
+
+def topic_set_host(chat_id: int, serial: int, host: str) -> bool:
+    """Fix the host of a topic that is already done."""
+    result = _coll("topics").update_one(
+        {"_id": f"{chat_id}:{serial}", "state": "done"}, {"$set": {"host": host[:100]}}
+    )
+    return result.matched_count > 0
