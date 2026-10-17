@@ -590,6 +590,7 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
+    "sethost": ("topics", "/sethost <topic number> <host>", "Fix or set the host of a discussed topic.", "Group admin"),
     "mylimits": ("everyone", "/mylimits  (in a private chat with the bot)", "See how many commands and audio downloads you have left today.", "Anyone"),
     "privacy": ("everyone", "/privacy", "What the bot stores about you, who can see it, and how to get or delete your data.", "Anyone"),
     "mydata": ("everyone", "/mydata  (in a private chat with the bot)", "Get a file with everything the bot has stored about you: stats, voice-chat sessions, recordings, warnings, topics.", "Anyone"),
@@ -3421,6 +3422,186 @@ async def cmd_mylimits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines))
 
 
+# =============================================================================
+# VC host/topic question: asked when a call ends, answered by a group admin
+#
+# Reply format:  (topic name)(host)     e.g.  (Atomic Habits)(Anna)   (also: Atomic Habits | Anna)
+# A bare number means an open topic:  (12)(Anna)  marks topic #12 as discussed.
+# The question stays open for 1 hour; after that the call is saved as
+# "Topic not recorded / Host: Don't know". Everything is stored in MongoDB (see db.py).
+# =============================================================================
+
+_VC_QUESTION_DELAY_SECONDS = 25  # let the call summary post first
+_VC_QUESTION_OPEN_HOURS = 1
+_VC_ANSWER_RE = re.compile(r"^\s*\(([^()]+)\)\s*\(([^()]+)\)\s*$", re.DOTALL)
+_vc_pending_ids: set[tuple[int, int]] = set()  # (chat_id, question message id): cheap filter for replies
+
+
+def _parse_vc_answer(text: str) -> tuple[str, str] | None:
+    """(topic, host) from '(topic)(host)' or 'topic | host'; None if it doesn't fit."""
+    m = _VC_ANSWER_RE.match(text or "")
+    if m:
+        topic, host = m.group(1).strip(), m.group(2).strip()
+    elif "|" in (text or "") and not text.lstrip().startswith("/"):
+        topic, host = [p.strip() for p in text.split("|", 1)]
+    else:
+        return None
+    if not topic or not host:
+        return None
+    return topic[:1000], host[:100]
+
+
+async def _schedule_vc_host_question(chat_id: int, ended_msg_id: int, ended_at: datetime, duration: int) -> None:
+    """Called when a call ends. Never raises; short calls are skipped."""
+    try:
+        if duration < dbmod.present_threshold_sec():
+            return
+        post_at = datetime.now(timezone.utc) + timedelta(seconds=_VC_QUESTION_DELAY_SECONDS)
+        await asyncio.to_thread(dbmod.vc_question_schedule, chat_id, ended_msg_id, ended_at, duration, post_at)
+    except Exception:
+        logger.exception("Could not schedule the VC host question chat_id=%s", chat_id)
+
+
+def _vc_question_text(duration: int) -> str:
+    return (
+        f"🎙️ <b>Voice chat ended</b> ({_format_duration(int(duration))}).\n"
+        "What was the topic name and who was the host?\n\n"
+        "Reply to this message with:\n"
+        "<code>(topic name)(host)</code>\n"
+        "Example: <code>(Atomic Habits)(Anna)</code>\n\n"
+        "<i>Group admins only. This question closes in 1 hour.</i>"
+    )
+
+
+async def vc_question_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every 30s: post questions that are due, close the ones open for over an hour (saving
+    'Topic not recorded / Don't know'), and refresh the set of open question messages."""
+    try:
+        docs = await asyncio.to_thread(dbmod.vc_questions_open)
+    except Exception:
+        logger.exception("VC question worker could not read the queue")
+        return
+    now = datetime.now(timezone.utc)
+    open_ids: set[tuple[int, int]] = set()
+    for d in docs:
+        try:
+            chat_id = int(d["chat_id"])
+            if d["status"] == "scheduled":
+                post_at = dbmod._aware(d.get("post_at")) or now
+                if post_at > now:
+                    continue
+                if await asyncio.to_thread(dbmod.vc_question_claim, d["_id"], "scheduled", "posting") is None:
+                    continue
+                try:
+                    sent = await context.bot.send_message(
+                        chat_id, _vc_question_text(d.get("duration", 0)), parse_mode="HTML"
+                    )
+                except Exception:
+                    logger.exception("Could not post the VC host question chat_id=%s", chat_id)
+                    await asyncio.to_thread(dbmod.vc_question_claim, d["_id"], "posting", "failed")
+                    continue
+                expires = now + timedelta(hours=_VC_QUESTION_OPEN_HOURS)
+                await asyncio.to_thread(dbmod.vc_question_set_posted, d["_id"], sent.message_id, expires)
+                open_ids.add((chat_id, sent.message_id))
+            elif d["status"] == "pending":
+                expires = dbmod._aware(d.get("expires_at")) or now
+                if expires > now:
+                    open_ids.add((chat_id, int(d["message_id"])))
+                    continue
+                if await asyncio.to_thread(dbmod.vc_question_claim, d["_id"], "pending", "expired") is None:
+                    continue
+                ended_at = dbmod._aware(d.get("ended_at")) or now
+                serial = await asyncio.to_thread(dbmod.vc_save_unrecorded, chat_id, ended_at)
+                try:
+                    await context.bot.edit_message_text(
+                        f"Question closed: nobody answered within 1 hour, so this call was saved as "
+                        f"topic #{serial} (topic not recorded, host unknown).",
+                        chat_id=chat_id, message_id=int(d["message_id"]),
+                    )
+                except Exception:
+                    logger.debug("Could not edit the closed VC question chat_id=%s", chat_id)
+        except Exception:
+            logger.exception("VC question worker failed on %s", d.get("_id"))
+    _vc_pending_ids.clear()
+    _vc_pending_ids.update(open_ids)
+
+
+async def on_vc_question_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A group admin replies to the question with (topic)(host). Runs in its own handler
+    group, so it never competes with other reply handlers."""
+    msg, chat = update.message, update.effective_chat
+    if not msg or not chat or not msg.reply_to_message or not msg.text:
+        return
+    qid = msg.reply_to_message.message_id
+    if (chat.id, qid) not in _vc_pending_ids:
+        return
+    if not await _message_sender_is_admin(update, context):
+        return  # only group admins can answer; everyone else is ignored quietly
+
+    parsed = _parse_vc_answer(msg.text)
+    if parsed is None:
+        await _reply_autodelete(
+            update, context,
+            "Please reply in this format: (topic name)(host)\nExample: (Atomic Habits)(Anna)",
+        )
+        return
+    topic_text, host = parsed
+    kind, serial, resolved_text = await asyncio.to_thread(dbmod.vc_resolve_topic, chat.id, topic_text)
+    if kind == "badnumber":
+        await _reply_autodelete(
+            update, context, f"Topic #{serial} isn't an open topic. Use its name instead, e.g. (Atomic Habits)(Anna)."
+        )
+        return
+
+    doc = await asyncio.to_thread(dbmod.vc_question_claim_answer, chat.id, qid)
+    if doc is None:
+        return  # someone else answered first
+    _vc_pending_ids.discard((chat.id, qid))
+
+    by = update.effective_user
+    by_name = _user_label(by) if by else "Admin"
+    ended_at = dbmod._aware(doc.get("ended_at")) or datetime.now(timezone.utc)
+    result = await asyncio.to_thread(
+        dbmod.vc_save_discussion, chat.id, serial if kind == "existing" else None,
+        resolved_text, host, ended_at, by.id if by else 0, by_name,
+    )
+    how = "marked as done" if not result["created"] else "added as a new topic"
+    await msg.reply_text(
+        f"✅ Saved: <b>{html.escape(resolved_text, quote=False)}</b> · {dbmod.topic_date_label(ended_at)} · "
+        f"Host: <b>{html.escape(host, quote=False)}</b>\n<i>Topic #{result['serial']} {how}.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_sethost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group admin: /sethost <topic number> <host>  - fix the host of a discussed topic."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    if not await _is_group_admin(update, context):
+        await _reply_autodelete(update, context, "Only group admins can set a host.")
+        return
+    args = context.args or []
+    try:
+        serial = int(args[0].lstrip("#"))
+        host = " ".join(args[1:]).strip()[:100]
+        if not host:
+            raise ValueError
+    except (ValueError, IndexError):
+        await _reply_autodelete(update, context, "Usage: /sethost <topic number> <host>   e.g. /sethost 12 Anna")
+        return
+    ok = await asyncio.to_thread(dbmod.topic_set_host, chat.id, serial, host)
+    if not ok:
+        await _reply_autodelete(update, context, f"Topic #{serial} isn't a discussed (done) topic.")
+        return
+    await _reply_autodelete(
+        update, context, f"Host of topic #{serial} set to {html.escape(host, quote=False)}.", parse_mode="HTML"
+    )
+
+
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Passive, silent: remembers username -> user_id for every message seen in a tracked
     group (any message type, not just text/commands), so /warn, /ban, /mute etc. can later
@@ -3734,8 +3915,8 @@ async def cmd_addtopic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: shows only Active topics, ranked by votes (see /upvote) so the group's
-    actual priority order is visible, not just insertion order."""
+    """Anyone: open topics ranked by votes (with who added them and when), then the most
+    recently discussed topics with their date and host."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -3743,18 +3924,31 @@ async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply_autodelete(update, context, "Use this command in a group.")
         return
     rows = await asyncio.to_thread(dbmod.get_active_topics, chat.id)
-    if not rows:
+    recent = await asyncio.to_thread(dbmod.get_recent_discussed, chat.id, 5)
+    if not rows and not recent:
         await _reply_autodelete(update, context, "No active topics yet.\n\nAdd one with /addtopic <topic>")
         return
-    shown = rows[:_MAX_TOPIC_ROWS]
     lines = ["📋 <b>Active Topics</b>", ""]
-    for r in shown:
+    if not rows:
+        lines.append("<i>No open topics right now.</i>")
+    for r in rows[:_MAX_TOPIC_ROWS]:
         safe = html.escape(r.text, quote=False)
         vote_badge = f" — 👍 {r.votes}" if r.votes else ""
         lines.append(f"{r.serial}. {safe}{vote_badge}")
+        if r.added_by_name:
+            lines.append(
+                f"    <i>added by {html.escape(r.added_by_name, quote=False)} · {dbmod.topic_date_label(r.added_at)}</i>"
+            )
     if len(rows) > _MAX_TOPIC_ROWS:
         lines.append("")
         lines.append(f"<i>+ {len(rows) - _MAX_TOPIC_ROWS} more not shown.</i>")
+    if recent:
+        lines += ["", "✅ <b>Recently discussed</b>"]
+        for r in recent:
+            lines.append(
+                f"{r.serial}. {html.escape(r.text, quote=False)} · {dbmod.topic_date_label(r.discussed_at)}"
+                f" · Host: {html.escape(r.host or '-', quote=False)}"
+            )
     lines.append("")
     lines.append("<i>Use the number shown with /topicdone, /deletetopic, or /upvote.</i>")
     await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
@@ -3893,8 +4087,8 @@ async def cmd_topicdone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_alltopics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: every topic ever added, sorted by serial. Active = plain, Done = + ✅,
-    Deleted = struck through."""
+    """Anyone: every topic ever added, sorted by number. Open = plain, discussed = ✅ with the
+    date it was discussed and its host, deleted = struck through. Each shows who added it."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -3910,11 +4104,18 @@ async def cmd_alltopics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for r in shown:
         safe = html.escape(r.text, quote=False)
         if r.state == "done":
-            lines.append(f"{r.serial}. {safe} ✅")
+            lines.append(
+                f"{r.serial}. {safe} ✅ · {dbmod.topic_date_label(r.discussed_at)}"
+                f" · Host: {html.escape(r.host or '-', quote=False)}"
+            )
         elif r.state == "deleted":
             lines.append(f"<s>{r.serial}. {safe}</s>")
         else:
             lines.append(f"{r.serial}. {safe}")
+        if r.added_by_name:
+            lines.append(
+                f"    <i>added by {html.escape(r.added_by_name, quote=False)} · {dbmod.topic_date_label(r.added_at)}</i>"
+            )
     if len(rows) > _MAX_TOPIC_ROWS:
         lines.append("")
         lines.append(f"<i>+ {len(rows) - _MAX_TOPIC_ROWS} more not shown.</i>")
@@ -5353,6 +5554,8 @@ async def on_video_chat_service(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat_id = chat.id
     now = msg.date
+    if msg.video_chat_ended:
+        await _schedule_vc_host_question(chat_id, msg.message_id, now, msg.video_chat_ended.duration)
     configured = app_state.configured_assistant_groups()
     assistant_group = chat_id in configured
     use_assistant = app_state.assistant_running and chat_id in app_state.assistant_chat_ids
@@ -5895,6 +6098,7 @@ async def post_init(application: Application) -> None:
         time=dt_time(hour=0, minute=5, tzinfo=timezone.utc),
         name="daily_streak_reset_job",
     )
+    jq.run_repeating(vc_question_worker, interval=30, first=45, name="vc_question_worker")
     jq.run_daily(
         daily_backup_job,
         time=dt_time(hour=_backup_hour_utc(), minute=30, tzinfo=timezone.utc),
@@ -6014,6 +6218,15 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
+    app.add_handler(CommandHandler("sethost", cmd_sethost))
+    # Answers to the "who was the host?" question; own handler group so it never shadows other reply handlers.
+    app.add_handler(
+        MessageHandler(
+            filters.REPLY & filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE,
+            on_vc_question_reply,
+        ),
+        group=8,
+    )
     app.add_handler(CommandHandler("mylimits", cmd_mylimits))
     # Gates run first (group -1) and stop the update when a limit is hit.
     app.add_handler(

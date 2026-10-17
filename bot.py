@@ -4134,11 +4134,91 @@ _TIMER_RE = re.compile(r"^(\d{1,2})m$", re.IGNORECASE)
 _active_timers: dict[int, dict] = {}  # chat_id -> {end_at, minutes, started_by, started_at}
 
 
+_TIMER_BAR_CELLS = 12
+
+
+def _timer_tick_seconds() -> int:
+    """How often the live countdown message is edited. Telegram allows only about 20 messages
+    per minute per group (edits count), so never go below 5s; default 10s = 6 edits/minute."""
+    try:
+        return max(5, int(os.getenv("TIMER_TICK_SECONDS", "10")))
+    except ValueError:
+        return 10
+
+
+def _timer_render(remaining: int, total: int, minutes: int, started_by: str, frame: int, state: str = "running") -> str:
+    """The live timer message: hourglass that flips every update, a progress bar and mm:ss."""
+    remaining = max(0, min(remaining, total))
+    elapsed = 1 - (remaining / total if total else 0)
+    filled = round(elapsed * _TIMER_BAR_CELLS)
+    bar = "▰" * filled + "▱" * (_TIMER_BAR_CELLS - filled)
+    mm, ss = divmod(remaining, 60)
+    if state == "done":
+        title = "⏰ <b>Time's up!</b>"
+        bar, pct = "▰" * _TIMER_BAR_CELLS, 100
+    elif state == "cancelled":
+        title = "⏹️ <b>Timer cancelled</b>"
+        pct = round(elapsed * 100)
+    else:
+        title = f"{'⏳' if frame % 2 == 0 else '⌛'} <b>{mm:02d}:{ss:02d}</b> left"
+        pct = round(elapsed * 100)
+    return f"{title}\n{bar} {pct}%\n<i>{minutes} min timer · started by {html.escape(started_by, quote=False)}</i>"
+
+
+async def _timer_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repeating job: edit the live timer message. Never raises; backs off if Telegram asks."""
+    from telegram.error import BadRequest, RetryAfter
+
+    chat_id = (context.job.data or {}).get("chat_id")
+    entry = _active_timers.get(chat_id)
+    if entry is None or entry.get("message_id") is None:
+        context.job.schedule_removal()
+        return
+    if time.monotonic() < entry.get("pause_until", 0.0):
+        return
+    total = entry["minutes"] * 60
+    remaining = int((entry["end_at"] - datetime.now(timezone.utc)).total_seconds())
+    if remaining <= 0:
+        return  # _timer_fire finishes it
+    entry["frame"] += 1
+    try:
+        await context.bot.edit_message_text(
+            _timer_render(remaining, total, entry["minutes"], entry["started_by"], entry["frame"]),
+            chat_id=chat_id, message_id=entry["message_id"], parse_mode="HTML",
+        )
+    except RetryAfter as exc:
+        wait = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
+        entry["pause_until"] = time.monotonic() + wait + 1
+        logger.warning("Timer: Telegram asked to slow down, pausing updates for %ss chat_id=%s", wait, chat_id)
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return
+        logger.info("Timer: live message can't be edited any more (%s); stopping updates chat_id=%s", exc, chat_id)
+        entry["message_id"] = None
+        context.job.schedule_removal()
+    except Exception:
+        logger.debug("Timer tick failed chat_id=%s", chat_id)
+
+
+async def _timer_finish_live_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, entry: dict, state: str) -> None:
+    """Turn the live message into its final 'Time's up' / 'cancelled' form."""
+    if entry.get("message_id") is None:
+        return
+    total = entry["minutes"] * 60
+    remaining = int((entry["end_at"] - datetime.now(timezone.utc)).total_seconds())
+    try:
+        await context.bot.edit_message_text(
+            _timer_render(remaining, total, entry["minutes"], entry["started_by"], entry.get("frame", 0), state),
+            chat_id=chat_id, message_id=entry["message_id"], parse_mode="HTML",
+        )
+    except Exception:
+        logger.debug("Timer: couldn't finalise the live message chat_id=%s", chat_id)
+
+
 async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: /timer <Nm> — e.g. /timer 5m. Minutes only (no h/d/w — deliberately
-    different from /tban's duration syntax, since this is meant for short in-chat things
-    like a VC break, not long moderation actions). Only one timer can run per chat at a
-    time; starting another while one is active is rejected with the remaining time shown."""
+    """Anyone: /timer <Nm> - e.g. /timer 5m. Minutes only, max 20m, one timer per chat. The bot
+    posts a live countdown (progress bar + mm:ss) that it edits every few seconds, then pings
+    the chat when time is up."""
     if not update.message or not update.effective_chat or not update.effective_user:
         return
     chat = update.effective_chat
@@ -4156,7 +4236,7 @@ async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not m:
         await _reply_autodelete(
             update, context,
-            f"Invalid format — minutes only, e.g. /timer 5m (max {TIMER_MAX_MINUTES}m).",
+            f"Invalid format - minutes only, e.g. /timer 5m (max {TIMER_MAX_MINUTES}m).",
         )
         return
     minutes = int(m.group(1))
@@ -4185,13 +4265,34 @@ async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     started_at = datetime.now(timezone.utc)
     end_at = started_at + timedelta(minutes=minutes)
     started_by = _user_label(update.effective_user)
-    _active_timers[chat.id] = {
+    entry = {
         "end_at": end_at, "minutes": minutes, "started_by": started_by, "started_at": started_at,
+        "message_id": None, "frame": 0, "pause_until": 0.0,
     }
+    _active_timers[chat.id] = entry
     jq.run_once(_timer_fire, when=minutes * 60, data={"chat_id": chat.id}, name=f"timer-{chat.id}")
-    await _reply_autodelete(
-        update, context, f"⏳ Timer set for {minutes}m — I'll ping this chat at {end_at.strftime('%H:%M UTC')}."
-    )
+
+    try:
+        live = await update.message.reply_text(
+            _timer_render(minutes * 60, minutes * 60, minutes, started_by, 0), parse_mode="HTML"
+        )
+        entry["message_id"] = live.message_id
+    except Exception:
+        logger.exception("Timer: couldn't post the live message chat_id=%s", chat.id)
+
+    if entry["message_id"] is not None:
+        tick = _timer_tick_seconds()
+        jq.run_repeating(_timer_tick, interval=tick, first=tick, data={"chat_id": chat.id}, name=f"timer-tick-{chat.id}")
+        # keep the chat tidy: the live message stays, the command message goes
+        jq.run_once(
+            _delete_messages_later, when=30,
+            data={"chat_id": chat.id, "message_ids": [update.message.message_id]},
+            name=f"timer-cmd-{chat.id}-{update.message.message_id}",
+        )
+    else:
+        await _reply_autodelete(
+            update, context, f"⏳ Timer set for {minutes}m - I'll ping this chat at {end_at.strftime('%H:%M UTC')}."
+        )
 
 
 async def _timer_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4201,11 +4302,16 @@ async def _timer_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
     entry = _active_timers.pop(chat_id, None)
     if entry is None:
         return  # cancelled before firing
+    if context.job_queue is not None:
+        for job in context.job_queue.get_jobs_by_name(f"timer-tick-{chat_id}"):
+            job.schedule_removal()
+    await _timer_finish_live_message(context, chat_id, entry, "done")
     start_str = entry["started_at"].strftime("%H:%M")
     end_str = entry["end_at"].strftime("%H:%M")
     minutes = entry["minutes"]
     safe_by = html.escape(entry["started_by"], quote=False)
     try:
+        # a new message (not an edit) so members actually get a notification
         await context.bot.send_message(
             chat_id,
             f"⏰ <b>Time's up!</b> {minutes} minute(s) are up.\n"
@@ -4217,7 +4323,7 @@ async def _timer_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_canceltimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: /canceltimer — cancels the chat's active timer, if any."""
+    """Anyone: /canceltimer - cancels the chat's active timer, if any."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -4230,9 +4336,11 @@ async def cmd_canceltimer(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     jq = context.job_queue
     if jq is not None:
-        for job in jq.get_jobs_by_name(f"timer-{chat.id}"):
-            job.schedule_removal()
+        for name in (f"timer-{chat.id}", f"timer-tick-{chat.id}"):
+            for job in jq.get_jobs_by_name(name):
+                job.schedule_removal()
     _active_timers.pop(chat.id, None)
+    await _timer_finish_live_message(context, chat.id, entry, "cancelled")
     await _reply_autodelete(update, context, "⏹️ Timer cancelled.")
 
 
