@@ -4141,9 +4141,9 @@ def _timer_tick_seconds() -> int:
     """How often the live countdown message is edited. Telegram allows only about 20 messages
     per minute per group (edits count), so never go below 5s; default 10s = 6 edits/minute."""
     try:
-        return max(5, int(os.getenv("TIMER_TICK_SECONDS", "10")))
+        return max(5, int(os.getenv("TIMER_TICK_SECONDS", "5")))
     except ValueError:
-        return 10
+        return 5
 
 
 def _timer_render(remaining: int, total: int, minutes: int, started_by: str, frame: int, state: str = "running") -> str:
