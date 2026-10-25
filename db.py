@@ -498,6 +498,11 @@ def record_present_attendance(
             {"_id": doc_id}, update, upsert=True, return_document=True
         )
 
+        try:  # announcements must never break attendance
+            _celebrate_after_attendance(chat_id, uid, name, sec, xp_gain, doc, crosses_threshold)
+        except Exception:
+            pass
+
         if crosses_threshold:
             earned.append(AttendanceRow(uid, name, int(doc.get("present_days", 1))))
 
@@ -733,27 +738,6 @@ def format_streakboard_html(rows: list[StreakInfo]) -> str:
         lines.append("")
         lines.append(f"<i>+ {len(rows) - MAX_ROWS} more not shown.</i>")
     return "\n".join(lines)
-
-
-def reset_expired_streaks_all() -> int:
-    """Zero out current_streak for ANY user in ANY chat whose last_present_date is more than
-    1 day in the past — i.e. at least one full calendar day passed with no present-attendance
-    (20+ min) call. Meant to run once daily, shortly after UTC midnight, so a broken streak
-    shows 0 the next day rather than staying stale until the person's next VC or the weekly
-    digest catches it."""
-    coll = _coll("user_attendance")
-    today = datetime.now(timezone.utc).date()
-    cutoff = today.toordinal() - 1
-    reset_count = 0
-    for doc in coll.find({"current_streak": {"$gt": 0}}):
-        last_day_str = doc.get("last_present_date")
-        if not last_day_str:
-            continue
-        last_day = datetime.strptime(last_day_str, "%Y-%m-%d").date()
-        if last_day.toordinal() < cutoff:
-            coll.update_one({"_id": doc["_id"]}, {"$set": {"current_streak": 0}})
-            reset_count += 1
-    return reset_count
 
 
 def fetch_xp_leaderboard(chat_id: int, limit: int = 10) -> list[LevelInfo]:
@@ -3113,3 +3097,372 @@ def topic_set_host(chat_id: int, serial: int, host: str) -> bool:
         {"_id": f"{chat_id}:{serial}", "state": "done"}, {"$set": {"host": host[:100]}}
     )
     return result.matched_count > 0
+
+
+# =============================================================================
+# Scheduled posts (/schedule, /scheduled, /unschedule)
+# One document per queued post: the content is stored like filters
+# ({"type", "text", "entities", "file_id"}), so it survives the admin deleting the original.
+# status: scheduled -> sending -> sent | failed, or cancelled.
+# =============================================================================
+
+_sched_ready = False
+
+
+def _sched():
+    global _sched_ready
+    coll = _coll("scheduled_posts")
+    if not _sched_ready:
+        coll.create_index([("status", ASCENDING), ("send_at", ASCENDING)])
+        _sched_ready = True
+    return coll
+
+
+def sched_create(chat_id: int, chat_title: str, data: dict, send_at: datetime, by_id: int, by_name: str) -> int:
+    counter = _coll("sched_counters").find_one_and_update(
+        {"_id": "posts"}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER
+    )
+    serial = int(counter["seq"])
+    if send_at.tzinfo is None:
+        send_at = send_at.replace(tzinfo=timezone.utc)
+    _sched().insert_one(
+        {
+            "_id": serial,
+            "serial": serial,
+            "chat_id": chat_id,
+            "chat_title": (chat_title or "")[:200],
+            "data": data,
+            "send_at": send_at,
+            "by_id": by_id,
+            "by_name": by_name[:512],
+            "status": "scheduled",
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+    return serial
+
+
+def sched_pending() -> list[dict]:
+    return list(_sched().find({"status": "scheduled"}).sort("send_at", ASCENDING))
+
+
+def sched_cancel(serial: int) -> dict | None:
+    return _sched().find_one_and_update(
+        {"_id": serial, "status": "scheduled"}, {"$set": {"status": "cancelled"}}
+    )
+
+
+def sched_due(now: datetime) -> list[dict]:
+    return list(_sched().find({"status": "scheduled", "send_at": {"$lte": now}}).sort("send_at", ASCENDING).limit(20))
+
+
+def sched_claim(serial: int) -> bool:
+    """Scheduled -> sending, atomically, so a post can never go out twice."""
+    return _sched().find_one_and_update({"_id": serial, "status": "scheduled"}, {"$set": {"status": "sending"}}) is not None
+
+
+def sched_finish(serial: int, status: str, error: str = "") -> None:
+    _sched().update_one(
+        {"_id": serial},
+        {"$set": {"status": status, "error": error[:300], "finished_at": datetime.now(timezone.utc)}},
+    )
+
+
+# =============================================================================
+# Engagement: celebrations, streak freezes, monthly awards and recaps, R&R reactions
+# =============================================================================
+
+LEVEL_TITLES = {
+    1: "Newcomer", 2: "Reader", 3: "Page-Turner", 4: "Bookworm", 5: "Scholar",
+    6: "Sage", 7: "Oracle", 8: "Legend", 9: "Luminary", 10: "Grandmaster",
+}
+STREAK_MILESTONES = (14, 21, 50, 100, 200, 365)    # 7 and 30 days already have badges
+HOURS_MILESTONES = (10, 25, 50, 100, 250, 500, 1000)
+VC_COUNT_MILESTONES = (10, 25, 50, 200, 500, 1000)  # 100 is the Veteran badge
+FREEZE_EVERY_DAYS = 14
+
+
+def freeze_cap() -> int:
+    """Most streak freezes a member can hold (FREEZES_MAX on Render, default 2)."""
+    try:
+        return max(1, int(os.getenv("FREEZES_MAX", "2")))
+    except ValueError:
+        return 2
+
+
+_celeb_ready = False
+
+
+def _celebrations():
+    global _celeb_ready
+    coll = _coll("celebrations")
+    if not _celeb_ready:
+        coll.create_index([("posted", ASCENDING), ("created_at", ASCENDING)])
+        coll.create_index("created_at", expireAfterSeconds=60 * 24 * 3600)
+        _celeb_ready = True
+    return coll
+
+
+def queue_celebration(chat_id: int, key: str, text: str) -> bool:
+    """Queue an announcement. The key makes each one happen once (False = already queued)."""
+    try:
+        _celebrations().insert_one(
+            {
+                "_id": f"{chat_id}:{key}",
+                "chat_id": chat_id,
+                "text": text,
+                "posted": False,
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+        return True
+    except DuplicateKeyError:
+        return False
+
+
+def celebrations_due(older_than_seconds: int = 20, limit: int = 60) -> list[dict]:
+    """Waiting announcements, oldest first. The small delay lets the call summary post first."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+    return list(
+        _celebrations().find({"posted": False, "created_at": {"$lte": cutoff}}).sort("created_at", ASCENDING).limit(limit)
+    )
+
+
+def celebrations_mark(ids: list, status: str) -> None:
+    _celebrations().update_many({"_id": {"$in": ids}}, {"$set": {"posted": True, "status": status}})
+
+
+def _celebrate_after_attendance(chat_id, uid, name, sec, xp_gain, doc, crosses_threshold) -> None:
+    """Called from record_present_attendance for every participant. Queues announcements for
+    level-ups and milestones, and grants a streak freeze every FREEZE_EVERY_DAYS streak days.
+    Runs after the call's session is stored, so totals already include it."""
+    if uid <= 0:
+        return
+    safe = html.escape(name, quote=False)
+    xp_after = int(doc.get("xp", 0))
+    lvl_after = _level_for_xp(xp_after)[0]
+    lvl_before = _level_for_xp(max(0, xp_after - xp_gain))[0]
+    if lvl_after > lvl_before:
+        title = LEVEL_TITLES.get(lvl_after)
+        suffix = f" ({title})" if title else ""
+        queue_celebration(chat_id, f"level:{uid}:{lvl_after}", f"🎉 {safe} reached <b>Level {lvl_after}</b>{suffix}!")
+
+    if sec > 0:
+        stats = get_user_vc_stats(chat_id, uid)
+        for h in HOURS_MILESTONES:
+            if stats.total_seconds - sec < h * 3600 <= stats.total_seconds:
+                queue_celebration(chat_id, f"hours:{uid}:{h}", f"⏱️ {safe} passed <b>{h} hours</b> in voice chats!")
+        if stats.vc_count in VC_COUNT_MILESTONES:
+            queue_celebration(
+                chat_id, f"vcs:{uid}:{stats.vc_count}", f"📞 {safe} joined their <b>{stats.vc_count}th voice chat</b>!"
+            )
+
+    if crosses_threshold:
+        streak = int(doc.get("current_streak", 0))
+        day = str(doc.get("last_present_date") or "")
+        if streak in STREAK_MILESTONES:
+            queue_celebration(chat_id, f"streak:{uid}:{streak}:{day}", f"🔥 {safe} is on a <b>{streak}-day streak</b>!")
+        if streak > 0 and streak % FREEZE_EVERY_DAYS == 0 and int(doc.get("freezes", 0)) < freeze_cap():
+            text = f"🧊 {safe} earned a <b>streak freeze</b>: one missed day won't break the streak."
+            if queue_celebration(chat_id, f"freeze:{uid}:{streak}:{day}", text):
+                _coll("user_attendance").update_one({"_id": f"{chat_id}:{uid}"}, {"$inc": {"freezes": 1}})
+
+
+def get_freezes(chat_id: int, user_id: int) -> int:
+    doc = _coll("user_attendance").find_one({"_id": f"{chat_id}:{user_id}"}) or {}
+    return int(doc.get("freezes", 0))
+
+
+def grant_freeze(chat_id: int, user_id: int, display_name: str, n: int = 1, cap: int = 5) -> int:
+    """Admin grant. Returns the member's new freeze count (never above `cap`)."""
+    coll = _coll("user_attendance")
+    doc_id = f"{chat_id}:{user_id}"
+    coll.update_one(
+        {"_id": doc_id},
+        {
+            "$setOnInsert": {
+                "chat_id": chat_id, "user_id": user_id, "display_name": display_name[:512],
+                "xp": 0, "present_days": 0, "current_streak": 0, "longest_streak": 0, "badges": {},
+            }
+        },
+        upsert=True,
+    )
+    have = int((coll.find_one({"_id": doc_id}) or {}).get("freezes", 0))
+    new = min(cap, have + n)
+    coll.update_one({"_id": doc_id}, {"$set": {"freezes": new}})
+    return new
+
+
+def reset_expired_streaks_all() -> int:
+    """Zero out current_streak for ANY user in ANY chat whose last_present_date is more than
+    1 day in the past (they missed a day). Runs once daily just after UTC midnight.
+
+    A member who holds a streak freeze and missed exactly ONE day keeps the streak: the
+    freeze is used up and the missed day is bridged. Missing two or more days still resets it.
+    Returns the number of streaks that were reset."""
+    coll = _coll("user_attendance")
+    today = datetime.now(timezone.utc).date()
+    cutoff = today.toordinal() - 1
+    yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    reset_count = 0
+    for doc in coll.find({"current_streak": {"$gt": 0}}):
+        last_day_str = doc.get("last_present_date")
+        if not last_day_str:
+            continue
+        last_day = datetime.strptime(last_day_str, "%Y-%m-%d").date()
+        if last_day.toordinal() >= cutoff:
+            continue
+        if last_day.toordinal() == cutoff - 1 and int(doc.get("freezes", 0)) > 0:
+            used = coll.update_one(
+                {"_id": doc["_id"], "freezes": {"$gt": 0}},
+                {"$inc": {"freezes": -1}, "$set": {"last_present_date": yesterday}},
+            )
+            if used.modified_count:
+                name = html.escape(str(doc.get("display_name", "A member")), quote=False)
+                queue_celebration(
+                    int(doc["chat_id"]), f"frozen:{doc['user_id']}:{yesterday}",
+                    f"🧊 A freeze saved {name}'s <b>{int(doc.get('current_streak', 0))}-day streak</b>!",
+                )
+                continue
+        coll.update_one({"_id": doc["_id"]}, {"$set": {"current_streak": 0}})
+        reset_count += 1
+    return reset_count
+
+
+def streaks_at_risk(chat_id: int, min_streak: int = 3, limit: int = 15) -> list[dict]:
+    """Members with a streak worth saving who haven't attended yet today (UTC day)."""
+    yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).strftime("%Y-%m-%d")
+    cursor = (
+        _coll("user_attendance")
+        .find({"chat_id": chat_id, "current_streak": {"$gte": min_streak}, "last_present_date": yesterday})
+        .sort("current_streak", DESCENDING)
+        .limit(limit)
+    )
+    return [
+        {"user_id": int(d["user_id"]), "name": str(d.get("display_name", "")),
+         "streak": int(d.get("current_streak", 0)), "freezes": int(d.get("freezes", 0))}
+        for d in cursor
+    ]
+
+
+def engage_posted(key: str) -> str | None:
+    doc = _coll("meta").find_one({"_id": key})
+    return doc.get("day") if doc else None
+
+
+def engage_set_posted(key: str, value: str) -> None:
+    _coll("meta").update_one({"_id": key}, {"$set": {"day": value}}, upsert=True)
+
+
+def _month_filters(chat_id: int, year: int, month: int):
+    start, end = month_bounds_utc(year, month)
+    prefix = f"{year:04d}-{month:02d}-"
+    rnr = {"chat_id": chat_id, "deleted": {"$ne": True}, "day": {"$gte": prefix + "01", "$lte": prefix + "31"}}
+    topics = {
+        "chat_id": chat_id, "added_at": {"$gte": start, "$lt": end},
+        "added_by_id": {"$gt": 0}, "source": {"$nin": ["vc", "vc_unrecorded"]},
+    }
+    return start, end, rnr, topics
+
+
+def month_awards(chat_id: int, year: int, month: int) -> list[dict]:
+    """Winners for the month: [{"key", "user_id", "name", "value"}]. Categories without data are skipped."""
+    start, end, rnr_filter, topic_filter = _month_filters(chat_id, year, month)
+    out: list[dict] = []
+    rows = [r for r in fetch_vc_stats(chat_id, start, end) if r.user_id > 0]
+    if rows:
+        top = rows[0]
+        out.append({"key": "voice", "user_id": top.user_id, "name": top.display_name, "value": top.total_seconds})
+        reg = max(rows, key=lambda r: (r.vc_count, r.total_seconds))
+        out.append({"key": "regular", "user_id": reg.user_id, "name": reg.display_name, "value": reg.vc_count})
+
+    def top_counter(cursor, id_field, name_field):
+        counts: dict[int, list] = {}
+        for d in cursor:
+            c = counts.setdefault(int(d[id_field]), [0, ""])
+            c[0] += 1
+            c[1] = d.get(name_field) or c[1]
+        if not counts:
+            return None
+        uid, (n, name) = max(counts.items(), key=lambda kv: kv[1][0])
+        return uid, name, n
+
+    best = top_counter(_coll("rnr_records").find(rnr_filter, {"user_id": 1, "display_name": 1}), "user_id", "display_name")
+    if best:
+        out.append({"key": "rnr", "user_id": best[0], "name": best[1], "value": best[2]})
+    best = top_counter(_coll("topics").find(topic_filter, {"added_by_id": 1, "added_by_name": 1}), "added_by_id", "added_by_name")
+    if best:
+        out.append({"key": "ideas", "user_id": best[0], "name": best[1], "value": best[2]})
+    if not out:
+        return []  # a month with no activity gets no awards (the streak award alone would be odd)
+    keeper = list(
+        _coll("user_attendance").find({"chat_id": chat_id, "current_streak": {"$gte": 3}}).sort("current_streak", DESCENDING).limit(1)
+    )
+    if keeper:
+        k = keeper[0]
+        out.append({"key": "streak", "user_id": int(k["user_id"]), "name": str(k.get("display_name", "")), "value": int(k["current_streak"])})
+    return out
+
+
+def member_month_recap(chat_id: int, user_id: int, year: int, month: int) -> dict:
+    start, end, rnr_filter, topic_filter = _month_filters(chat_id, year, month)
+    rows = [r for r in fetch_vc_stats(chat_id, start, end) if r.user_id > 0]
+    idx = next((i for i, r in enumerate(rows) if r.user_id == user_id), None)
+    att = _coll("user_attendance").find_one({"_id": f"{chat_id}:{user_id}"}) or {}
+    xp = int(att.get("xp", 0))
+    return {
+        "vcs": rows[idx].vc_count if idx is not None else 0,
+        "seconds": rows[idx].total_seconds if idx is not None else 0,
+        "rank": idx + 1 if idx is not None else None,
+        "participants": len(rows),
+        "recordings": _coll("rnr_records").count_documents({**rnr_filter, "user_id": user_id}),
+        "topics": _coll("topics").count_documents({**topic_filter, "added_by_id": user_id}),
+        "streak": int(att.get("current_streak", 0)),
+        "best_streak": int(att.get("longest_streak", 0)),
+        "freezes": int(att.get("freezes", 0)),
+        "xp": xp,
+        "level": _level_for_xp(xp)[0],
+    }
+
+
+def month_active_user_ids(chat_id: int, year: int, month: int) -> list[int]:
+    start, end, rnr_filter, topic_filter = _month_filters(chat_id, year, month)
+    ids = {r.user_id for r in fetch_vc_stats(chat_id, start, end) if r.user_id > 0}
+    ids |= {int(d["user_id"]) for d in _coll("rnr_records").find(rnr_filter, {"user_id": 1})}
+    ids |= {int(d["added_by_id"]) for d in _coll("topics").find(topic_filter, {"added_by_id": 1})}
+    return sorted(i for i in ids if i > 0)
+
+
+def recap_opted_out(user_id: int) -> bool:
+    doc = _coll("recap_prefs").find_one({"_id": user_id})
+    return bool(doc and doc.get("optout"))
+
+
+def set_recap_optout(user_id: int, optout: bool) -> None:
+    _coll("recap_prefs").update_one({"_id": user_id}, {"$set": {"optout": optout}}, upsert=True)
+
+
+def rnr_set_reaction(chat_id: int, msg_id: int, reactor_id: int, has_reaction: bool) -> None:
+    """Remember who reacted to a recorded audio (own reactions don't count)."""
+    coll = _coll("rnr_records")
+    doc_id = f"{chat_id}:{msg_id}"
+    if has_reaction:
+        coll.update_one(
+            {"_id": doc_id, "deleted": {"$ne": True}, "user_id": {"$ne": reactor_id}},
+            {"$addToSet": {"reactor_ids": reactor_id}},
+        )
+    else:
+        coll.update_one({"_id": doc_id}, {"$pull": {"reactor_ids": reactor_id}})
+
+
+def rnr_week_winner(chat_id: int, days: list[str], min_reactions: int = 2) -> dict | None:
+    """The recorded audio (sent on one of `days`) with the most members reacting."""
+    best, best_n = None, 0
+    cursor = _coll("rnr_records").find({"chat_id": chat_id, "deleted": {"$ne": True}, "day": {"$in": days}})
+    for d in sorted(cursor, key=lambda x: x.get("audio_at") or datetime.min):
+        n = len(d.get("reactor_ids") or [])
+        if n > best_n:
+            best, best_n = d, n
+    if best is None or best_n < min_reactions:
+        return None
+    return {"doc": best, "count": best_n}

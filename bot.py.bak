@@ -590,6 +590,9 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
+    "schedule": ("botadmin", "/schedule 3/10/2026 8am  (reply to a post, in a private chat with the bot)", "Publish that post to the group at the given date and time (day/month/year, group time). Queue as many as you like.", "Bot admin, DM only"),
+    "scheduled": ("botadmin", "/scheduled", "List the posts waiting to go out.", "Bot admin, DM only"),
+    "unschedule": ("botadmin", "/unschedule <number>", "Cancel a waiting scheduled post.", "Bot admin, DM only"),
     "sethost": ("topics", "/sethost <topic number> <host>", "Fix or set the host of a discussed topic.", "Group admin"),
     "mylimits": ("everyone", "/mylimits  (in a private chat with the bot)", "See how many commands and audio downloads you have left today.", "Anyone"),
     "privacy": ("everyone", "/privacy", "What the bot stores about you, who can see it, and how to get or delete your data.", "Anyone"),
@@ -3602,6 +3605,271 @@ async def cmd_sethost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# =============================================================================
+# Scheduled posts: a bot admin replies to a post in a PRIVATE chat with the bot:
+#     /schedule 3/10/2026 8am          (day/month/year, group time)
+# and the bot publishes that post to the group at that moment. Queue as many as you like.
+#     /scheduled   lists what is waiting      /unschedule 3   cancels #3
+# Group time is RNR_TZ_OFFSET_MINUTES (default 330 = IST). Stored in MongoDB, so restarts
+# don't lose anything; a post that came due while the bot was down goes out when it is back.
+# =============================================================================
+
+_SCHED_MAX_DAYS = 366
+_SCHED_DATE_RE = re.compile(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})")
+_SCHED_ISO_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+_SCHED_TIME_RE = re.compile(r"(?<![\d/\-.])(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?(?![\d/\-.])", re.IGNORECASE)
+
+
+def _sched_offset() -> timedelta:
+    try:
+        return timedelta(minutes=int(os.getenv("RNR_TZ_OFFSET_MINUTES", "330")))
+    except ValueError:
+        return timedelta(minutes=330)
+
+
+def _sched_tz_label() -> str:
+    minutes = int(_sched_offset().total_seconds() // 60)
+    if minutes == 330:
+        return "IST"
+    sign = "+" if minutes >= 0 else "-"
+    return f"UTC{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
+
+
+def _parse_schedule_when(text: str, now: datetime) -> tuple[datetime | None, str]:
+    """(send_time_in_UTC, error). Accepts '3/10/2026 8am', '03-10-2026 20:30', '2026-10-03 8.30pm',
+    'tomorrow 7pm', 'today 9pm'. Dates are day/month/year, times are in group time."""
+    t = text.strip().lower()
+    local_now = now + _sched_offset()
+    day = None
+    m = _SCHED_ISO_RE.search(t)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        t = t[: m.start()] + " " + t[m.end():]
+    else:
+        m = _SCHED_DATE_RE.search(t)
+        if m:
+            d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            t = t[: m.start()] + " " + t[m.end():]
+        elif "tomorrow" in t:
+            day = (local_now + timedelta(days=1)).date()
+            t = t.replace("tomorrow", " ")
+        elif "today" in t:
+            day = local_now.date()
+            t = t.replace("today", " ")
+        else:
+            return None, "I need a date, like 3/10/2026 (day/month/year), or the word tomorrow."
+    if day is None:
+        try:
+            day = datetime(y, mo, d).date()
+        except ValueError:
+            return None, "That date doesn't exist. Use day/month/year, like 3/10/2026."
+
+    tm = _SCHED_TIME_RE.search(t)
+    if not tm:
+        return None, "I need a time too, like 8am, 8:30pm or 20:00."
+    hour, minute, ampm = int(tm.group(1)), int(tm.group(2) or 0), (tm.group(3) or "").lower()
+    if minute > 59 or (ampm and not 1 <= hour <= 12) or (not ampm and hour > 23):
+        return None, "That time doesn't look right. Use 8am, 8:30pm or 20:00."
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+
+    local_dt = datetime(day.year, day.month, day.day, hour, minute)
+    when = (local_dt - _sched_offset()).replace(tzinfo=timezone.utc)
+    if when <= now + timedelta(seconds=30):
+        return None, f"That time has already passed (it is {local_now.strftime('%d %b %Y, %H:%M')} {_sched_tz_label()} now)."
+    if when > now + timedelta(days=_SCHED_MAX_DAYS):
+        return None, "That is more than a year away. Pick a closer date."
+    return when, ""
+
+
+async def _send_data_or_raise(bot, chat_id: int, data: dict):
+    """Send stored post content (same shape as filters). Unlike _send_filter_response this
+    raises on failure, so the scheduler can tell the admin."""
+    ftype = data.get("type", "text")
+    text = data.get("text")
+    entities = [
+        _dict_to_entity(d) for d in (data.get("entities") or []) if d.get("type") != "text_mention"
+    ] or None
+    file_id = data.get("file_id")
+    if ftype == "text":
+        return await bot.send_message(chat_id, text or "", entities=entities)
+    senders = {
+        "photo": ("send_photo", "photo"), "video": ("send_video", "video"),
+        "animation": ("send_animation", "animation"), "document": ("send_document", "document"),
+        "voice": ("send_voice", "voice"), "audio": ("send_audio", "audio"),
+    }
+    if ftype in senders:
+        method, arg = senders[ftype]
+        return await getattr(bot, method)(chat_id, **{arg: file_id}, caption=text, caption_entities=entities)
+    if ftype == "sticker":
+        return await bot.send_sticker(chat_id, sticker=file_id)
+    if ftype == "video_note":
+        return await bot.send_video_note(chat_id, video_note=file_id)
+    raise ValueError(f"unsupported post type {ftype}")
+
+
+def _sched_when_label(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return f"{(dt + _sched_offset()).strftime('%d %b %Y, %H:%M')} {_sched_tz_label()}"
+
+
+def _sched_in_label(seconds: int) -> str:
+    """'12 days 14 h', '3 h 20 min', 'under a minute' - friendlier than 302h 30m."""
+    days, rem = divmod(max(0, int(seconds)), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} h")
+    if minutes and not days:
+        parts.append(f"{minutes} min")
+    return " ".join(parts) or "under a minute"
+
+
+def _sched_preview(data: dict) -> str:
+    kind = data.get("type", "text")
+    text = (data.get("text") or "").strip().replace("\n", " ")
+    snippet = (text[:40] + "...") if len(text) > 40 else text
+    return f"{kind}: {snippet}" if snippet else kind
+
+
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin, private chat: reply to a post with /schedule <date> <time> [chat_id]."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Schedule posts in a private chat with me.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Only bot admins can schedule posts.")
+        return
+    usage = (
+        "To schedule a post: send (or forward) it to me here, then REPLY to it with\n"
+        "/schedule 3/10/2026 8am\n\n"
+        "Date is day/month/year, time is in group time. Also works: tomorrow 7pm, 03-10-2026 20:30.\n"
+        "By default it goes to the main group; add a chat id at the end to pick another.\n"
+        "/scheduled lists waiting posts, /unschedule <number> cancels one."
+    )
+    reply = update.message.reply_to_message
+    if reply is None:
+        await update.message.reply_text(usage)
+        return
+    data = _filter_data_from_message(reply)
+    if data is None:
+        await update.message.reply_text(
+            "I can schedule text, photos, videos, GIFs, documents, stickers, voice notes, audio and "
+            "video notes. That kind of message isn't supported."
+        )
+        return
+
+    args = list(context.args or [])
+    target = None
+    if args and re.fullmatch(r"-\d{5,}", args[-1]):
+        target = int(args.pop())
+    when, error = _parse_schedule_when(" ".join(args), datetime.now(timezone.utc))
+    if when is None:
+        await update.message.reply_text(f"{error}\n\n{usage}")
+        return
+    if target is None:
+        target = _broadcast_target_chat_id()
+    if target is None:
+        await update.message.reply_text("No main group is configured. Add a chat id: /schedule 3/10/2026 8am -100123456789")
+        return
+    try:
+        chat = await context.bot.get_chat(target)
+        title = chat.title or str(target)
+    except Exception:
+        await update.message.reply_text(f"I can't see chat {target}. Is the bot a member of it?")
+        return
+
+    user = update.effective_user
+    serial = await asyncio.to_thread(
+        dbmod.sched_create, target, title, data, when, user.id, _user_label(user)
+    )
+    delta = when - datetime.now(timezone.utc)
+    await update.message.reply_text(
+        f"Scheduled #{serial} for {title}\n"
+        f"{_sched_when_label(when)} (in {_sched_in_label(int(delta.total_seconds()))})\n"
+        f"{_sched_preview(data)}\n\n"
+        f"/scheduled shows the queue, /unschedule {serial} cancels it."
+    )
+
+
+async def cmd_scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin, private chat: list posts waiting to go out."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private" or not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Bot admins only, in a private chat with me.")
+        return
+    rows = await asyncio.to_thread(dbmod.sched_pending)
+    if not rows:
+        await update.message.reply_text("Nothing is scheduled. Reply to a post with /schedule 3/10/2026 8am")
+        return
+    lines = [f"Scheduled posts ({len(rows)}):", ""]
+    for r in rows[:30]:
+        lines.append(f"#{r['serial']}  {_sched_when_label(r['send_at'])}")
+        lines.append(f"    {_sched_preview(r['data'])} -> {r.get('chat_title') or r['chat_id']} (by {r.get('by_name', '?')})")
+    if len(rows) > 30:
+        lines.append(f"... and {len(rows) - 30} more")
+    for chunk in _split_for_telegram("\n".join(lines)):
+        await update.message.reply_text(chunk)
+
+
+async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin, private chat: /unschedule <number>."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private" or not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Bot admins only, in a private chat with me.")
+        return
+    try:
+        serial = int((context.args or [""])[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("Usage: /unschedule <number>   (see /scheduled)")
+        return
+    doc = await asyncio.to_thread(dbmod.sched_cancel, serial)
+    if doc is None:
+        await update.message.reply_text(f"No waiting post #{serial}. It may already be sent or cancelled.")
+        return
+    await update.message.reply_text(f"Cancelled #{serial} ({_sched_preview(doc['data'])}).")
+
+
+async def scheduled_post_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every 30s: publish due posts and tell the admin who scheduled each one how it went."""
+    try:
+        due = await asyncio.to_thread(dbmod.sched_due, datetime.now(timezone.utc))
+    except Exception:
+        logger.exception("Scheduled-post worker could not read the queue")
+        return
+    for d in due:
+        serial = d["serial"]
+        try:
+            if not await asyncio.to_thread(dbmod.sched_claim, serial):
+                continue
+            title = d.get("chat_title") or d["chat_id"]
+            try:
+                await _send_data_or_raise(context.bot, int(d["chat_id"]), d["data"])
+            except Exception as exc:
+                logger.exception("Scheduled post #%s failed", serial)
+                await asyncio.to_thread(dbmod.sched_finish, serial, "failed", str(exc))
+                note = f"Scheduled post #{serial} could NOT be posted to {title}: {str(exc)[:200]}"
+            else:
+                await asyncio.to_thread(dbmod.sched_finish, serial, "sent")
+                note = f"Posted #{serial} to {title}."
+            try:
+                await context.bot.send_message(int(d["by_id"]), note)
+            except Exception:
+                logger.debug("Could not notify admin %s about scheduled post #%s", d.get("by_id"), serial)
+        except Exception:
+            logger.exception("Scheduled-post worker failed on #%s", serial)
+
+
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Passive, silent: remembers username -> user_id for every message seen in a tracked
     group (any message type, not just text/commands), so /warn, /ban, /mute etc. can later
@@ -4134,11 +4402,91 @@ _TIMER_RE = re.compile(r"^(\d{1,2})m$", re.IGNORECASE)
 _active_timers: dict[int, dict] = {}  # chat_id -> {end_at, minutes, started_by, started_at}
 
 
+_TIMER_BAR_CELLS = 12
+
+
+def _timer_tick_seconds() -> int:
+    """How often the live countdown message is edited. Telegram allows only about 20 messages
+    per minute per group (edits count), so never go below 5s; default 10s = 6 edits/minute."""
+    try:
+        return max(5, int(os.getenv("TIMER_TICK_SECONDS", "5")))
+    except ValueError:
+        return 5
+
+
+def _timer_render(remaining: int, total: int, minutes: int, started_by: str, frame: int, state: str = "running") -> str:
+    """The live timer message: hourglass that flips every update, a progress bar and mm:ss."""
+    remaining = max(0, min(remaining, total))
+    elapsed = 1 - (remaining / total if total else 0)
+    filled = round(elapsed * _TIMER_BAR_CELLS)
+    bar = "▰" * filled + "▱" * (_TIMER_BAR_CELLS - filled)
+    mm, ss = divmod(remaining, 60)
+    if state == "done":
+        title = "⏰ <b>Time's up!</b>"
+        bar, pct = "▰" * _TIMER_BAR_CELLS, 100
+    elif state == "cancelled":
+        title = "⏹️ <b>Timer cancelled</b>"
+        pct = round(elapsed * 100)
+    else:
+        title = f"{'⏳' if frame % 2 == 0 else '⌛'} <b>{mm:02d}:{ss:02d}</b> left"
+        pct = round(elapsed * 100)
+    return f"{title}\n{bar} {pct}%\n<i>{minutes} min timer · started by {html.escape(started_by, quote=False)}</i>"
+
+
+async def _timer_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repeating job: edit the live timer message. Never raises; backs off if Telegram asks."""
+    from telegram.error import BadRequest, RetryAfter
+
+    chat_id = (context.job.data or {}).get("chat_id")
+    entry = _active_timers.get(chat_id)
+    if entry is None or entry.get("message_id") is None:
+        context.job.schedule_removal()
+        return
+    if time.monotonic() < entry.get("pause_until", 0.0):
+        return
+    total = entry["minutes"] * 60
+    remaining = int((entry["end_at"] - datetime.now(timezone.utc)).total_seconds())
+    if remaining <= 0:
+        return  # _timer_fire finishes it
+    entry["frame"] += 1
+    try:
+        await context.bot.edit_message_text(
+            _timer_render(remaining, total, entry["minutes"], entry["started_by"], entry["frame"]),
+            chat_id=chat_id, message_id=entry["message_id"], parse_mode="HTML",
+        )
+    except RetryAfter as exc:
+        wait = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
+        entry["pause_until"] = time.monotonic() + wait + 1
+        logger.warning("Timer: Telegram asked to slow down, pausing updates for %ss chat_id=%s", wait, chat_id)
+    except BadRequest as exc:
+        if "not modified" in str(exc).lower():
+            return
+        logger.info("Timer: live message can't be edited any more (%s); stopping updates chat_id=%s", exc, chat_id)
+        entry["message_id"] = None
+        context.job.schedule_removal()
+    except Exception:
+        logger.debug("Timer tick failed chat_id=%s", chat_id)
+
+
+async def _timer_finish_live_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, entry: dict, state: str) -> None:
+    """Turn the live message into its final 'Time's up' / 'cancelled' form."""
+    if entry.get("message_id") is None:
+        return
+    total = entry["minutes"] * 60
+    remaining = int((entry["end_at"] - datetime.now(timezone.utc)).total_seconds())
+    try:
+        await context.bot.edit_message_text(
+            _timer_render(remaining, total, entry["minutes"], entry["started_by"], entry.get("frame", 0), state),
+            chat_id=chat_id, message_id=entry["message_id"], parse_mode="HTML",
+        )
+    except Exception:
+        logger.debug("Timer: couldn't finalise the live message chat_id=%s", chat_id)
+
+
 async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: /timer <Nm> — e.g. /timer 5m. Minutes only (no h/d/w — deliberately
-    different from /tban's duration syntax, since this is meant for short in-chat things
-    like a VC break, not long moderation actions). Only one timer can run per chat at a
-    time; starting another while one is active is rejected with the remaining time shown."""
+    """Anyone: /timer <Nm> - e.g. /timer 5m. Minutes only, max 20m, one timer per chat. The bot
+    posts a live countdown (progress bar + mm:ss) that it edits every few seconds, then pings
+    the chat when time is up."""
     if not update.message or not update.effective_chat or not update.effective_user:
         return
     chat = update.effective_chat
@@ -4156,7 +4504,7 @@ async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not m:
         await _reply_autodelete(
             update, context,
-            f"Invalid format — minutes only, e.g. /timer 5m (max {TIMER_MAX_MINUTES}m).",
+            f"Invalid format - minutes only, e.g. /timer 5m (max {TIMER_MAX_MINUTES}m).",
         )
         return
     minutes = int(m.group(1))
@@ -4185,13 +4533,34 @@ async def cmd_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     started_at = datetime.now(timezone.utc)
     end_at = started_at + timedelta(minutes=minutes)
     started_by = _user_label(update.effective_user)
-    _active_timers[chat.id] = {
+    entry = {
         "end_at": end_at, "minutes": minutes, "started_by": started_by, "started_at": started_at,
+        "message_id": None, "frame": 0, "pause_until": 0.0,
     }
+    _active_timers[chat.id] = entry
     jq.run_once(_timer_fire, when=minutes * 60, data={"chat_id": chat.id}, name=f"timer-{chat.id}")
-    await _reply_autodelete(
-        update, context, f"⏳ Timer set for {minutes}m — I'll ping this chat at {end_at.strftime('%H:%M UTC')}."
-    )
+
+    try:
+        live = await update.message.reply_text(
+            _timer_render(minutes * 60, minutes * 60, minutes, started_by, 0), parse_mode="HTML"
+        )
+        entry["message_id"] = live.message_id
+    except Exception:
+        logger.exception("Timer: couldn't post the live message chat_id=%s", chat.id)
+
+    if entry["message_id"] is not None:
+        tick = _timer_tick_seconds()
+        jq.run_repeating(_timer_tick, interval=tick, first=tick, data={"chat_id": chat.id}, name=f"timer-tick-{chat.id}")
+        # keep the chat tidy: the live message stays, the command message goes
+        jq.run_once(
+            _delete_messages_later, when=30,
+            data={"chat_id": chat.id, "message_ids": [update.message.message_id]},
+            name=f"timer-cmd-{chat.id}-{update.message.message_id}",
+        )
+    else:
+        await _reply_autodelete(
+            update, context, f"⏳ Timer set for {minutes}m - I'll ping this chat at {end_at.strftime('%H:%M UTC')}."
+        )
 
 
 async def _timer_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4201,11 +4570,16 @@ async def _timer_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
     entry = _active_timers.pop(chat_id, None)
     if entry is None:
         return  # cancelled before firing
+    if context.job_queue is not None:
+        for job in context.job_queue.get_jobs_by_name(f"timer-tick-{chat_id}"):
+            job.schedule_removal()
+    await _timer_finish_live_message(context, chat_id, entry, "done")
     start_str = entry["started_at"].strftime("%H:%M")
     end_str = entry["end_at"].strftime("%H:%M")
     minutes = entry["minutes"]
     safe_by = html.escape(entry["started_by"], quote=False)
     try:
+        # a new message (not an edit) so members actually get a notification
         await context.bot.send_message(
             chat_id,
             f"⏰ <b>Time's up!</b> {minutes} minute(s) are up.\n"
@@ -4217,7 +4591,7 @@ async def _timer_fire(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_canceltimer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Anyone: /canceltimer — cancels the chat's active timer, if any."""
+    """Anyone: /canceltimer - cancels the chat's active timer, if any."""
     if not update.message or not update.effective_chat:
         return
     chat = update.effective_chat
@@ -4230,9 +4604,11 @@ async def cmd_canceltimer(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     jq = context.job_queue
     if jq is not None:
-        for job in jq.get_jobs_by_name(f"timer-{chat.id}"):
-            job.schedule_removal()
+        for name in (f"timer-{chat.id}", f"timer-tick-{chat.id}"):
+            for job in jq.get_jobs_by_name(name):
+                job.schedule_removal()
     _active_timers.pop(chat.id, None)
+    await _timer_finish_live_message(context, chat.id, entry, "cancelled")
     await _reply_autodelete(update, context, "⏹️ Timer cancelled.")
 
 
@@ -6098,6 +6474,7 @@ async def post_init(application: Application) -> None:
         time=dt_time(hour=0, minute=5, tzinfo=timezone.utc),
         name="daily_streak_reset_job",
     )
+    jq.run_repeating(scheduled_post_worker, interval=30, first=50, name="scheduled_post_worker")
     jq.run_repeating(vc_question_worker, interval=30, first=45, name="vc_question_worker")
     jq.run_daily(
         daily_backup_job,
@@ -6218,6 +6595,9 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("scheduled", cmd_scheduled))
+    app.add_handler(CommandHandler("unschedule", cmd_unschedule))
     app.add_handler(CommandHandler("sethost", cmd_sethost))
     # Answers to the "who was the host?" question; own handler group so it never shadows other reply handlers.
     app.add_handler(

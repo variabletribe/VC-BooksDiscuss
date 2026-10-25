@@ -590,6 +590,12 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     "addcmd": ("groupadmin", "/addcmd <name> <reply text>  —  or reply to any message with /addcmd <name>", "Create your own command like /rules or /about. Anyone can then type /name to get the saved reply (text, photo, video, ...). Unlike filters, it only answers when someone types the command.", "Group admin"),
     "delcmd": ("groupadmin", "/delcmd <name>", "Delete a custom command.", "Group admin"),
     "cmds": ("everyone", "/cmds", "List this group's custom commands.", "Anyone"),
+    "myrecap": ("everyone", "/myrecap [this]  (in a private chat with the bot)", "Your month in books: voice chats, hours, Read & Records, topics, streak and level. Last month by default, or 'this' for the month so far.", "Anyone"),
+    "recap": ("everyone", "/recap on|off  (in a private chat with the bot)", "Switch the monthly recap message I send you on or off.", "Anyone"),
+    "givefreeze": ("botadmin", "/givefreeze [reply / id / @user]", "Give a member a streak freeze (covers one missed day), e.g. for an emergency.", "Bot admin"),
+    "schedule": ("botadmin", "/schedule 3/10/2026 8am  (reply to a post, in a private chat with the bot)", "Publish that post to the group at the given date and time (day/month/year, group time). Queue as many as you like.", "Bot admin, DM only"),
+    "scheduled": ("botadmin", "/scheduled", "List the posts waiting to go out.", "Bot admin, DM only"),
+    "unschedule": ("botadmin", "/unschedule <number>", "Cancel a waiting scheduled post.", "Bot admin, DM only"),
     "sethost": ("topics", "/sethost <topic number> <host>", "Fix or set the host of a discussed topic.", "Group admin"),
     "mylimits": ("everyone", "/mylimits  (in a private chat with the bot)", "See how many commands and audio downloads you have left today.", "Anyone"),
     "privacy": ("everyone", "/privacy", "What the bot stores about you, who can see it, and how to get or delete your data.", "Anyone"),
@@ -3602,6 +3608,577 @@ async def cmd_sethost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# =============================================================================
+# Scheduled posts: a bot admin replies to a post in a PRIVATE chat with the bot:
+#     /schedule 3/10/2026 8am          (day/month/year, group time)
+# and the bot publishes that post to the group at that moment. Queue as many as you like.
+#     /scheduled   lists what is waiting      /unschedule 3   cancels #3
+# Group time is RNR_TZ_OFFSET_MINUTES (default 330 = IST). Stored in MongoDB, so restarts
+# don't lose anything; a post that came due while the bot was down goes out when it is back.
+# =============================================================================
+
+_SCHED_MAX_DAYS = 366
+_SCHED_DATE_RE = re.compile(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})")
+_SCHED_ISO_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+_SCHED_TIME_RE = re.compile(r"(?<![\d/\-.])(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?(?![\d/\-.])", re.IGNORECASE)
+
+
+def _sched_offset() -> timedelta:
+    try:
+        return timedelta(minutes=int(os.getenv("RNR_TZ_OFFSET_MINUTES", "330")))
+    except ValueError:
+        return timedelta(minutes=330)
+
+
+def _sched_tz_label() -> str:
+    minutes = int(_sched_offset().total_seconds() // 60)
+    if minutes == 330:
+        return "IST"
+    sign = "+" if minutes >= 0 else "-"
+    return f"UTC{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
+
+
+def _parse_schedule_when(text: str, now: datetime) -> tuple[datetime | None, str]:
+    """(send_time_in_UTC, error). Accepts '3/10/2026 8am', '03-10-2026 20:30', '2026-10-03 8.30pm',
+    'tomorrow 7pm', 'today 9pm'. Dates are day/month/year, times are in group time."""
+    t = text.strip().lower()
+    local_now = now + _sched_offset()
+    day = None
+    m = _SCHED_ISO_RE.search(t)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        t = t[: m.start()] + " " + t[m.end():]
+    else:
+        m = _SCHED_DATE_RE.search(t)
+        if m:
+            d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            t = t[: m.start()] + " " + t[m.end():]
+        elif "tomorrow" in t:
+            day = (local_now + timedelta(days=1)).date()
+            t = t.replace("tomorrow", " ")
+        elif "today" in t:
+            day = local_now.date()
+            t = t.replace("today", " ")
+        else:
+            return None, "I need a date, like 3/10/2026 (day/month/year), or the word tomorrow."
+    if day is None:
+        try:
+            day = datetime(y, mo, d).date()
+        except ValueError:
+            return None, "That date doesn't exist. Use day/month/year, like 3/10/2026."
+
+    tm = _SCHED_TIME_RE.search(t)
+    if not tm:
+        return None, "I need a time too, like 8am, 8:30pm or 20:00."
+    hour, minute, ampm = int(tm.group(1)), int(tm.group(2) or 0), (tm.group(3) or "").lower()
+    if minute > 59 or (ampm and not 1 <= hour <= 12) or (not ampm and hour > 23):
+        return None, "That time doesn't look right. Use 8am, 8:30pm or 20:00."
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+
+    local_dt = datetime(day.year, day.month, day.day, hour, minute)
+    when = (local_dt - _sched_offset()).replace(tzinfo=timezone.utc)
+    if when <= now + timedelta(seconds=30):
+        return None, f"That time has already passed (it is {local_now.strftime('%d %b %Y, %H:%M')} {_sched_tz_label()} now)."
+    if when > now + timedelta(days=_SCHED_MAX_DAYS):
+        return None, "That is more than a year away. Pick a closer date."
+    return when, ""
+
+
+async def _send_data_or_raise(bot, chat_id: int, data: dict):
+    """Send stored post content (same shape as filters). Unlike _send_filter_response this
+    raises on failure, so the scheduler can tell the admin."""
+    ftype = data.get("type", "text")
+    text = data.get("text")
+    entities = [
+        _dict_to_entity(d) for d in (data.get("entities") or []) if d.get("type") != "text_mention"
+    ] or None
+    file_id = data.get("file_id")
+    if ftype == "text":
+        return await bot.send_message(chat_id, text or "", entities=entities)
+    senders = {
+        "photo": ("send_photo", "photo"), "video": ("send_video", "video"),
+        "animation": ("send_animation", "animation"), "document": ("send_document", "document"),
+        "voice": ("send_voice", "voice"), "audio": ("send_audio", "audio"),
+    }
+    if ftype in senders:
+        method, arg = senders[ftype]
+        return await getattr(bot, method)(chat_id, **{arg: file_id}, caption=text, caption_entities=entities)
+    if ftype == "sticker":
+        return await bot.send_sticker(chat_id, sticker=file_id)
+    if ftype == "video_note":
+        return await bot.send_video_note(chat_id, video_note=file_id)
+    raise ValueError(f"unsupported post type {ftype}")
+
+
+def _sched_when_label(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return f"{(dt + _sched_offset()).strftime('%d %b %Y, %H:%M')} {_sched_tz_label()}"
+
+
+def _sched_in_label(seconds: int) -> str:
+    """'12 days 14 h', '3 h 20 min', 'under a minute' - friendlier than 302h 30m."""
+    days, rem = divmod(max(0, int(seconds)), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} h")
+    if minutes and not days:
+        parts.append(f"{minutes} min")
+    return " ".join(parts) or "under a minute"
+
+
+def _sched_preview(data: dict) -> str:
+    kind = data.get("type", "text")
+    text = (data.get("text") or "").strip().replace("\n", " ")
+    snippet = (text[:40] + "...") if len(text) > 40 else text
+    return f"{kind}: {snippet}" if snippet else kind
+
+
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin, private chat: reply to a post with /schedule <date> <time> [chat_id]."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Schedule posts in a private chat with me.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Only bot admins can schedule posts.")
+        return
+    usage = (
+        "To schedule a post: send (or forward) it to me here, then REPLY to it with\n"
+        "/schedule 3/10/2026 8am\n\n"
+        "Date is day/month/year, time is in group time. Also works: tomorrow 7pm, 03-10-2026 20:30.\n"
+        "By default it goes to the main group; add a chat id at the end to pick another.\n"
+        "/scheduled lists waiting posts, /unschedule <number> cancels one."
+    )
+    reply = update.message.reply_to_message
+    if reply is None:
+        await update.message.reply_text(usage)
+        return
+    data = _filter_data_from_message(reply)
+    if data is None:
+        await update.message.reply_text(
+            "I can schedule text, photos, videos, GIFs, documents, stickers, voice notes, audio and "
+            "video notes. That kind of message isn't supported."
+        )
+        return
+
+    args = list(context.args or [])
+    target = None
+    if args and re.fullmatch(r"-\d{5,}", args[-1]):
+        target = int(args.pop())
+    when, error = _parse_schedule_when(" ".join(args), datetime.now(timezone.utc))
+    if when is None:
+        await update.message.reply_text(f"{error}\n\n{usage}")
+        return
+    if target is None:
+        target = _broadcast_target_chat_id()
+    if target is None:
+        await update.message.reply_text("No main group is configured. Add a chat id: /schedule 3/10/2026 8am -100123456789")
+        return
+    try:
+        chat = await context.bot.get_chat(target)
+        title = chat.title or str(target)
+    except Exception:
+        await update.message.reply_text(f"I can't see chat {target}. Is the bot a member of it?")
+        return
+
+    user = update.effective_user
+    serial = await asyncio.to_thread(
+        dbmod.sched_create, target, title, data, when, user.id, _user_label(user)
+    )
+    delta = when - datetime.now(timezone.utc)
+    await update.message.reply_text(
+        f"Scheduled #{serial} for {title}\n"
+        f"{_sched_when_label(when)} (in {_sched_in_label(int(delta.total_seconds()))})\n"
+        f"{_sched_preview(data)}\n\n"
+        f"/scheduled shows the queue, /unschedule {serial} cancels it."
+    )
+
+
+async def cmd_scheduled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin, private chat: list posts waiting to go out."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private" or not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Bot admins only, in a private chat with me.")
+        return
+    rows = await asyncio.to_thread(dbmod.sched_pending)
+    if not rows:
+        await update.message.reply_text("Nothing is scheduled. Reply to a post with /schedule 3/10/2026 8am")
+        return
+    lines = [f"Scheduled posts ({len(rows)}):", ""]
+    for r in rows[:30]:
+        lines.append(f"#{r['serial']}  {_sched_when_label(r['send_at'])}")
+        lines.append(f"    {_sched_preview(r['data'])} -> {r.get('chat_title') or r['chat_id']} (by {r.get('by_name', '?')})")
+    if len(rows) > 30:
+        lines.append(f"... and {len(rows) - 30} more")
+    for chunk in _split_for_telegram("\n".join(lines)):
+        await update.message.reply_text(chunk)
+
+
+async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin, private chat: /unschedule <number>."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private" or not _is_admin_user(update.effective_user.id):
+        await update.message.reply_text("Bot admins only, in a private chat with me.")
+        return
+    try:
+        serial = int((context.args or [""])[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("Usage: /unschedule <number>   (see /scheduled)")
+        return
+    doc = await asyncio.to_thread(dbmod.sched_cancel, serial)
+    if doc is None:
+        await update.message.reply_text(f"No waiting post #{serial}. It may already be sent or cancelled.")
+        return
+    await update.message.reply_text(f"Cancelled #{serial} ({_sched_preview(doc['data'])}).")
+
+
+async def scheduled_post_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every 30s: publish due posts and tell the admin who scheduled each one how it went."""
+    try:
+        due = await asyncio.to_thread(dbmod.sched_due, datetime.now(timezone.utc))
+    except Exception:
+        logger.exception("Scheduled-post worker could not read the queue")
+        return
+    for d in due:
+        serial = d["serial"]
+        try:
+            if not await asyncio.to_thread(dbmod.sched_claim, serial):
+                continue
+            title = d.get("chat_title") or d["chat_id"]
+            try:
+                await _send_data_or_raise(context.bot, int(d["chat_id"]), d["data"])
+            except Exception as exc:
+                logger.exception("Scheduled post #%s failed", serial)
+                await asyncio.to_thread(dbmod.sched_finish, serial, "failed", str(exc))
+                note = f"Scheduled post #{serial} could NOT be posted to {title}: {str(exc)[:200]}"
+            else:
+                await asyncio.to_thread(dbmod.sched_finish, serial, "sent")
+                note = f"Posted #{serial} to {title}."
+            try:
+                await context.bot.send_message(int(d["by_id"]), note)
+            except Exception:
+                logger.debug("Could not notify admin %s about scheduled post #%s", d.get("by_id"), serial)
+        except Exception:
+            logger.exception("Scheduled-post worker failed on #%s", serial)
+
+
+# =============================================================================
+# Engagement: celebrations, streak reminder + freezes, monthly awards and recaps,
+# Read & Record of the week (from member reactions)
+#
+#   FREEZES_MAX              most streak freezes a member holds (default 2)
+#   STREAK_REMINDER_HOUR     group-time hour of the "streaks at risk" post (default 20)
+#   RNR_WINNER_MIN_REACTIONS reactions needed to win Read & Record of the week (default 2)
+# Reactions only reach the bot if it is an ADMIN of the group.
+# =============================================================================
+
+from telegram import ReplyParameters
+from telegram.ext import MessageReactionHandler
+
+
+def _engage_offset() -> timedelta:
+    try:
+        return timedelta(minutes=int(os.getenv("RNR_TZ_OFFSET_MINUTES", "330")))
+    except ValueError:
+        return timedelta(minutes=330)
+
+
+def _plural(n: int, one: str, many: str | None = None) -> str:
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+async def celebration_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every 30s: post queued level-up / milestone / freeze announcements, grouped per chat."""
+    try:
+        docs = await asyncio.to_thread(dbmod.celebrations_due)
+    except Exception:
+        logger.exception("Celebration worker could not read the queue")
+        return
+    by_chat: dict[int, list[dict]] = {}
+    for d in docs:
+        by_chat.setdefault(int(d["chat_id"]), []).append(d)
+    for chat_id, items in by_chat.items():
+        for i in range(0, len(items), 8):
+            chunk = items[i : i + 8]
+            text = chunk[0]["text"] if len(chunk) == 1 else "🎉 <b>Celebrations</b>\n\n" + "\n".join(d["text"] for d in chunk)
+            status = "sent"
+            try:
+                await context.bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception:
+                logger.exception("Celebration post failed chat_id=%s", chat_id)
+                status = "failed"
+            await asyncio.to_thread(dbmod.celebrations_mark, [d["_id"] for d in chunk], status)
+
+
+def _streak_reminder_hour() -> int:
+    try:
+        return min(21, max(0, int(os.getenv("STREAK_REMINDER_HOUR", "20"))))
+    except ValueError:
+        return 20
+
+
+async def streak_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Evening post naming members whose streak ends if they skip today. Checked every 30
+    minutes; stored per chat per day so a restart never double-posts."""
+    try:
+        local = datetime.now(timezone.utc) + _engage_offset()
+        hour = _streak_reminder_hour()
+        if not (hour <= local.hour < hour + 3):
+            return
+        today = local.strftime("%Y-%m-%d")
+        chat_ids = await asyncio.to_thread(dbmod.list_chats_with_monthly_reports)
+    except Exception:
+        logger.exception("Streak reminder setup failed")
+        return
+    deadline = (datetime(2000, 1, 1) + _engage_offset()).strftime("%H:%M")  # when the attendance day (UTC) ends
+    for chat_id in chat_ids:
+        try:
+            key = f"streak_reminder:{chat_id}"
+            if await asyncio.to_thread(dbmod.engage_posted, key) == today:
+                continue
+            await asyncio.to_thread(dbmod.engage_set_posted, key, today)
+            rows = await asyncio.to_thread(dbmod.streaks_at_risk, chat_id)
+            if not rows:
+                continue
+            lines = ["🔥 <b>Streaks at risk today</b>", f"<i>Join a call before {deadline} to keep your streak alive.</i>", ""]
+            for r in rows:
+                freeze = " 🧊" if r["freezes"] else ""
+                lines.append(f"• {html.escape(r['name'], quote=False)}: {_plural(r['streak'], 'day')}{freeze}")
+            if any(r["freezes"] for r in rows):
+                lines += ["", "<i>🧊 = has a freeze that covers one missed day.</i>"]
+            await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        except Exception:
+            logger.exception("Streak reminder failed chat_id=%s", chat_id)
+
+
+_AWARD_FORMATS = {
+    "voice": ("🎧", "Voice Champion", lambda v: _format_duration_hours(int(v))),
+    "regular": ("🤝", "Most Regular", lambda v: _plural(int(v), "voice chat")),
+    "rnr": ("🎙️", "Storyteller", lambda v: _plural(int(v), "Read &amp; Record")),
+    "ideas": ("💡", "Idea Machine", lambda v: _plural(int(v), "topic")),
+    "streak": ("🔥", "Streak Keeper", lambda v: f"{int(v)}-day streak"),
+}
+
+
+def _format_awards(year: int, month: int, awards: list[dict]) -> str:
+    lines = [f"🏆 <b>Awards: {_month_name(month)} {year}</b>", ""]
+    for a in awards:
+        icon, title, fmt = _AWARD_FORMATS[a["key"]]
+        lines.append(f"{icon} <b>{title}</b>: {html.escape(a['name'] or str(a['user_id']), quote=False)} ({fmt(a['value'])})")
+    lines += ["", "<i>Thank you all. See you next month!</i>"]
+    return "\n".join(lines)
+
+
+def _format_recap(year: int, month: int, r: dict, footer: bool = True) -> str:
+    lines = [f"📖 <b>Your {_month_name(month)} in books</b>", ""]
+    if r["vcs"]:
+        rank = f" · #{r['rank']} of {r['participants']}" if r["rank"] else ""
+        lines.append(f"🎧 {_plural(r['vcs'], 'voice chat')} · {_format_duration_hours(r['seconds'])}{rank}")
+    else:
+        lines.append("🎧 No voice chats this month")
+    if r["recordings"]:
+        lines.append(f"🎙️ {_plural(r['recordings'], 'Read &amp; Record')}")
+    if r["topics"]:
+        lines.append(f"💡 {_plural(r['topics'], 'topic')} suggested")
+    lines += ["", f"🔥 Streak now: <b>{r['streak']}</b> day(s) · best {r['best_streak']}", f"🎖️ Level {r['level']} · {r['xp']} XP"]
+    if r["freezes"]:
+        lines.append(f"🧊 Streak freezes: {r['freezes']}")
+    if footer:
+        lines += ["", "<i>Don't want these? Send /recap off to me.</i>"]
+    return "\n".join(lines)
+
+
+async def monthly_awards_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """On the 1st (an hour after the monthly report): post last month's awards in the group,
+    then DM each active member their own recap (members who haven't started the bot, or who
+    sent /recap off, are skipped). Marked done before sending, so it can never post twice."""
+    now = datetime.now(timezone.utc)
+    try:
+        hour = min(23, int(os.getenv("MONTHLY_REPORT_HOUR_UTC", "9")) + 1)
+    except ValueError:
+        hour = 10
+    if now.day != 1 or now.hour < hour:
+        return
+    year, month = dbmod.previous_calendar_month(now.year, now.month)
+    try:
+        chat_ids = await asyncio.to_thread(dbmod.list_chats_with_monthly_reports)
+    except Exception:
+        logger.exception("Awards job could not list chats")
+        return
+    for chat_id in chat_ids:
+        try:
+            key = f"awards:{chat_id}:{year}-{month:02d}"
+            if await asyncio.to_thread(dbmod.engage_posted, key):
+                continue
+            awards = await asyncio.to_thread(dbmod.month_awards, chat_id, year, month)
+            await asyncio.to_thread(dbmod.engage_set_posted, key, "started")
+            if awards:
+                await context.bot.send_message(chat_id, _format_awards(year, month, awards), parse_mode="HTML")
+            for uid in await asyncio.to_thread(dbmod.month_active_user_ids, chat_id, year, month):
+                try:
+                    if await asyncio.to_thread(dbmod.recap_opted_out, uid):
+                        continue
+                    recap = await asyncio.to_thread(dbmod.member_month_recap, chat_id, uid, year, month)
+                    await context.bot.send_message(uid, _format_recap(year, month, recap), parse_mode="HTML")
+                except Exception:
+                    logger.debug("Recap DM to %s skipped", uid)  # usually: they never started the bot
+                await asyncio.sleep(0.2)
+        except Exception:
+            logger.exception("Monthly awards failed chat_id=%s", chat_id)
+
+
+async def cmd_myrecap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Private chat: /myrecap shows last month in books, /myrecap this = the month so far."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        await _reply_autodelete(update, context, "Send /myrecap to me in a private chat.")
+        return
+    chat_id = _broadcast_target_chat_id()
+    if chat_id is None:
+        await update.message.reply_text("No main group is configured yet.")
+        return
+    now = datetime.now(timezone.utc)
+    if context.args and context.args[0].lower() in ("this", "current"):
+        year, month = now.year, now.month
+    else:
+        year, month = dbmod.previous_calendar_month(now.year, now.month)
+    recap = await asyncio.to_thread(dbmod.member_month_recap, chat_id, update.effective_user.id, year, month)
+    await update.message.reply_text(_format_recap(year, month, recap, footer=False), parse_mode="HTML")
+
+
+async def cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Private chat: /recap on|off - the monthly recap message I send you."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        await _reply_autodelete(update, context, "Send /recap to me in a private chat.")
+        return
+    uid = update.effective_user.id
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        off = await asyncio.to_thread(dbmod.recap_opted_out, uid)
+        await update.message.reply_text(
+            f"Your monthly recap message is {'off' if off else 'on'}.\nUse /recap on or /recap off. "
+            "/myrecap shows it any time."
+        )
+        return
+    off = context.args[0].lower() == "off"
+    await asyncio.to_thread(dbmod.set_recap_optout, uid, off)
+    await update.message.reply_text("Okay, I won't send you a monthly recap." if off else "Okay, you'll get a recap each month.")
+
+
+async def cmd_givefreeze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bot admin, in the group: /givefreeze (reply to a member, or give their id/@username)."""
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in the group.")
+        return
+    if not _is_admin_user(update.effective_user.id):
+        await _reply_autodelete(update, context, "Bot admins only.")
+        return
+    args = context.args or []
+    reply = update.message.reply_to_message
+    if reply is not None and reply.from_user:
+        target_id, label = reply.from_user.id, _user_label(reply.from_user)
+    elif args:
+        resolved = await _resolve_user_ref(context, chat.id, args[0])
+        if resolved is None:
+            await _reply_autodelete(update, context, f"Couldn't resolve {html.escape(args[0], quote=False)}.", parse_mode="HTML")
+            return
+        target_id, label = resolved
+    else:
+        await _reply_autodelete(update, context, "Reply to a member, or give their user id / @username.")
+        return
+    total = await asyncio.to_thread(dbmod.grant_freeze, chat.id, target_id, label, 1, 5)
+    await _reply_autodelete(
+        update, context, f"🧊 {html.escape(label, quote=False)} now has {_plural(total, 'streak freeze')}.", parse_mode="HTML"
+    )
+
+
+async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat or not update.effective_user:
+        return
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await _reply_autodelete(update, context, "Use this command in a group.")
+        return
+    user = update.effective_user
+    label = _user_label(user)
+    info = await asyncio.to_thread(dbmod.get_streak_info, chat.id, user.id, label)
+    freezes = await asyncio.to_thread(dbmod.get_freezes, chat.id, user.id)
+    safe = html.escape(info.display_name or label, quote=False)
+    text = (
+        f"🔥 <b>{safe}</b>\n"
+        f"Current streak: <b>{info.current_streak}</b> day(s)\n"
+        f"Longest streak: <b>{info.longest_streak}</b> day(s)\n"
+        f"🧊 Streak freezes: <b>{freezes}</b> <i>(you earn one every {dbmod.FREEZE_EVERY_DAYS} streak days, "
+        f"max {dbmod.freeze_cap()}; it covers one missed day)</i>"
+    )
+    await _reply_autodelete(update, context, text, parse_mode="HTML")
+
+
+async def on_message_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A member reacted to (or un-reacted from) a message. Counted only for recorded audios."""
+    r = update.message_reaction
+    if r is None or r.user is None or r.user.is_bot or r.chat.type not in ("group", "supergroup"):
+        return
+    try:
+        await asyncio.to_thread(dbmod.rnr_set_reaction, r.chat.id, r.message_id, r.user.id, bool(r.new_reaction))
+    except Exception:
+        logger.exception("Reaction tracking failed chat_id=%s", r.chat.id)
+
+
+async def rnr_week_winner_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Monday, an hour after the morning Read & Record posts: announce last week's most
+    appreciated recording (most members reacting), as a reply to the original audio."""
+    local = datetime.now(timezone.utc) + _engage_offset()
+    start_hour = min(23, _rnr_morning_hour() + 1)
+    if local.weekday() != 0 or not (start_hour <= local.hour < start_hour + 6):
+        return
+    today = local.strftime("%Y-%m-%d")
+    days = [(local - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7, 0, -1)]
+    try:
+        minimum = max(1, int(os.getenv("RNR_WINNER_MIN_REACTIONS", "2")))
+        chat_ids = await asyncio.to_thread(dbmod.rnr_chat_ids)
+    except Exception:
+        logger.exception("R&R winner setup failed")
+        return
+    for chat_id in chat_ids:
+        try:
+            key = f"rnr_winner:{chat_id}"
+            if await asyncio.to_thread(dbmod.engage_posted, key) == today:
+                continue
+            winner = await asyncio.to_thread(dbmod.rnr_week_winner, chat_id, days, minimum)
+            await asyncio.to_thread(dbmod.engage_set_posted, key, today)
+            if not winner:
+                continue
+            d = winner["doc"]
+            text = (
+                f"🏆 <b>Read &amp; Record of the week</b>\n"
+                f"RNR #{d['serial']} by <b>{html.escape(str(d.get('display_name', '')), quote=False)}</b>: "
+                f"{_plural(winner['count'], 'member')} reacted ❤️\n<i>Listen again 👆</i>"
+            )
+            await context.bot.send_message(
+                chat_id, text, parse_mode="HTML",
+                reply_parameters=ReplyParameters(message_id=int(d["msg_id"]), allow_sending_without_reply=True),
+            )
+        except Exception:
+            logger.exception("R&R winner post failed chat_id=%s", chat_id)
+
+
 async def on_track_known_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Passive, silent: remembers username -> user_id for every message seen in a tracked
     group (any message type, not just text/commands), so /warn, /ban, /mute etc. can later
@@ -5971,25 +6548,6 @@ async def cmd_xpleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _reply_autodelete(update, context, "\n".join(lines), parse_mode="HTML")
 
 
-async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_chat or not update.effective_user:
-        return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
-        return
-    user = update.effective_user
-    label = _user_label(user)
-    info = await asyncio.to_thread(dbmod.get_streak_info, chat.id, user.id, label)
-    safe = html.escape(info.display_name or label, quote=False)
-    text = (
-        f"🔥 <b>{safe}</b>\n"
-        f"Current streak: <b>{info.current_streak}</b> day(s)\n"
-        f"Longest streak: <b>{info.longest_streak}</b> day(s)"
-    )
-    await _reply_autodelete(update, context, text, parse_mode="HTML")
-
-
 async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or not update.effective_user:
         return
@@ -6206,6 +6764,11 @@ async def post_init(application: Application) -> None:
         time=dt_time(hour=0, minute=5, tzinfo=timezone.utc),
         name="daily_streak_reset_job",
     )
+    jq.run_repeating(celebration_worker, interval=30, first=55, name="celebration_worker")
+    jq.run_repeating(streak_reminder_job, interval=1800, first=100, name="streak_reminder_job")
+    jq.run_repeating(monthly_awards_job, interval=3600, first=120, name="monthly_awards_job")
+    jq.run_repeating(rnr_week_winner_job, interval=1800, first=140, name="rnr_week_winner_job")
+    jq.run_repeating(scheduled_post_worker, interval=30, first=50, name="scheduled_post_worker")
     jq.run_repeating(vc_question_worker, interval=30, first=45, name="vc_question_worker")
     jq.run_daily(
         daily_backup_job,
@@ -6326,6 +6889,13 @@ def main() -> None:
     app.add_handler(CommandHandler("addcmd", cmd_addcmd))
     app.add_handler(CommandHandler("delcmd", cmd_delcmd))
     app.add_handler(CommandHandler("cmds", cmd_cmds))
+    app.add_handler(CommandHandler("myrecap", cmd_myrecap))
+    app.add_handler(CommandHandler("recap", cmd_recap))
+    app.add_handler(CommandHandler("givefreeze", cmd_givefreeze))
+    app.add_handler(MessageReactionHandler(on_message_reaction))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("scheduled", cmd_scheduled))
+    app.add_handler(CommandHandler("unschedule", cmd_unschedule))
     app.add_handler(CommandHandler("sethost", cmd_sethost))
     # Answers to the "who was the host?" question; own handler group so it never shadows other reply handlers.
     app.add_handler(
