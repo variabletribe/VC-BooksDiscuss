@@ -571,12 +571,12 @@ HELP_COMMANDS: dict[str, tuple[str, str, str, str]] = {
     # --- Group Admin Tools (Telegram group admin/owner status) ---
     "streakboard": ("groupadmin", "/streakboard", "Every member's current and best attendance streak, ranked.", "Group admin"),
     "reports": ("groupadmin", "/reports on|off", "Toggle the automatic monthly report for this group.", "Group admin"),
-    "removeuser": ("groupadmin", "/removeuser USER_ID", "Wipe a user's VC stats and attendance. Shows a preview and asks for confirmation first.", "Group admin"),
     "finduser": ("groupadmin", "/finduser NAME", "Look up a user's numeric id by name or an old @username.", "Group admin"),
 
     # --- Bot Owner Tools (ADMIN_USER_IDS — cross-group, not tied to any one group) ---
     "message": ("botadmin", "/message ID [ID2 ID3 ...] text  —  or reply to any message with /message ID [ID2 ...]", "DM one or more users directly by numeric id. Reply to any message (text, photo, audio, video, etc.) to copy it verbatim instead of typing text.", "Bot admin"),
     "broadcast": ("botadmin", "/broadcast text  (or reply to a message with /broadcast)", "Message everyone who has ever joined a tracked VC. Shows the audience size and asks for confirmation before sending.", "Bot admin"),
+    "removeuser": ("botadmin", "/removeuser USER_ID [chat_id]", "Permanently ban a user from the group, silently: nothing is posted in the group and they can no longer read it. Use it in a private chat with the bot; it does nothing in a group. Omit chat_id to use the main group.", "Bot admin, DM only"),
     "exportdata": ("botadmin", "/exportdata [chat_id]", "CSV of every user who's joined a VC — hours, present days, streaks, XP, level, join dates. Works only in a DM with the bot.", "Bot admin, DM only"),
     "user": ("botadmin", "/user USER_ID [chat_id]", "Full stats for any one user by id, without needing them to run /mystats themselves. DM only.", "Bot admin, DM only"),
     "health": ("botadmin", "/health", "Checks MongoDB, the Telegram Bot API, the Telethon assistant, and Groq — catches a silent failure before it's noticed the hard way. DM only.", "Bot admin, DM only"),
@@ -1093,13 +1093,25 @@ async def on_confirmation_callback(update: Update, context: ContextTypes.DEFAULT
 
     elif kind == "removeuser":
         target_id = payload["target_id"]
-        result = await asyncio.to_thread(dbmod.remove_user_from_chat, chat_id, target_id)
-        label = html.escape(result.display_name or str(target_id), quote=False)
+        target_label = payload["target_label"]
+        group_id = payload["group_id"]
+        group_title = payload.get("group_title") or str(group_id)
+        try:
+            # No message is sent to the group. A ban also removes the user from the group
+            # and blocks them from viewing it or rejoining.
+            await context.bot.ban_chat_member(group_id, target_id)
+        except Exception:
+            logger.exception("Silent ban failed group_id=%s target=%s", group_id, target_id)
+            await _safe_edit(query, "❌ Couldn't ban — check that I'm an admin in that group with the 'Ban users' right.")
+            return
+        await asyncio.to_thread(
+            dbmod.log_mod_action, group_id, "ban", target_id, target_label, actor.id, _user_label(actor),
+            "removed by bot admin (/removeuser)",
+        )
         await _safe_edit(
             query,
-            f"Removed <b>{label}</b> (<code>{target_id}</code>) from this group's stats:\n"
-            f"• VC call records deleted: <b>{result.vc_rows_deleted}</b>\n"
-            f"• Attendance records deleted: <b>{result.attendance_rows_deleted}</b>",
+            f"🚫 <b>{html.escape(target_label, quote=False)}</b> (<code>{target_id}</code>) is permanently banned "
+            f"from {html.escape(group_title, quote=False)}.\nNothing was posted in the group.",
         )
 
     elif kind == "broadcast":
@@ -3951,7 +3963,7 @@ async def streak_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             rows = await asyncio.to_thread(dbmod.streaks_at_risk, chat_id)
             if not rows:
                 continue
-            lines = ["🔥 <b>Streaks at risk today</b>", f"<i>Join a call before {deadline} to keep your streak alive.</i>", ""]
+            lines = ["🔥 <b>Streaks at risk today</b>", f"<i>Join today's VC session to keep your streak alive.</i>", ""]
             for r in rows:
                 freeze = " 🧊" if r["freezes"] else ""
                 lines.append(f"• {html.escape(r['name'], quote=False)}: {_plural(r['streak'], 'day')}{freeze}")
@@ -5114,59 +5126,97 @@ async def cmd_finduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_chat or not update.effective_user:
+    """Bot admin, private chat only: /removeuser USER_ID [chat_id]
+
+    Permanently bans the user from the group without posting anything there. In a group
+    this command does nothing visible (the command message is just deleted if possible)."""
+    msg, chat, user = update.message, update.effective_chat, update.effective_user
+    if not msg or not chat or not user:
         return
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await _reply_autodelete(update, context, "Use this command in a group.")
+    if chat.type != "private":
+        # Silent in groups: no reply. Tidy away the command text so it doesn't linger.
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return
-    if not await _is_group_admin(update, context):
-        await _reply_autodelete(update, context, "Only group admins can remove users from the database.")
+    if not _is_admin_user(user.id):
+        await msg.reply_text("Admins only.")
         return
 
-    if not context.args:
-        await _reply_autodelete(
-            update,
-            context,
-            "Usage: /removeuser &lt;telegram_user_id&gt;\n\n"
-            "Example: /removeuser 1087968824\n\n"
-            "Run /finduser NAME to look up a user's numeric id.",
-            parse_mode="HTML",
+    args = context.args or []
+    if not args:
+        await msg.reply_text(
+            "Usage: /removeuser USER_ID [chat_id]\n\n"
+            "Permanently bans the user from the group. Nothing is posted in the group.\n"
+            "Omit chat_id to use the main group. Find ids with /finduser NAME in the group."
         )
         return
-
-    raw = context.args[0].strip()
     try:
-        user_id = int(raw)
+        target_id = int(args[0])
     except ValueError:
-        await _reply_autodelete(update, context, "User id must be a number, e.g. /removeuser 1087968824")
+        await msg.reply_text("User id must be a number, e.g. /removeuser 1087968824")
         return
-    if user_id <= 0:
-        await _reply_autodelete(update, context, "User id must be a positive Telegram user id.")
-        return
-
-    preview = await asyncio.to_thread(dbmod.preview_remove_user, chat.id, user_id)
-    if preview.vc_rows_deleted == 0 and preview.attendance_rows_deleted == 0:
-        await _reply_autodelete(
-            update,
-            context,
-            f"No database records found for user id <code>{user_id}</code> in this group.",
-            parse_mode="HTML",
-        )
+    if target_id <= 0:
+        await msg.reply_text("User id must be a positive Telegram user id.")
         return
 
-    # Destructive and irreversible: confirm before actually deleting.
+    if len(args) >= 2:
+        try:
+            group_id = int(args[1])
+        except ValueError:
+            await msg.reply_text("chat_id must be a number.")
+            return
+    else:
+        group_id = _broadcast_target_chat_id()
+        if group_id is None:
+            await msg.reply_text(
+                "No default group configured (set BROADCAST_CHAT_ID or ASSISTANT_GROUP_IDS). "
+                "Usage: /removeuser USER_ID chat_id"
+            )
+            return
+
+    if target_id == context.bot.id or _is_admin_user(target_id):
+        await msg.reply_text("I won't ban the bot or a bot admin.")
+        return
+
+    try:
+        group = await context.bot.get_chat(group_id)
+        group_title = group.title or str(group_id)
+    except Exception:
+        await msg.reply_text(f"I can't see chat {group_id}. Is the bot a member of it?")
+        return
+
+    target_label = str(target_id)
+    try:
+        member = await context.bot.get_chat_member(group_id, target_id)
+        target_label = _user_label(member.user)
+        if member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+            await msg.reply_text("That user is a group admin. Remove their admin rights first.")
+            return
+        if member.status == ChatMemberStatus.BANNED:
+            await msg.reply_text(f"{target_label} is already banned from {group_title}.")
+            return
+    except Exception:
+        # Not a current member (already left, or never joined): banning still stops a rejoin.
+        known = await asyncio.to_thread(dbmod.get_my_stats, group_id, target_id)
+        target_label = known.display_name or target_label
+
     token = _register_pending_confirmation(
-        "removeuser", chat.id, update.effective_user.id, {"target_id": user_id}
+        "removeuser", chat.id, user.id,
+        {
+            "target_id": target_id,
+            "target_label": target_label,
+            "group_id": group_id,
+            "group_title": group_title,
+        },
     )
-    label = html.escape(preview.display_name or str(user_id), quote=False)
-    lines = [
-        f"⚠️ Remove <b>{label}</b> (<code>{user_id}</code>) from this group's stats?",
-        f"• VC call records to delete: <b>{preview.vc_rows_deleted}</b>",
-        f"• Attendance records to delete: <b>{preview.attendance_rows_deleted}</b>",
-    ]
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode="HTML", reply_markup=_confirm_keyboard(token)
+    await msg.reply_text(
+        f"⚠️ Permanently ban <b>{html.escape(target_label, quote=False)}</b> (<code>{target_id}</code>) "
+        f"from <b>{html.escape(group_title, quote=False)}</b>?\n"
+        "<i>Nothing will be posted in the group.</i>",
+        parse_mode="HTML",
+        reply_markup=_confirm_keyboard(token),
     )
 
 
